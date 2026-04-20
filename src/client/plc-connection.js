@@ -106,7 +106,7 @@ export class PlcConnection extends EventEmitter {
         reject(new Error(`Connection timeout to ${this.endpoint.ip}`));
       }, this.#requestTimeoutMs * 2);
 
-      socket.connect(S7_DEFAULT_PORT, this.endpoint.ip, () => {
+      socket.connect(this.endpoint.port ?? S7_DEFAULT_PORT, this.endpoint.ip, () => {
         clearTimeout(timeout);
         this.#logger.debug('TCP connected');
         this.#state = 'cotp';

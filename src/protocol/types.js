@@ -9,6 +9,7 @@
  * @property {string} ip
  * @property {number} rack
  * @property {number} slot
+ * @property {number} [port]
  */
 
 /**

@@ -24,4 +24,6 @@ export { WsServer } from './api/ws-server.js';
 export { Metrics } from './metrics/metrics.js';
 export { createLogger } from './logging/logger.js';
 export { FrameAssembler } from './protocol/frame-assembler.js';
+export { S7Client } from './compat/s7client.js';
+export { S7Server } from './compat/s7server.js';
 export * from './protocol/constants.js';

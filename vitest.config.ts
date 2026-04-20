@@ -5,5 +5,6 @@ export default defineConfig({
     include: ['test/**/*.test.js'],
     globals: true,
     testTimeout: 15000,
+    maxWorkers: 1,
   },
 });
