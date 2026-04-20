@@ -7,6 +7,7 @@ import { TagRegistry } from './tag-registry.js';
 import { DataCache } from './data-cache.js';
 import { ScanGroup } from './scan-group.js';
 import { ReadCoalescer } from './read-coalescer.js';
+import { wordLenToBytes } from '../protocol/constants.js';
 
 /** @import { ConnectionPool } from '../client/connection-pool.js' */
 /** @import { WasmBridge } from '../wasm/bridge.js' */
@@ -206,10 +207,20 @@ export class DaqEngine extends EventEmitter {
         const pduRef = frame.readUInt16BE(11);
         const response = await conn.sendRequest(frame, pduRef);
 
+        // Parse S7 read response: TPKT(4) + COTP DT(3) + S7 header(12) + param(2) = 21
+        const dataItemStart = 21;
+        const returnCode = response[dataItemStart];
+        if (returnCode !== 0xFF) {
+          throw new Error(`S7 read return code 0x${returnCode.toString(16)}`);
+        }
+        // Data item header: returnCode(1) + transportSize(1) + bitLength(2)
+        const dataPayload = response.subarray(dataItemStart + 4);
+
         // Update cache for each tag in this coalesced read
         for (const tag of read.tags) {
           const offset = tag.start - read.start;
-          const value = response.subarray(offset, offset + tag.amount);
+          const byteLen = wordLenToBytes(tag.wordLen, tag.amount);
+          const value = dataPayload.subarray(offset, offset + byteLen);
           this.dataCache.set(tag.name, Buffer.from(value), 192);
         }
       } catch (err) {
@@ -224,13 +235,31 @@ export class DaqEngine extends EventEmitter {
     this.#metrics.daqScanDuration.observe({ target: targetId, group: groupId }, durationMs);
     this.#metrics.daqScanTotal.inc({ target: targetId, group: groupId });
 
-    // Notify subscriptions
+    // Collect cached tag values for this scan
+    /** @type {Array<{name: string, value: string, quality: number, timestamp: number}>} */
+    const tagValues = [];
+    for (const read of reads) {
+      for (const tag of read.tags) {
+        const cached = this.dataCache.get(tag.name);
+        if (cached) {
+          tagValues.push({
+            name: tag.name,
+            value: cached.value.toString('hex'),
+            quality: cached.quality,
+            timestamp: cached.timestamp,
+          });
+        }
+      }
+    }
+
+    // Notify subscriptions (includes tag data for WS push)
     for (const [subId, sub] of this.#subscriptions) {
       if (sub.targetId === targetId) {
         this.emit('subscription:data', subId, {
           targetId,
           groupId,
           durationMs,
+          tags: tagValues,
         });
       }
     }

@@ -94,6 +94,25 @@ export const WORDLEN_BY_NAME = {
   timer: S7WLTimer,
 };
 
+/**
+ * Convert wordLen + amount to byte count.
+ * @param {number} wordLen
+ * @param {number} amount
+ * @returns {number}
+ */
+export function wordLenToBytes(wordLen, amount) {
+  switch (wordLen) {
+    case S7WLBit:     return Math.ceil(amount / 8);
+    case S7WLByte:    return amount;
+    case S7WLWord:    return amount * 2;
+    case S7WLDWord:   return amount * 4;
+    case S7WLReal:    return amount * 4;
+    case S7WLCounter: return amount * 2;
+    case S7WLTimer:   return amount * 2;
+    default:          return amount;
+  }
+}
+
 // Default S7 port
 export const S7_DEFAULT_PORT = 102;
 
