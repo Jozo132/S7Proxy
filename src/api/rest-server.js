@@ -11,6 +11,7 @@ import { registerRoutes } from './rest-routes.js';
 /** @import { ConnectionPool } from '../client/connection-pool.js' */
 /** @import { DaqEngine } from '../daq/daq-engine.js' */
 /** @import { Metrics } from '../metrics/metrics.js' */
+/** @import { StructManager } from '../protocol/struct-manager.js' */
 /** @import pino from 'pino' */
 
 export class RestServer {
@@ -27,13 +28,14 @@ export class RestServer {
    * @param {Metrics} metrics
    * @param {WebApiConfig} config
    * @param {pino.Logger} logger
+   * @param {StructManager} [structs]
    */
-  constructor(pool, daq, metrics, config, logger) {
+  constructor(pool, daq, metrics, config, logger, structs) {
     this.#config = config;
     this.#logger = logger.child({ component: 'rest' });
 
     this.#app = Fastify({ logger: false });
-    this.#setupPromise = this.#setup(pool, daq, metrics);
+    this.#setupPromise = this.#setup(pool, daq, metrics, structs);
   }
 
   /** @type {Promise<void>} */
@@ -43,8 +45,9 @@ export class RestServer {
    * @param {ConnectionPool} pool
    * @param {DaqEngine} daq
    * @param {Metrics} metrics
+   * @param {StructManager} [structs]
    */
-  async #setup(pool, daq, metrics) {
+  async #setup(pool, daq, metrics, structs) {
     await this.#app.register(cors, {
       origin: this.#config.cors?.origin ?? '*',
     });
@@ -54,7 +57,7 @@ export class RestServer {
       timeWindow: this.#config.rateLimit?.windowMs ?? 60000,
     });
 
-    registerRoutes(this.#app, pool, daq, metrics);
+    registerRoutes(this.#app, pool, daq, metrics, structs);
   }
 
   async start() {

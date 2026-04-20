@@ -13,8 +13,10 @@ import { RestServer } from './api/rest-server.js';
 import { WsServer } from './api/ws-server.js';
 import { Metrics } from './metrics/metrics.js';
 import { createLogger } from './logging/logger.js';
+import { StructManager } from './protocol/struct-manager.js';
 
 /** @import { S7ProxyConfig } from './protocol/types.js' */
+/** @import { S7StructDef, S7Value } from './protocol/db-struct.js' */
 /** @import pino from 'pino' */
 
 export class ProxyServer {
@@ -38,13 +40,79 @@ export class ProxyServer {
   #restServer = null;
   /** @type {WsServer | null} */
   #wsServer = null;
+  /** @type {StructManager} */
+  #structs;
 
   /** @param {S7ProxyConfig} config */
   constructor(config) {
     this.#config = config;
     this.#logger = createLogger(config.logging);
     this.#metrics = new Metrics();
+    this.#structs = new StructManager({ logger: this.#logger });
   }
+
+  /** @returns {StructManager} */
+  get structs() { return this.#structs; }
+
+  // ─── Struct delegate methods ─────────────────────────────────────────────
+
+  /**
+   * Register a struct definition. Can be called before or after start().
+   * @param {S7StructDef} def
+   */
+  registerStruct(def) { return this.#structs.register(def); }
+
+  /**
+   * Register multiple struct definitions at once.
+   * @param {S7StructDef[]} defs
+   */
+  registerStructs(defs) { return this.#structs.registerMany(defs); }
+
+  /**
+   * Unregister a struct by name.
+   * @param {string} name
+   */
+  unregisterStruct(name) { this.#structs.unregister(name); }
+
+  /**
+   * Read a struct from the PLC → decoded object.
+   * @param {string} name
+   * @param {string[]} [keys]  - Optional field filter
+   * @param {string} [targetId]
+   * @returns {Promise<Record<string, S7Value>>}
+   */
+  readStruct(name, keys, targetId) { return this.#structs.read(name, keys, targetId); }
+
+  /**
+   * Write an object to a struct on the PLC. Supports partial writes.
+   * @param {string} name
+   * @param {Record<string, S7Value>} values
+   * @param {string} [targetId]
+   * @returns {Promise<void>}
+   */
+  writeStruct(name, values, targetId) { return this.#structs.write(name, values, targetId); }
+
+  /**
+   * Subscribe to a struct via DAQ for periodic decoded updates.
+   * @param {string} name
+   * @param {string} targetId
+   * @param {number} intervalMs
+   * @returns {string} subscription ID
+   */
+  subscribeStruct(name, targetId, intervalMs) { return this.#structs.subscribe(name, targetId, intervalMs); }
+
+  /**
+   * Unsubscribe a struct subscription.
+   * @param {string} subId
+   */
+  unsubscribeStruct(subId) { this.#structs.unsubscribe(subId); }
+
+  /**
+   * Get cached decoded values (no PLC hit).
+   * @param {string} name
+   * @returns {Record<string, S7Value> | undefined}
+   */
+  getCachedStruct(name) { return this.#structs.getCachedValues(name); }
 
   async start() {
     this.#logger.info('Starting S7Proxy...');
@@ -69,6 +137,16 @@ export class ProxyServer {
       );
     }
 
+    // 3b. Bind struct manager to runtime infrastructure
+    if (this.#pool && this.#bridge) {
+      this.#structs.bind({
+        pool: this.#pool,
+        bridge: this.#bridge,
+        daq: this.#daq ?? undefined,
+        targetId: target?.id,
+      });
+    }
+
     // 4. TCP listener + router
     this.#tcpListener = new TcpListener(this.#config.listen.port, this.#config.listen.ip, this.#logger);
 
@@ -87,10 +165,14 @@ export class ProxyServer {
     if (this.#config.webApi?.enabled && this.#pool && this.#daq) {
       this.#restServer = new RestServer(
         this.#pool, this.#daq, this.#metrics, this.#config.webApi, this.#logger,
+        this.#structs,
       );
       await this.#restServer.start();
 
-      this.#wsServer = new WsServer(this.#daq, this.#config.daq, this.#metrics, this.#logger);
+      this.#wsServer = new WsServer(
+        this.#daq, this.#config.daq, this.#metrics, this.#logger,
+        this.#structs,
+      );
       const httpServer = this.#restServer.server.server;
       this.#wsServer.attach(httpServer);
     }
@@ -105,6 +187,7 @@ export class ProxyServer {
     this.#wsServer?.stop();
     await this.#restServer?.stop();
     await this.#tcpListener?.stop();
+    this.#structs.shutdown();
     this.#daq?.shutdown();
     await this.#pool?.stop();
 

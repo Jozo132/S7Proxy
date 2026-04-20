@@ -8,6 +8,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 /** @import { DaqEngine } from '../daq/daq-engine.js' */
 /** @import { DaqConfig } from '../protocol/types.js' */
 /** @import { Metrics } from '../metrics/metrics.js' */
+/** @import { StructManager } from '../protocol/struct-manager.js' */
 /** @import pino from 'pino' */
 
 /**
@@ -32,6 +33,8 @@ export class WsServer extends EventEmitter {
   #metrics;
   /** @type {pino.Logger} */
   #logger;
+  /** @type {StructManager | null} */
+  #structs;
   #clientCounter = 0;
 
   /**
@@ -39,13 +42,15 @@ export class WsServer extends EventEmitter {
    * @param {DaqConfig} config
    * @param {Metrics} metrics
    * @param {pino.Logger} logger
+   * @param {StructManager} [structs]
    */
-  constructor(daq, config, metrics, logger) {
+  constructor(daq, config, metrics, logger, structs) {
     super();
     this.#daq = daq;
     this.#config = config;
     this.#metrics = metrics;
     this.#logger = logger.child({ component: 'ws' });
+    this.#structs = structs ?? null;
   }
 
   /**
@@ -64,6 +69,13 @@ export class WsServer extends EventEmitter {
     this.#daq.on('subscription:data', (/** @type {string} */ subId, /** @type {any} */ data) => {
       this.#broadcastToSubscribers(subId, data);
     });
+
+    // Broadcast decoded struct data to WS clients
+    if (this.#structs) {
+      this.#structs.on('struct:data', (/** @type {any} */ data) => {
+        this.#broadcastStructData(data);
+      });
+    }
   }
 
   stop() {
@@ -164,6 +176,89 @@ export class WsServer extends EventEmitter {
         break;
       }
 
+      case 'register-struct': {
+        if (!this.#structs) {
+          client.ws.send(JSON.stringify({ error: 'Structs not enabled' }));
+          return;
+        }
+        const { name, db, offset, items } = msg;
+        if (!name || db === undefined || !items) {
+          client.ws.send(JSON.stringify({ error: 'name, db, and items are required' }));
+          return;
+        }
+        if (this.#structs.has(name)) {
+          client.ws.send(JSON.stringify({ error: `Struct "${name}" already registered` }));
+          return;
+        }
+        const struct = this.#structs.register({ name, db, offset: offset ?? 0, items });
+        client.ws.send(JSON.stringify({
+          type: 'struct-registered',
+          name: struct.name, db: struct.db, offset: struct.offset, size: struct.size,
+          fields: struct.items.map((i) => i.name),
+        }));
+        break;
+      }
+
+      case 'subscribe-struct': {
+        if (!this.#structs) {
+          client.ws.send(JSON.stringify({ error: 'Structs not enabled' }));
+          return;
+        }
+        const { name: sName, targetId: sTgt, intervalMs: sInt } = msg;
+        if (!sName || !sTgt || !sInt) {
+          client.ws.send(JSON.stringify({ error: 'name, targetId, and intervalMs required' }));
+          return;
+        }
+        try {
+          const subId = this.#structs.subscribe(sName, sTgt, sInt);
+          client.subscriptionIds.push(subId);
+          client.ws.send(JSON.stringify({
+            type: 'struct-subscribed',
+            subscriptionId: subId,
+            struct: sName,
+          }));
+        } catch (err) {
+          client.ws.send(JSON.stringify({ error: /** @type {Error} */ (err).message }));
+        }
+        break;
+      }
+
+      case 'read-struct': {
+        if (!this.#structs) {
+          client.ws.send(JSON.stringify({ error: 'Structs not enabled' }));
+          return;
+        }
+        const { name: rName, keys: rKeys } = msg;
+        if (!rName) {
+          client.ws.send(JSON.stringify({ error: 'name required' }));
+          return;
+        }
+        this.#structs.read(rName, rKeys).then((values) => {
+          client.ws.send(JSON.stringify({ type: 'struct-data', struct: rName, values, timestamp: Date.now() }));
+        }).catch((err) => {
+          client.ws.send(JSON.stringify({ error: /** @type {Error} */ (err).message }));
+        });
+        break;
+      }
+
+      case 'write-struct': {
+        if (!this.#structs) {
+          client.ws.send(JSON.stringify({ error: 'Structs not enabled' }));
+          return;
+        }
+        const { name: wName, values: wValues } = msg;
+        if (!wName || !wValues) {
+          client.ws.send(JSON.stringify({ error: 'name and values required' }));
+          return;
+        }
+        this.#structs.write(wName, wValues).then(() => {
+          client.ws.send(JSON.stringify({ type: 'struct-written', struct: wName, timestamp: Date.now() }));
+        }).catch((err) => {
+          client.ws.send(JSON.stringify({ error: /** @type {Error} */ (err).message }));
+        });
+        break;
+      }
+
       default:
         client.ws.send(JSON.stringify({ error: `Unknown message type: ${msg.type}` }));
     }
@@ -204,6 +299,33 @@ export class WsServer extends EventEmitter {
           client.droppedFrames = 0;
           client.droppedSince = Date.now();
         }
+        continue;
+      }
+
+      client.ws.send(payload);
+    }
+  }
+
+  /**
+   * Broadcast decoded struct data to clients subscribed to that struct's DAQ subscription.
+   * @param {any} data
+   */
+  #broadcastStructData(data) {
+    const payload = JSON.stringify({
+      type: 'struct-data',
+      struct: data.structName,
+      subscriptionId: data.subscriptionId,
+      targetId: data.targetId,
+      values: data.values,
+      timestamp: data.timestamp,
+    });
+
+    for (const client of this.#clients.values()) {
+      if (!client.subscriptionIds.includes(data.subscriptionId)) continue;
+      if (client.ws.readyState !== WebSocket.OPEN) continue;
+
+      if (client.ws.bufferedAmount > (this.#config.slowClient?.maxSendBufferBytes ?? 65536)) {
+        client.droppedFrames++;
         continue;
       }
 
