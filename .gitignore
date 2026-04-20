@@ -1,7 +1,7 @@
 node_modules
 dist
 build/*
-build/s7engine.wasm
+!build/s7engine.wasm
 package-lock.json
 nul
 
