@@ -1,0 +1,21 @@
+{
+  "targets": {
+    "release": {
+      "outFile": "build/s7engine.wasm",
+      "textFile": "build/s7engine.wat",
+      "sourceMap": true,
+      "optimize": true
+    },
+    "debug": {
+      "outFile": "build/s7engine.debug.wasm",
+      "textFile": "build/s7engine.debug.wat",
+      "sourceMap": true,
+      "debug": true
+    }
+  },
+  "options": {
+    "exportRuntime": true,
+    "runtime": "incremental"
+  },
+  "entries": ["assembly/index.ts"]
+}

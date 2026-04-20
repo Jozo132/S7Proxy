@@ -6,6 +6,13 @@ Build a fully-featured **S7Comm proxy** that sits between S7 clients (SCADA/HMI/
 
 **Key differentiator:** The S7Comm protocol engine (PDU serialization, deserialization, TPKT/COTP framing) runs in **AssemblyScript-compiled WebAssembly** for near-native performance, while **Node.js** provides the TCP networking, configuration, and orchestration layer. AssemblyScript modules communicate with the host's native `net` module through WASM imports/exports.
 
+**Language:** **Vanilla ES6 JavaScript with JSDoc type annotations** — no TypeScript compilation step for the Node.js layer. The WASM engine remains AssemblyScript. JSDoc provides full IDE type-checking, IntelliSense, and type-safety via `// @ts-check` and `jsconfig.json` without a build step.
+
+**Usage modes:**
+1. **NPM package** — `import { S7Proxy, DaqEngine, ConnectionPool } from 's7proxy'` — use as a library in other Node.js projects
+2. **Standalone service** — `node src/index.js` or `npx s7proxy` — run as a daemon with YAML config
+3. **Worker thread** — `new Worker('./src/worker.js', { workerData: config })` — run inside a parent process for isolation/multi-core
+
 **Reference implementation:** [node-snap7](https://github.com/mathiask88/node-snap7) — the API surface, constants, and protocol behavior are modeled after snap7's Client and Server APIs.
 
 ---
@@ -235,28 +242,64 @@ assembly/
 ### 5.1 Project Structure
 
 ```
-src/
-├── index.ts                  # Entry point
-├── config.ts                 # Configuration loader (YAML/JSON/env)
-├── proxy-server.ts           # Main proxy orchestrator
-├── server/
-│   ├── tcp-listener.ts       # net.createServer, accept clients
-│   └── client-session.ts     # Per-client session state machine
-├── client/
-│   ├── plc-connection.ts     # Outbound connection to PLC
-│   ├── connection-pool.ts    # Pool of PLC connections with reconnect
-│   ├── failover-manager.ts   # Health monitoring, failover/failback state machine
-│   └── health-probe.ts       # TCP connect probe for endpoint liveness
-├── wasm/
-│   ├── loader.ts             # Load & instantiate WASM module
-│   ├── bridge.ts             # JS ↔ WASM bridge: buffer copy, call exports
-│   └── imports.ts            # Host import functions provided to WASM
-├── router/
-│   ├── router.ts             # Route client TSAP → PLC target
-│   ├── filter.ts             # Read/write access control filters
-│   └── transform.ts          # Data transformation hooks
-├── protocol/
-│   ├── frame-assembler.ts    # Fastify REST server (management + data API)
+S7Proxy/
+├── package.json              # NPM package with "exports" map
+├── jsconfig.json             # JS type-checking (ts-check equivalent)
+├── asconfig.json             # AssemblyScript compiler config
+├── config/
+│   └── default.yaml          # Default proxy configuration
+├── assembly/                 # AssemblyScript source (→ WASM) — unchanged
+│   ├── index.ts
+│   ├── tpkt.ts, cotp.ts, s7comm.ts, ...
+│   ├── constants.ts, error.ts, memory.ts
+│   ├── pdu-splitter.ts, ring-buffer.ts
+├── build/                    # Compiled WASM output
+│   └── s7engine.wasm
+├── src/                      # Vanilla ES6 JS with JSDoc types
+│   ├── index.js              # Standalone entry point (CLI)
+│   ├── worker.js             # Worker thread entry point
+│   ├── lib.js                # NPM package main export (API surface)
+│   ├── config.js             # Configuration loader (YAML/JSON/env)
+│   ├── proxy-server.js       # Main proxy orchestrator
+│   ├── server/
+│   │   ├── tcp-listener.js
+│   │   └── client-session.js
+│   ├── client/
+│   │   ├── plc-connection.js
+│   │   ├── connection-pool.js
+│   │   ├── failover-manager.js
+│   │   └── health-probe.js
+│   ├── wasm/
+│   │   ├── loader.js
+│   │   ├── bridge.js
+│   │   └── imports.js
+│   ├── router/
+│   │   └── router.js
+│   ├── protocol/
+│   │   ├── types.js          # JSDoc typedefs (no runtime code)
+│   │   ├── constants.js
+│   │   └── frame-assembler.js
+│   ├── api/
+│   │   ├── rest-server.js
+│   │   ├── rest-routes.js
+│   │   └── ws-server.js
+│   ├── daq/
+│   │   ├── daq-engine.js
+│   │   ├── scan-group.js
+│   │   ├── tag-registry.js
+│   │   ├── read-coalescer.js
+│   │   ├── priority-queue.js
+│   │   └── data-cache.js
+│   ├── logging/
+│   │   └── logger.js
+│   └── metrics/
+│       └── metrics.js
+├── test/
+│   ├── unit/
+│   └── integration/
+├── docs/
+└── PLAN.md
+```
 │   ├── rest-routes/
 │   │   ├── plc-data.ts       # GET/POST /api/plc/:target/read, /write (single-shot)
 │   │   ├── daq.ts            # DAQ subscription management via REST
@@ -659,7 +702,6 @@ The critical design detail: how AssemblyScript "directly interacts" with Node.js
 |---|---|
 | `assemblyscript` | AssemblyScript compiler (dev) |
 | `@assemblyscript/loader` | Load WASM modules in Node.js |
-| `typescript` | TypeScript for Node.js layer |
 | `pino` | Structured logging |
 | `fastify` | REST API server (management + data endpoints) |
 | `@fastify/cors` | CORS for browser-based web clients |
@@ -668,8 +710,11 @@ The critical design detail: how AssemblyScript "directly interacts" with Node.js
 | `ws` | Low-level WebSocket server for high-speed DAQ feed |
 | `yaml` | Config file parsing |
 | `prom-client` | Prometheus metrics |
-| `vitest` or `jest` | Testing framework |
+| `eventemitter3` | Fast event emitter |
+| `vitest` | Testing framework (dev) |
 | `node-snap7` | **Dev dependency only** — used for integration testing as a reference client/server |
+
+> **Note:** No `typescript`, `@types/*`, or `tsx` — the Node.js layer is vanilla ES6 JS with JSDoc types. Type checking is done via `jsconfig.json` + `// @ts-check`.
 
 ---
 
@@ -803,9 +848,11 @@ S7Proxy/
 | Protocol codec runtime | AssemblyScript → WASM | Near-native speed for hot-path parsing; deterministic memory; no GC pauses |
 | Networking runtime | Node.js `net` module | Mature, async, handles TCP lifecycle; WASM can't do sockets |
 | JS ↔ WASM data passing | Shared linear memory (typed views) | Avoids copy overhead; `Buffer.from(wasmMemory.buffer, offset, len)` |
+| Node.js language | Vanilla ES6 JS + JSDoc types | Zero build step; `// @ts-check` gives TS-level type safety; simpler tooling |
 | API style | async/await (Promises) | Node.js idiom; no blocking; unlike node-snap7's sync+callback dual mode |
 | Configuration | YAML + env overrides | Human-readable, 12-factor app compatible |
 | Testing reference | node-snap7 as dev dep | Known-good S7 implementation for integration test clients |
+| Package distribution | NPM package + standalone binary + worker | Triple entry points via `exports` map, `bin` field, `worker.js` |
 | Failover strategy | Threshold-based with auto/manual failback | Prevents flapping; `failbackDelayMs` + hysteresis ensures stability; session migration keeps clients connected |
 | PLC connections | Persistent, always-open, pre-established | Eliminates per-request connection overhead; enables high-speed DAQ; keep-alive + auto-reconnect |
 | Web data access | REST for single-shot, WS for DAQ subscriptions | REST is simple/stateless for ad-hoc reads; WS avoids HTTP overhead for high-frequency push |
@@ -1523,3 +1570,223 @@ s7proxy_plc_connection_reconnects_total{target="plc-line1"}              2
 s7proxy_plc_amq_slots_free{target="plc-line1", conn="0"}                6
 s7proxy_plc_amq_slots_total{target="plc-line1", conn="0"}               8
 ```
+
+---
+
+## 16. Vanilla ES6 JavaScript + JSDoc Approach
+
+### 16.1 Rationale
+
+Remove the TypeScript compilation step for the Node.js layer. Use **Vanilla ES6 JavaScript** with **JSDoc type annotations** for full IDE type-checking and IntelliSense without a build pipeline. Benefits:
+
+- **Zero build step** — run `node src/index.js` directly
+- **Simpler debugging** — no source maps needed; line numbers match source
+- **Full type safety** — `// @ts-check` + `jsconfig.json` gives TypeScript-level checking in VS Code
+- **Lighter dependencies** — no `typescript`, no `@types/*`, no `tsx`
+
+### 16.2 JSDoc Type Strategy
+
+All TypeScript interfaces and types are converted to JSDoc `@typedef` declarations in `src/protocol/types.js`. This file contains **only JSDoc comments** — no runtime code — and serves as the central type definition hub.
+
+```javascript
+// src/protocol/types.js
+// @ts-check
+
+/**
+ * @typedef {'NEW' | 'COTP_PENDING' | 'COTP_CONNECTED' | 'S7_NEGOTIATING' | 'ESTABLISHED' | 'CLOSED'} SessionState
+ */
+
+/**
+ * @typedef {Object} SessionInfo
+ * @property {string} id
+ * @property {SessionState} state
+ * @property {string} remoteAddress
+ * @property {number} remotePort
+ * @property {string} [targetId]
+ * @property {number} connectedAt
+ * @property {number} pduSize
+ * @property {number} pdusForwarded
+ * @property {number} errors
+ */
+
+// ... all other types as @typedef
+```
+
+Every `.js` file starts with `// @ts-check` and imports types via:
+```javascript
+/** @import { SessionState, SessionInfo } from './protocol/types.js' */
+```
+
+### 16.3 jsconfig.json
+
+Replaces `tsconfig.json` for the JS layer:
+
+```json
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "checkJs": true,
+    "strict": true,
+    "noEmit": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": {
+      "#src/*": ["./src/*"]
+    }
+  },
+  "include": ["src/**/*.js"],
+  "exclude": ["node_modules", "build", "assembly"]
+}
+```
+
+### 16.4 Package Structure — Triple Entry Point
+
+#### package.json exports map
+
+```json
+{
+  "name": "s7proxy",
+  "type": "module",
+  "exports": {
+    ".": {
+      "import": "./src/lib.js",
+      "types": "./src/protocol/types.js"
+    },
+    "./worker": {
+      "import": "./src/worker.js"
+    }
+  },
+  "main": "./src/lib.js",
+  "bin": {
+    "s7proxy": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "build/s7engine.wasm",
+    "config/default.yaml",
+    "README.md"
+  ]
+}
+```
+
+#### Entry Point: NPM Package (`src/lib.js`)
+
+```javascript
+// @ts-check
+export { ProxyServer } from './proxy-server.js';
+export { ConnectionPool } from './client/connection-pool.js';
+export { FailoverManager } from './client/failover-manager.js';
+export { DaqEngine } from './daq/daq-engine.js';
+export { PriorityQueue } from './daq/priority-queue.js';
+export { DataCache } from './daq/data-cache.js';
+export { WasmBridge } from './wasm/bridge.js';
+export { loadConfig } from './config.js';
+export { createLogger } from './logging/logger.js';
+```
+
+#### Entry Point: Standalone Service (`src/index.js`)
+
+```javascript
+#!/usr/bin/env node
+// @ts-check
+import { loadConfig } from './config.js';
+import { ProxyServer } from './proxy-server.js';
+import { createLogger } from './logging/logger.js';
+
+const config = loadConfig();
+const logger = createLogger(config.logging);
+const server = new ProxyServer(config, logger);
+
+process.on('SIGINT', () => server.shutdown());
+process.on('SIGTERM', () => server.shutdown());
+
+await server.start();
+```
+
+#### Entry Point: Worker Thread (`src/worker.js`)
+
+```javascript
+// @ts-check
+import { workerData, parentPort } from 'node:worker_threads';
+import { ProxyServer } from './proxy-server.js';
+import { createLogger } from './logging/logger.js';
+
+const config = workerData;
+const logger = createLogger(config.logging);
+const server = new ProxyServer(config, logger);
+
+parentPort?.on('message', async (msg) => {
+  switch (msg.type) {
+    case 'shutdown':
+      await server.shutdown();
+      process.exit(0);
+      break;
+    case 'status':
+      parentPort?.postMessage({ type: 'status', data: server.getStatus() });
+      break;
+  }
+});
+
+await server.start();
+parentPort?.postMessage({ type: 'ready' });
+```
+
+### 16.5 Dependencies (Updated)
+
+| Package | Purpose | Type |
+|---|---|---|
+| `assemblyscript` | AssemblyScript compiler | dev |
+| `@assemblyscript/loader` | Load WASM modules in Node.js | production |
+| `pino` | Structured logging | production |
+| `fastify` | REST API server | production |
+| `@fastify/cors` | CORS support | production |
+| `@fastify/rate-limit` | Rate limiting | production |
+| `@fastify/websocket` | WS integration with Fastify | production |
+| `ws` | WebSocket server | production |
+| `yaml` | Config file parsing | production |
+| `prom-client` | Prometheus metrics | production |
+| `eventemitter3` | Fast event emitter | production |
+| `vitest` | Testing framework | dev |
+
+**Removed:** `typescript`, `@types/node`, `@types/ws`, `tsx`
+
+### 16.6 Scripts
+
+```json
+{
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "build:wasm": "asc assembly/index.ts --outFile build/s7engine.wasm --optimize --exportRuntime",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --project jsconfig.json --noEmit",
+    "check-types": "tsc --project jsconfig.json --noEmit"
+  }
+}
+```
+
+Note: `tsc --noEmit` can still be used with `jsconfig.json` for CI type-checking even though we don't compile. For local dev, VS Code checks types automatically via `// @ts-check`.
+
+### 16.7 Migration Checklist (TS → ES6 JS + JSDoc)
+
+1. ☐ Replace `tsconfig.json` with `jsconfig.json`
+2. ☐ Remove `typescript`, `@types/node`, `@types/ws`, `tsx` from dependencies
+3. ☐ Convert `src/protocol/types.ts` → `types.js` (all interfaces → `@typedef`)
+4. ☐ Remove `src/global.d.ts` (no longer needed)
+5. ☐ For each `.ts` file in `src/`:
+   - Rename to `.js`
+   - Add `// @ts-check` at top
+   - Convert type annotations to JSDoc (`@param`, `@returns`, `@type`)
+   - Convert `interface`/`type` to `@typedef`
+   - Replace `import type` with `/** @import { Type } from '...' */`
+   - Update all `.ts` → `.js` import specifiers
+6. ☐ Create `src/lib.js` (NPM package exports)
+7. ☐ Create `src/worker.js` (worker_threads entry point)
+8. ☐ Update `src/index.js` (standalone entry with shebang)
+9. ☐ Update `package.json` (`exports`, `bin`, `files`, scripts, remove TS deps)
+10. ☐ Verify `node src/index.js` starts without errors
+11. ☐ Verify `import { ProxyServer } from 's7proxy'` resolves correctly

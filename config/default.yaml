@@ -1,0 +1,73 @@
+# S7Proxy default configuration
+
+listen:
+  ip: "0.0.0.0"
+  port: 102
+
+targets:
+  - id: plc1
+    primary:
+      ip: "192.168.1.10"
+      rack: 0
+      slot: 1
+    # backups:
+    #   - ip: "192.168.1.11"
+    #     rack: 0
+    #     slot: 1
+    maxConnections: 2
+    requestTimeoutMs: 3000
+    keepAliveIntervalMs: 30000
+    reconnectBackoffMs: [1000, 2000, 4000, 8000, 15000]
+
+routing: []
+  # - srcIp: "192.168.1.100"
+  #   targetId: plc1
+  # - dstTsap: 0x0102
+  #   targetId: plc1
+
+filters: []
+  # - action: deny
+  #   srcIp: "10.0.0.0/8"
+
+failover:
+  healthCheckIntervalMs: 3000
+  healthCheckTimeoutMs: 1500
+  failoverThreshold: 3
+  failbackMode: auto
+  failbackDelayMs: 15000
+  failbackThreshold: 5
+  healthProbeMode: tcp
+
+webApi:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+  cors:
+    origin: "*"
+  rateLimit:
+    max: 100
+    windowMs: 60000
+
+daq:
+  minScanIntervalMs: 20
+  maxScanGroupsPerTarget: 50
+  maxTagsPerSubscription: 500
+  maxGapBytes: 32
+  cacheEnabled: true
+  cacheTtlMs: 5000
+  priorityQueue:
+    fairnessWindow: 10
+    agingThresholdMs: 2000
+  slowClient:
+    maxSendBufferBytes: 65536
+    maxDroppedFrames: 100
+    dropWindowMs: 10000
+
+logging:
+  level: info
+  # pretty: true
+
+metrics:
+  enabled: true
+  port: 9090
+  path: /metrics
