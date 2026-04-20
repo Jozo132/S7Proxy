@@ -636,7 +636,7 @@ function renderTargets() {
     const conns = t ? (state?.connections||[]).filter(c => c.targetId === t.id) : [];
     const badges = t
       ? `<span class="badge ${t.active?'ok':'warn'}">${t.active?'Active':'Standby'}</span>`
-        + `<span class="badge ${t.source==='config'?'warn':'info'}">${esc(t.source||'database')}</span>`
+        + `<span class="badge ${t.source==='config'?'warn':'info'}">${esc(t.source||'persisted')}</span>`
         + (conns.length ? `<span class="badge ok">${conns.length} conn</span>` : '<span class="badge warn">No connections</span>')
       : '<span class="badge warn">Unassigned</span>';
 

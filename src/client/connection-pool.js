@@ -1,7 +1,7 @@
 // @ts-check
 // Connection pool for a single PLC target
 
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { PlcConnection } from './plc-connection.js';
 import { FailoverManager } from './failover-manager.js';
 

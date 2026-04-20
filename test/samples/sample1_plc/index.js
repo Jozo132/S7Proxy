@@ -84,7 +84,7 @@ async function readWithSnap7() {
   console.log('  Connected via snap7');
 
   const buf = await new Promise((resolve, reject) => {
-    client.DBRead(DB_NUMBER, BYTE_OFFSET, READ_BYTES, (/** @type {number} */ err, /** @type {Buffer} */ data) => {
+    client.DBRead(DB_NUMBER, BYTE_OFFSET, READ_BYTES, (/** @type {number} */ err, /** @type {Buffer | undefined} */ data) => {
       if (err) return reject(new Error(`snap7 DBRead failed: ${err}`));
       resolve(data);
     });
@@ -277,40 +277,21 @@ async function startS7Proxy() {
 
   // Write temp config
   const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 's7proxy-sample-'));
-  const cfgPath = path.join(tmpDir, 'config.yaml');
-  const yaml = [
-    'listen:',
-    '  ip: "0.0.0.0"',
-    '  port: 10102',
-    '',
-    'targets:',
-    '  - id: plc1',
-    '    primary:',
-    `      ip: "${PLC_IP}"`,
-    `      rack: ${PLC_RACK}`,
-    `      slot: ${PLC_SLOT}`,
-    '    maxConnections: 2',
-    '    requestTimeoutMs: 3000',
-    '',
-    'webApi:',
-    '  enabled: true',
-    '  host: "0.0.0.0"',
-    `  port: ${WEB_PORT}`,
-    '  cors:',
-    '    origin: "*"',
-    '',
-    'daq:',
-    '  minScanIntervalMs: 20',
-    '  cacheEnabled: true',
-    '  cacheTtlMs: 5000',
-    '',
-    'logging:',
-    '  level: warn',
-    '',
-    'metrics:',
-    '  enabled: false',
-  ].join('\n');
-  fs.writeFileSync(cfgPath, yaml, 'utf-8');
+  const cfgPath = path.join(tmpDir, 'config.json');
+  const config = {
+    listen: { ip: '0.0.0.0', port: 10102 },
+    targets: [{
+      id: 'plc1',
+      primary: { ip: PLC_IP, rack: PLC_RACK, slot: PLC_SLOT },
+      maxConnections: 2,
+      requestTimeoutMs: 3000,
+    }],
+    webApi: { enabled: true, host: '0.0.0.0', port: WEB_PORT, cors: { origin: '*' } },
+    daq: { minScanIntervalMs: 20, cacheEnabled: true, cacheTtlMs: 5000 },
+    logging: { level: 'warn' },
+    metrics: { enabled: false },
+  };
+  fs.writeFileSync(cfgPath, JSON.stringify(config, null, 2), 'utf-8');
 
   // Determine project root (3 levels up from this file)
   const __dirname = dirname(fileURLToPath(import.meta.url));

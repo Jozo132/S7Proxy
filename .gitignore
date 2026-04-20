@@ -5,4 +5,5 @@ build/*
 package-lock.json
 nul
 data/*.db*
+data/s7proxy.json
 

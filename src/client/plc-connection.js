@@ -3,7 +3,7 @@
 // Handles TCP socket, COTP handshake, S7 Setup Communication
 
 import { Socket } from 'node:net';
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { FrameAssembler } from '../protocol/frame-assembler.js';
 import { WasmBridge } from '../wasm/bridge.js';
 import { S7_DEFAULT_PORT, CONNTYPE_PG, calcTsap, DEFAULT_PDU_SIZE, DEFAULT_AMQ, COTP_CC, S7_FN_SETUP_COMM, S7_MSG_ACK } from '../protocol/constants.js';

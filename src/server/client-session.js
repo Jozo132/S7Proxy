@@ -1,7 +1,7 @@
 // @ts-check
 // Inbound client session — handles COTP/S7 handshake and request proxying
 
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { FrameAssembler } from '../protocol/frame-assembler.js';
 import { COTP_CR, COTP_DT, COTP_DR, S7_FN_SETUP_COMM, DEFAULT_PDU_SIZE, DEFAULT_AMQ } from '../protocol/constants.js';
 

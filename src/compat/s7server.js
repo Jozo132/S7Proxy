@@ -3,7 +3,7 @@
 // Supports custom port via SetParam(S7Server.LocalPort, port) or StartTo(ip, callback)
 
 import { createServer } from 'node:net';
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { FrameAssembler } from '../protocol/frame-assembler.js';
 import { WasmBridge } from '../wasm/bridge.js';
 import { loadWasmEngine } from '../wasm/loader.js';

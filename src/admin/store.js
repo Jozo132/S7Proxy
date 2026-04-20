@@ -1,10 +1,9 @@
 // @ts-check
-// SQLite persistence layer for S7Proxy admin configuration and struct storage.
-// Uses better-sqlite3 for synchronous, zero-dependency embedded database.
+// JSON persistence layer for S7Proxy admin configuration and struct storage.
+// Uses a small file-backed store to keep the package portable and dependency-light.
 
-import Database from 'better-sqlite3';
-import { existsSync, mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, rmSync, renameSync, writeFileSync } from 'node:fs';
+import { basename, dirname, extname, join, resolve } from 'node:path';
 
 /** @import { S7StructDef } from '../protocol/db-struct.js' */
 /** @import pino from 'pino' */
@@ -14,131 +13,146 @@ import { dirname } from 'node:path';
  * @property {string} name
  * @property {number} db
  * @property {number} offset
- * @property {string} items_json  - JSON-serialized S7StructItem[]
- * @property {string} [target_id]
+ * @property {import('../protocol/db-struct.js').S7StructItem[]} items
+ * @property {string} [targetId]
  * @property {string} [description]
- * @property {string} [subscribe_mode]
- * @property {string} [subscribe_items_json]
- * @property {number} [subscribe_interval_ms]
- * @property {string} [subscribe_target_id]
- * @property {number} created_at
- * @property {number} updated_at
+ * @property {'none' | 'struct' | 'items'} [subscribeMode]
+ * @property {string[]} [subscribeItems]
+ * @property {number} [subscribeIntervalMs]
+ * @property {string} [subscribeTargetId]
+ * @property {number} createdAt
+ * @property {number} updatedAt
  */
 
 /**
  * @typedef {Object} StoredTarget
  * @property {string} id
- * @property {string} primary_ip
- * @property {number} primary_rack
- * @property {number} primary_slot
- * @property {number} [primary_port]
- * @property {string} [backups_json]
- * @property {number} max_connections
- * @property {number} [request_timeout_ms]
- * @property {number} [keep_alive_interval_ms]
- * @property {string} [reconnect_backoff_json]
- * @property {number} created_at
- * @property {number} updated_at
+ * @property {{ ip: string, rack: number, slot: number, port?: number }} primary
+ * @property {Array<{ ip: string, rack: number, slot: number, port?: number }>} [backups]
+ * @property {number} maxConnections
+ * @property {number} [requestTimeoutMs]
+ * @property {number} [keepAliveIntervalMs]
+ * @property {number[]} [reconnectBackoffMs]
+ * @property {number} createdAt
+ * @property {number} updatedAt
  */
 
 /**
  * @typedef {Object} StoredSetting
- * @property {string} key
  * @property {string} value
- * @property {number} updated_at
+ * @property {number} updatedAt
  */
 
+/**
+ * @typedef {Object} AuditEntry
+ * @property {number} id
+ * @property {number} timestamp
+ * @property {string} action
+ * @property {string | null} entity
+ * @property {string | null} detail
+ */
+
+/**
+ * @typedef {Object} StoreData
+ * @property {number} schemaVersion
+ * @property {Record<string, StoredStruct>} structs
+ * @property {Record<string, StoredTarget>} targets
+ * @property {Record<string, StoredSetting>} settings
+ * @property {AuditEntry[]} auditLog
+ * @property {number} nextAuditId
+ */
+
+const STORE_SCHEMA_VERSION = 1;
+
+/** @returns {StoreData} */
+function createEmptyStoreData() {
+  return {
+    schemaVersion: STORE_SCHEMA_VERSION,
+    structs: {},
+    targets: {},
+    settings: {},
+    auditLog: [],
+    nextAuditId: 1,
+  };
+}
+
+/**
+ * @param {string} persistencePath
+ * @returns {string}
+ */
+function resolveStorePath(persistencePath) {
+  const absolutePath = resolve(persistencePath);
+  if (extname(absolutePath).toLowerCase() === '.json') return absolutePath;
+
+  const dir = dirname(absolutePath);
+  const stem = basename(absolutePath, extname(absolutePath)) || 's7proxy';
+  return join(dir, `${stem}.json`);
+}
+
+/**
+ * @param {StoreData} data
+ * @returns {StoreData}
+ */
+function normalizeStoreData(data) {
+  return {
+    schemaVersion: STORE_SCHEMA_VERSION,
+    structs: data.structs && typeof data.structs === 'object' ? data.structs : {},
+    targets: data.targets && typeof data.targets === 'object' ? data.targets : {},
+    settings: data.settings && typeof data.settings === 'object' ? data.settings : {},
+    auditLog: Array.isArray(data.auditLog) ? data.auditLog : [],
+    nextAuditId: Number.isSafeInteger(data.nextAuditId) && data.nextAuditId > 0
+      ? data.nextAuditId
+      : ((Array.isArray(data.auditLog) && data.auditLog.length > 0)
+        ? Math.max(...data.auditLog.map((entry) => Number.isSafeInteger(entry.id) ? entry.id : 0)) + 1
+        : 1),
+  };
+}
+
 export class AdminStore {
-  /** @type {Database.Database} */
-  #db;
+  /** @type {string} */
+  #filePath;
+  /** @type {StoreData} */
+  #data;
   /** @type {pino.Logger | null} */
   #logger;
 
   /**
-   * @param {string} dbPath  - Path to the SQLite database file
+   * @param {string} persistencePath  - Path to the JSON store file, or a legacy .db-style path whose basename will be converted to .json
    * @param {pino.Logger} [logger]
    */
-  constructor(dbPath, logger) {
+  constructor(persistencePath, logger) {
     this.#logger = logger ?? null;
+    this.#filePath = resolveStorePath(persistencePath);
 
     // Ensure directory exists
-    const dir = dirname(dbPath);
+    const dir = dirname(this.#filePath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
 
-    this.#db = new Database(dbPath);
-    this.#db.pragma('journal_mode = WAL');
-    this.#db.pragma('foreign_keys = ON');
-    this.#migrate();
-    this.#logger?.info({ dbPath }, 'Admin store initialized');
-  }
-
-  // ─── Schema migration ───────────────────────────────────────────────────
-
-  #migrate() {
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS structs (
-        name                  TEXT PRIMARY KEY,
-        db                    INTEGER NOT NULL,
-        "offset"              INTEGER NOT NULL DEFAULT 0,
-        items_json            TEXT    NOT NULL,
-        target_id             TEXT,
-        description           TEXT,
-        subscribe_mode        TEXT,
-        subscribe_items_json  TEXT,
-        subscribe_interval_ms INTEGER,
-        subscribe_target_id   TEXT,
-        created_at            INTEGER NOT NULL,
-        updated_at            INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS targets (
-        id               TEXT PRIMARY KEY,
-        primary_ip       TEXT    NOT NULL,
-        primary_rack     INTEGER NOT NULL DEFAULT 0,
-        primary_slot     INTEGER NOT NULL DEFAULT 1,
-        primary_port     INTEGER,
-        backups_json     TEXT,
-        max_connections  INTEGER NOT NULL DEFAULT 4,
-        request_timeout_ms INTEGER,
-        keep_alive_interval_ms INTEGER,
-        reconnect_backoff_json TEXT,
-        created_at       INTEGER NOT NULL,
-        updated_at       INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS settings (
-        key        TEXT PRIMARY KEY,
-        value      TEXT NOT NULL,
-        updated_at INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS audit_log (
-        id         INTEGER PRIMARY KEY AUTOINCREMENT,
-        timestamp  INTEGER NOT NULL,
-        action     TEXT    NOT NULL,
-        entity     TEXT,
-        detail     TEXT
-      );
-    `);
-
-    this.#ensureColumn('structs', 'target_id', 'TEXT');
-    this.#ensureColumn('structs', 'subscribe_mode', 'TEXT');
-    this.#ensureColumn('structs', 'subscribe_items_json', 'TEXT');
-    this.#ensureColumn('targets', 'request_timeout_ms', 'INTEGER');
-    this.#ensureColumn('targets', 'keep_alive_interval_ms', 'INTEGER');
-    this.#ensureColumn('targets', 'reconnect_backoff_json', 'TEXT');
+    this.#data = this.#load();
+    this.#logger?.info({ filePath: this.#filePath }, 'Admin store initialized');
   }
 
   /**
-   * @param {string} table
-   * @param {string} column
-   * @param {string} definition
+   * @returns {StoreData}
    */
-  #ensureColumn(table, column, definition) {
-    const columns = /** @type {Array<{ name: string }>} */ (this.#db.prepare(`PRAGMA table_info(${table})`).all());
-    if (!columns.some((c) => c.name === column)) {
-      this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  #load() {
+    if (!existsSync(this.#filePath)) return createEmptyStoreData();
+
+    const raw = readFileSync(this.#filePath, 'utf8').trim();
+    if (!raw) return createEmptyStoreData();
+
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') {
+      throw new Error(`Invalid admin store file: ${this.#filePath}`);
     }
+    return normalizeStoreData(/** @type {StoreData} */ (parsed));
+  }
+
+  #save() {
+    const tempPath = `${this.#filePath}.tmp`;
+    writeFileSync(tempPath, `${JSON.stringify(this.#data, null, 2)}\n`, 'utf8');
+    rmSync(this.#filePath, { force: true });
+    renameSync(tempPath, this.#filePath);
   }
 
   // ─── Structs ────────────────────────────────────────────────────────────
@@ -157,45 +171,25 @@ export class AdminStore {
    */
   saveStruct(def, opts) {
     const now = Date.now();
-    const stmt = this.#db.prepare(`
-      INSERT INTO structs (
-        name, db, "offset", items_json, target_id, description,
-        subscribe_mode, subscribe_items_json, subscribe_interval_ms, subscribe_target_id,
-        created_at, updated_at
-      )
-      VALUES (
-        @name, @db, @offset, @items_json, @target_id, @description,
-        @subscribe_mode, @subscribe_items_json, @subscribe_interval_ms, @subscribe_target_id,
-        @now, @now
-      )
-      ON CONFLICT(name) DO UPDATE SET
-        db = @db,
-        "offset" = @offset,
-        items_json = @items_json,
-        target_id = @target_id,
-        description = @description,
-        subscribe_mode = @subscribe_mode,
-        subscribe_items_json = @subscribe_items_json,
-        subscribe_interval_ms = @subscribe_interval_ms,
-        subscribe_target_id = @subscribe_target_id,
-        updated_at = @now
-    `);
     const subscribeMode = opts?.subscribeMode ?? (opts?.subscribeIntervalMs ? 'struct' : 'none');
     const subscribeTargetId = opts?.subscribeTargetId ?? opts?.targetId ?? null;
-    stmt.run({
+    const existing = this.#data.structs[def.name];
+    this.#data.structs[def.name] = {
       name: def.name,
       db: def.db,
       offset: def.offset ?? 0,
-      items_json: JSON.stringify(def.items),
-      target_id: opts?.targetId ?? null,
-      description: opts?.description ?? null,
-      subscribe_mode: subscribeMode,
-      subscribe_items_json: opts?.subscribeItems?.length ? JSON.stringify(opts.subscribeItems) : null,
-      subscribe_interval_ms: opts?.subscribeIntervalMs ?? null,
-      subscribe_target_id: subscribeTargetId,
-      now,
-    });
+      items: JSON.parse(JSON.stringify(def.items)),
+      targetId: opts?.targetId ?? undefined,
+      description: opts?.description ?? undefined,
+      subscribeMode,
+      subscribeItems: opts?.subscribeItems?.length ? [...opts.subscribeItems] : undefined,
+      subscribeIntervalMs: opts?.subscribeIntervalMs ?? undefined,
+      subscribeTargetId: subscribeTargetId ?? undefined,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
     this.#audit('struct:save', def.name, `DB${def.db} offset=${def.offset ?? 0} target=${opts?.targetId ?? 'unassigned'}`);
+    this.#save();
   }
 
   /**
@@ -210,18 +204,19 @@ export class AdminStore {
    * }>}
    */
   loadStructs() {
-    const rows = /** @type {StoredStruct[]} */ (this.#db.prepare('SELECT * FROM structs ORDER BY name').all());
-    return rows.map((r) => ({
+    return Object.values(this.#data.structs)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((r) => ({
       name: r.name,
       db: r.db,
       offset: r.offset,
-      items: JSON.parse(r.items_json),
-      targetId: r.target_id ?? r.subscribe_target_id ?? undefined,
+      items: JSON.parse(JSON.stringify(r.items)),
+      targetId: r.targetId ?? r.subscribeTargetId ?? undefined,
       description: r.description ?? undefined,
-      subscribeMode: /** @type {'none' | 'struct' | 'items' | undefined} */ (r.subscribe_mode ?? (r.subscribe_interval_ms ? 'struct' : 'none')),
-      subscribeItems: r.subscribe_items_json ? JSON.parse(r.subscribe_items_json) : undefined,
-      subscribeIntervalMs: r.subscribe_interval_ms ?? undefined,
-      subscribeTargetId: r.subscribe_target_id ?? undefined,
+      subscribeMode: /** @type {'none' | 'struct' | 'items' | undefined} */ (r.subscribeMode ?? (r.subscribeIntervalMs ? 'struct' : 'none')),
+      subscribeItems: r.subscribeItems ? [...r.subscribeItems] : undefined,
+      subscribeIntervalMs: r.subscribeIntervalMs ?? undefined,
+      subscribeTargetId: r.subscribeTargetId ?? undefined,
     }));
   }
 
@@ -238,19 +233,19 @@ export class AdminStore {
    * }) | undefined}
    */
   getStruct(name) {
-    const r = /** @type {StoredStruct | undefined} */ (this.#db.prepare('SELECT * FROM structs WHERE name = ?').get(name));
+    const r = this.#data.structs[name];
     if (!r) return undefined;
     return {
       name: r.name,
       db: r.db,
       offset: r.offset,
-      items: JSON.parse(r.items_json),
-      targetId: r.target_id ?? r.subscribe_target_id ?? undefined,
+      items: JSON.parse(JSON.stringify(r.items)),
+      targetId: r.targetId ?? r.subscribeTargetId ?? undefined,
       description: r.description ?? undefined,
-      subscribeMode: /** @type {'none' | 'struct' | 'items' | undefined} */ (r.subscribe_mode ?? (r.subscribe_interval_ms ? 'struct' : 'none')),
-      subscribeItems: r.subscribe_items_json ? JSON.parse(r.subscribe_items_json) : undefined,
-      subscribeIntervalMs: r.subscribe_interval_ms ?? undefined,
-      subscribeTargetId: r.subscribe_target_id ?? undefined,
+      subscribeMode: /** @type {'none' | 'struct' | 'items' | undefined} */ (r.subscribeMode ?? (r.subscribeIntervalMs ? 'struct' : 'none')),
+      subscribeItems: r.subscribeItems ? [...r.subscribeItems] : undefined,
+      subscribeIntervalMs: r.subscribeIntervalMs ?? undefined,
+      subscribeTargetId: r.subscribeTargetId ?? undefined,
     };
   }
 
@@ -260,9 +255,11 @@ export class AdminStore {
    * @returns {boolean}
    */
   deleteStruct(name) {
-    const result = this.#db.prepare('DELETE FROM structs WHERE name = ?').run(name);
-    if (result.changes > 0) this.#audit('struct:delete', name);
-    return result.changes > 0;
+    if (!(name in this.#data.structs)) return false;
+    delete this.#data.structs[name];
+    this.#audit('struct:delete', name);
+    this.#save();
+    return true;
   }
 
   // ─── Targets ────────────────────────────────────────────────────────────
@@ -281,39 +278,20 @@ export class AdminStore {
    */
   saveTarget(target) {
     const now = Date.now();
-    this.#db.prepare(`
-      INSERT INTO targets (
-        id, primary_ip, primary_rack, primary_slot, primary_port, backups_json,
-        max_connections, request_timeout_ms, keep_alive_interval_ms, reconnect_backoff_json,
-        created_at, updated_at
-      )
-      VALUES (
-        @id, @ip, @rack, @slot, @port, @backups,
-        @maxConn, @requestTimeoutMs, @keepAliveIntervalMs, @reconnectBackoffJson,
-        @now, @now
-      )
-      ON CONFLICT(id) DO UPDATE SET
-        primary_ip = @ip, primary_rack = @rack, primary_slot = @slot, primary_port = @port,
-        backups_json = @backups,
-        max_connections = @maxConn,
-        request_timeout_ms = @requestTimeoutMs,
-        keep_alive_interval_ms = @keepAliveIntervalMs,
-        reconnect_backoff_json = @reconnectBackoffJson,
-        updated_at = @now
-    `).run({
+    const existing = this.#data.targets[target.id];
+    this.#data.targets[target.id] = {
       id: target.id,
-      ip: target.primary.ip,
-      rack: target.primary.rack,
-      slot: target.primary.slot,
-      port: target.primary.port ?? null,
-      backups: target.backups ? JSON.stringify(target.backups) : null,
-      maxConn: target.maxConnections ?? 4,
-      requestTimeoutMs: target.requestTimeoutMs ?? null,
-      keepAliveIntervalMs: target.keepAliveIntervalMs ?? null,
-      reconnectBackoffJson: target.reconnectBackoffMs?.length ? JSON.stringify(target.reconnectBackoffMs) : null,
-      now,
-    });
+      primary: { ...target.primary },
+      backups: target.backups?.map((backup) => ({ ...backup })),
+      maxConnections: target.maxConnections ?? 4,
+      requestTimeoutMs: target.requestTimeoutMs ?? undefined,
+      keepAliveIntervalMs: target.keepAliveIntervalMs ?? undefined,
+      reconnectBackoffMs: target.reconnectBackoffMs?.length ? [...target.reconnectBackoffMs] : undefined,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
     this.#audit('target:save', target.id, target.primary.ip);
+    this.#save();
   }
 
   /**
@@ -329,15 +307,16 @@ export class AdminStore {
    * }>}
    */
   loadTargets() {
-    const rows = /** @type {StoredTarget[]} */ (this.#db.prepare('SELECT * FROM targets ORDER BY id').all());
-    return rows.map((r) => ({
+    return Object.values(this.#data.targets)
+      .sort((a, b) => a.id.localeCompare(b.id))
+      .map((r) => ({
       id: r.id,
-      primary: { ip: r.primary_ip, rack: r.primary_rack, slot: r.primary_slot, ...(r.primary_port ? { port: r.primary_port } : {}) },
-      ...(r.backups_json ? { backups: JSON.parse(r.backups_json) } : {}),
-      maxConnections: r.max_connections,
-      ...(r.request_timeout_ms != null ? { requestTimeoutMs: r.request_timeout_ms } : {}),
-      ...(r.keep_alive_interval_ms != null ? { keepAliveIntervalMs: r.keep_alive_interval_ms } : {}),
-      ...(r.reconnect_backoff_json ? { reconnectBackoffMs: JSON.parse(r.reconnect_backoff_json) } : {}),
+      primary: { ...r.primary },
+      ...(r.backups ? { backups: r.backups.map((backup) => ({ ...backup })) } : {}),
+      maxConnections: r.maxConnections,
+      ...(r.requestTimeoutMs != null ? { requestTimeoutMs: r.requestTimeoutMs } : {}),
+      ...(r.keepAliveIntervalMs != null ? { keepAliveIntervalMs: r.keepAliveIntervalMs } : {}),
+      ...(r.reconnectBackoffMs ? { reconnectBackoffMs: [...r.reconnectBackoffMs] } : {}),
     }));
   }
 
@@ -347,9 +326,11 @@ export class AdminStore {
    * @returns {boolean}
    */
   deleteTarget(id) {
-    const result = this.#db.prepare('DELETE FROM targets WHERE id = ?').run(id);
-    if (result.changes > 0) this.#audit('target:delete', id);
-    return result.changes > 0;
+    if (!(id in this.#data.targets)) return false;
+    delete this.#data.targets[id];
+    this.#audit('target:delete', id);
+    this.#save();
+    return true;
   }
 
   // ─── Settings ───────────────────────────────────────────────────────────
@@ -360,10 +341,8 @@ export class AdminStore {
    */
   setSetting(key, value) {
     const now = Date.now();
-    this.#db.prepare(`
-      INSERT INTO settings (key, value, updated_at) VALUES (@key, @value, @now)
-      ON CONFLICT(key) DO UPDATE SET value = @value, updated_at = @now
-    `).run({ key, value, now });
+    this.#data.settings[key] = { value, updatedAt: now };
+    this.#save();
   }
 
   /**
@@ -372,7 +351,7 @@ export class AdminStore {
    * @returns {string | undefined}
    */
   getSetting(key, defaultValue) {
-    const row = /** @type {{ value: string } | undefined} */ (this.#db.prepare('SELECT value FROM settings WHERE key = ?').get(key));
+    const row = this.#data.settings[key];
     return row?.value ?? defaultValue;
   }
 
@@ -380,10 +359,9 @@ export class AdminStore {
    * @returns {Record<string, string>}
    */
   getAllSettings() {
-    const rows = /** @type {{ key: string, value: string }[]} */ (this.#db.prepare('SELECT key, value FROM settings').all());
     /** @type {Record<string, string>} */
     const out = {};
-    for (const r of rows) out[r.key] = r.value;
+    for (const [key, setting] of Object.entries(this.#data.settings)) out[key] = setting.value;
     return out;
   }
 
@@ -408,6 +386,7 @@ export class AdminStore {
     else current.delete(targetId);
     this.setSetting('disabledTargets', JSON.stringify([...current]));
     this.#audit(disabled ? 'target:disable' : 'target:enable', targetId);
+    this.#save();
   }
 
   // ─── Audit log ──────────────────────────────────────────────────────────
@@ -418,9 +397,13 @@ export class AdminStore {
    * @param {string} [detail]
    */
   #audit(action, entity, detail) {
-    this.#db.prepare(
-      'INSERT INTO audit_log (timestamp, action, entity, detail) VALUES (?, ?, ?, ?)',
-    ).run(Date.now(), action, entity ?? null, detail ?? null);
+    this.#data.auditLog.push({
+      id: this.#data.nextAuditId++,
+      timestamp: Date.now(),
+      action,
+      entity: entity ?? null,
+      detail: detail ?? null,
+    });
   }
 
   /**
@@ -429,14 +412,15 @@ export class AdminStore {
    * @returns {Array<{ id: number, timestamp: number, action: string, entity: string | null, detail: string | null }>}
    */
   getAuditLog(limit = 100) {
-    return /** @type {any[]} */ (this.#db.prepare(
-      'SELECT * FROM audit_log ORDER BY id DESC LIMIT ?',
-    ).all(limit));
+    return [...this.#data.auditLog]
+      .sort((a, b) => b.id - a.id)
+      .slice(0, limit)
+      .map((entry) => ({ ...entry }));
   }
 
   // ─── Lifecycle ──────────────────────────────────────────────────────────
 
   close() {
-    this.#db.close();
+    this.#save();
   }
 }

@@ -1,7 +1,7 @@
 // @ts-check
 // Failover manager — per-target health monitoring + state machine
 
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { HealthProbe } from './health-probe.js';
 
 /** @import { PlcTarget, PlcEndpoint, FailoverState, FailoverConfig, EndpointHealth } from '../protocol/types.js' */

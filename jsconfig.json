@@ -6,10 +6,11 @@
     "checkJs": true,
     "strict": true,
     "noEmit": true,
+    "maxNodeModuleJsDepth": 0,
     "resolveJsonModule": true,
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.js", "test/**/*.js"],
+  "include": ["src/**/*.js", "src/**/*.d.ts", "test/**/*.js"],
   "exclude": ["node_modules", "build", "assembly", "dist"]
 }

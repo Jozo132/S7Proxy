@@ -1,0 +1,55 @@
+{
+  "listen": {
+    "ip": "0.0.0.0",
+    "port": 102
+  },
+  "targets": [],
+  "routing": [],
+  "filters": [],
+  "failover": {
+    "healthCheckIntervalMs": 3000,
+    "healthCheckTimeoutMs": 1500,
+    "failoverThreshold": 3,
+    "failbackMode": "auto",
+    "failbackDelayMs": 15000,
+    "failbackThreshold": 5,
+    "healthProbeMode": "tcp"
+  },
+  "webApi": {
+    "enabled": true,
+    "host": "0.0.0.0",
+    "port": 8080,
+    "cors": {
+      "origin": "*"
+    },
+    "rateLimit": {
+      "max": 100,
+      "windowMs": 60000
+    }
+  },
+  "daq": {
+    "minScanIntervalMs": 20,
+    "maxScanGroupsPerTarget": 50,
+    "maxTagsPerSubscription": 500,
+    "maxGapBytes": 32,
+    "cacheEnabled": true,
+    "cacheTtlMs": 5000,
+    "priorityQueue": {
+      "fairnessWindow": 10,
+      "agingThresholdMs": 2000
+    },
+    "slowClient": {
+      "maxSendBufferBytes": 65536,
+      "maxDroppedFrames": 100,
+      "dropWindowMs": 10000
+    }
+  },
+  "logging": {
+    "level": "info"
+  },
+  "metrics": {
+    "enabled": true,
+    "port": 9090,
+    "path": "/metrics"
+  }
+}

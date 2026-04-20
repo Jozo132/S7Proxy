@@ -1,11 +1,11 @@
 // @ts-check
 // Host import functions provided to WASM module
 
-import pino from 'pino';
+/** @import { Logger } from '../logging/logger.js' */
 
 /**
  * Create WASM host imports.
- * @param {pino.Logger} logger
+ * @param {Logger} logger
  * @returns {import('./loader.js').WasmImports}
  */
 export function createWasmImports(logger) {

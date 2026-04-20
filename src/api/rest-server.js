@@ -1,26 +1,24 @@
 // @ts-check
-// REST API server (Fastify)
+// REST API server backed by the built-in HTTP stack
 
-import Fastify from 'fastify';
-import cors from '@fastify/cors';
-import rateLimit from '@fastify/rate-limit';
 import { registerRoutes } from './rest-routes.js';
+import { createHttpApp } from '../http/app.js';
 
-/** @import { FastifyInstance } from 'fastify' */
+/** @import { HttpApp } from '../http/app.js' */
 /** @import { WebApiConfig } from '../protocol/types.js' */
 /** @import { ConnectionPool } from '../client/connection-pool.js' */
 /** @import { DaqEngine } from '../daq/daq-engine.js' */
 /** @import { Metrics } from '../metrics/metrics.js' */
 /** @import { StructManager } from '../protocol/struct-manager.js' */
 /** @import { Socket } from 'node:net' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 export class RestServer {
-  /** @type {FastifyInstance} */
+  /** @type {HttpApp} */
   #app;
   /** @type {WebApiConfig} */
   #config;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
   /** @type {ConnectionPool | null} */
   #pool;
@@ -34,7 +32,7 @@ export class RestServer {
    * @param {DaqEngine | null} daq
    * @param {Metrics} metrics
    * @param {WebApiConfig} config
-   * @param {pino.Logger} logger
+  * @param {Logger} logger
    * @param {StructManager} [structs]
    */
   constructor(pool, daq, metrics, config, logger, structs) {
@@ -43,7 +41,13 @@ export class RestServer {
     this.#pool = pool;
     this.#daq = daq;
 
-    this.#app = Fastify({ logger: false });
+    this.#app = createHttpApp({
+      cors: { origin: this.#config.cors?.origin ?? '*' },
+      rateLimit: {
+        max: this.#config.rateLimit?.max ?? 100,
+        windowMs: this.#config.rateLimit?.windowMs ?? 60000,
+      },
+    });
     this.#app.server.on('connection', (socket) => {
       this.#sockets.add(socket);
       socket.on('close', () => {
@@ -61,15 +65,6 @@ export class RestServer {
    * @param {StructManager} [structs]
    */
   async #setup(metrics, structs) {
-    await this.#app.register(cors, {
-      origin: this.#config.cors?.origin ?? '*',
-    });
-
-    await this.#app.register(rateLimit, {
-      max: this.#config.rateLimit?.max ?? 100,
-      timeWindow: this.#config.rateLimit?.windowMs ?? 60000,
-    });
-
     registerRoutes(this.#app, () => this.#pool, () => this.#daq, metrics, structs);
   }
 
@@ -102,7 +97,7 @@ export class RestServer {
     this.#logger.info('REST API stopped');
   }
 
-  /** @returns {FastifyInstance} */
+  /** @returns {HttpApp} */
   get server() {
     return this.#app;
   }

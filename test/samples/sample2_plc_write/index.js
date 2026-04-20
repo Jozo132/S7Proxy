@@ -355,43 +355,23 @@ async function startS7Proxy() {
   const path = await import('node:path');
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 's7proxy-sample2-'));
-  const cfgPath = path.join(tmpDir, 'config.yaml');
+  const cfgPath = path.join(tmpDir, 'config.json');
   const dbPath = path.join(tmpDir, 'sample2.db');
 
-  const yaml = [
-    'listen:',
-    '  ip: "0.0.0.0"',
-    '  port: 10103',
-    '',
-    'targets:',
-    '  - id: plc1',
-    '    primary:',
-    `      ip: "${PLC_IP}"`,
-    `      rack: ${PLC_RACK}`,
-    `      slot: ${PLC_SLOT}`,
-    '    maxConnections: 2',
-    '    requestTimeoutMs: 3000',
-    '',
-    'webApi:',
-    '  enabled: true',
-    '  host: "0.0.0.0"',
-    `  port: ${WEB_PORT}`,
-    '  cors:',
-    '    origin: "*"',
-    '',
-    'daq:',
-    '  minScanIntervalMs: 20',
-    '  cacheEnabled: true',
-    '  cacheTtlMs: 5000',
-    '',
-    'logging:',
-    '  level: debug',
-    '  pretty: true',
-    '',
-    'metrics:',
-    '  enabled: false',
-  ].join('\n');
-  fs.writeFileSync(cfgPath, yaml, 'utf-8');
+  const config = {
+    listen: { ip: '0.0.0.0', port: 10103 },
+    targets: [{
+      id: 'plc1',
+      primary: { ip: PLC_IP, rack: PLC_RACK, slot: PLC_SLOT },
+      maxConnections: 2,
+      requestTimeoutMs: 3000,
+    }],
+    webApi: { enabled: true, host: '0.0.0.0', port: WEB_PORT, cors: { origin: '*' } },
+    daq: { minScanIntervalMs: 20, cacheEnabled: true, cacheTtlMs: 5000 },
+    logging: { level: 'debug', pretty: true },
+    metrics: { enabled: false },
+  };
+  fs.writeFileSync(cfgPath, JSON.stringify(config, null, 2), 'utf-8');
 
   const __dirname = dirname(fileURLToPath(import.meta.url));
   const projectRoot = resolve(__dirname, '..', '..', '..');

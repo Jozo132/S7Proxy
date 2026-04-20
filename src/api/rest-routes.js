@@ -1,14 +1,14 @@
 // @ts-check
 // REST API route registration
 
-/** @import { FastifyInstance } from 'fastify' */
+/** @import { HttpApp } from '../http/app.js' */
 /** @import { ConnectionPool } from '../client/connection-pool.js' */
 /** @import { DaqEngine } from '../daq/daq-engine.js' */
 /** @import { Metrics } from '../metrics/metrics.js' */
 /** @import { StructManager } from '../protocol/struct-manager.js' */
 
 /**
- * @param {FastifyInstance} app
+ * @param {HttpApp} app
  * @param {() => ConnectionPool | null} getPool
  * @param {() => DaqEngine | null} getDaq
  * @param {Metrics} metrics

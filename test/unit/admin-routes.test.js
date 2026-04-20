@@ -1,6 +1,5 @@
 // @ts-check
 
-import Fastify from 'fastify';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
@@ -9,8 +8,9 @@ import { registerAdminRoutes } from '../../src/admin/routes.js';
 import { AdminStore } from '../../src/admin/store.js';
 import { StructManager } from '../../src/protocol/struct-manager.js';
 import { Metrics } from '../../src/metrics/metrics.js';
+import { createHttpApp } from '../../src/http/app.js';
 
-/** @type {import('fastify').FastifyInstance} */
+/** @type {import('../../src/http/app.js').HttpApp} */
 let app;
 /** @type {AdminStore} */
 let store;
@@ -25,7 +25,7 @@ describe('Admin routes', () => {
   beforeEach(async () => {
     tmpDir = mkdtempSync(join(tmpdir(), 's7proxy-admin-routes-'));
     store = new AdminStore(join(tmpDir, 'admin.db'));
-    app = Fastify({ logger: false });
+    app = createHttpApp();
     currentPool = null;
 
     config = {
@@ -116,7 +116,7 @@ describe('Admin routes', () => {
     expect(state.connections[0].targetId).toBe('plc-admin');
     expect(state.targets).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: 'plc-admin', source: 'database', active: true }),
+        expect.objectContaining({ id: 'plc-admin', source: 'persisted', active: true }),
       ]),
     );
   });
@@ -136,7 +136,7 @@ describe('Admin routes', () => {
     expect(listRes.statusCode).toBe(200);
     expect(listRes.json()).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ id: 'plc-list', source: 'database' }),
+        expect.objectContaining({ id: 'plc-list', source: 'persisted' }),
       ]),
     );
   });
@@ -170,7 +170,7 @@ describe('Admin routes', () => {
       expect.arrayContaining([
         expect.objectContaining({
           id: 'plc-edit',
-          source: 'database',
+          source: 'persisted',
           maxConnections: 3,
           requestTimeoutMs: 4000,
           primary: expect.objectContaining({ ip: '10.0.0.6', slot: 2 }),

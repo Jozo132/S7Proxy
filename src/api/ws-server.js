@@ -1,7 +1,7 @@
 // @ts-check
 // WebSocket server for real-time DAQ streaming
 
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { WebSocketServer, WebSocket } from 'ws';
 
 /** @import { Server as HttpServer } from 'node:http' */
@@ -58,7 +58,7 @@ export class WsServer extends EventEmitter {
   }
 
   /**
-   * Attach to an existing HTTP server (from Fastify).
+  * Attach to an existing HTTP server.
    * @param {HttpServer} server
    */
   attach(server) {

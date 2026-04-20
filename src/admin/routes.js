@@ -1,7 +1,7 @@
 // @ts-check
 // Admin REST API routes — configuration, struct management, and state overview
 
-/** @import { FastifyInstance } from 'fastify' */
+/** @import { HttpApp } from '../http/app.js' */
 /** @import { AdminStore } from './store.js' */
 /** @import { StructManager } from '../protocol/struct-manager.js' */
 /** @import { ConnectionPool } from '../client/connection-pool.js' */
@@ -10,7 +10,7 @@
 /** @import { AdminAuth } from './auth.js' */
 
 /**
- * @param {FastifyInstance} app
+ * @param {HttpApp} app
  * @param {{
  *   store: AdminStore,
  *   structs: StructManager,
@@ -28,13 +28,22 @@
 export function registerAdminRoutes(app, ctx, auth) {
   const { store, structs, metrics, config } = ctx;
 
+  /**
+   * @param {string | string[] | undefined} header
+   * @returns {string | null}
+   */
+  function getBearerToken(header) {
+    const value = Array.isArray(header) ? header[0] : header;
+    return typeof value === 'string' && value.startsWith('Bearer ') ? value.slice(7) : null;
+  }
+
   /** @returns {Set<string>} */
   function getDisabledTargetIds() {
     return new Set(store.getDisabledTargets());
   }
 
   /**
-   * Merge config-file targets with SQLite-persisted targets.
+   * Merge config-file targets with persisted admin targets.
    * Config targets are shown as source:'config', persisted entries override them.
    */
   function getAllTargets() {
@@ -43,7 +52,7 @@ export function registerAdminRoutes(app, ctx, auth) {
     const persistedIds = new Set(persisted.map((t) => t.id));
 
     /** @type {Array<any>} */
-    const merged = persisted.map((t) => ({ ...t, source: 'database' }));
+    const merged = persisted.map((t) => ({ ...t, source: 'persisted' }));
     for (const t of config.targets) {
       if (!persistedIds.has(t.id) && !disabledTargetIds.has(t.id)) {
         merged.push({
@@ -68,8 +77,7 @@ export function registerAdminRoutes(app, ctx, auth) {
       if (!request.url.startsWith('/admin/api/')) return;
       if (request.url.startsWith('/admin/api/auth/')) return;
 
-      const header = request.headers.authorization;
-      const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
+      const token = getBearerToken(request.headers.authorization);
       if (!auth.validate(token)) {
         reply.code(401).send({ error: 'Unauthorized' });
       }
@@ -84,15 +92,13 @@ export function registerAdminRoutes(app, ctx, auth) {
     });
 
     app.post('/admin/api/auth/logout', async (req) => {
-      const header = req.headers.authorization;
-      const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
+      const token = getBearerToken(req.headers.authorization);
       if (token) auth.logout(token);
       return { status: 'ok' };
     });
 
     app.get('/admin/api/auth/check', async (req) => {
-      const header = req.headers.authorization;
-      const token = header?.startsWith('Bearer ') ? header.slice(7) : null;
+      const token = getBearerToken(req.headers.authorization);
       return { valid: auth.validate(token) };
     });
 

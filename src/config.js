@@ -1,10 +1,28 @@
 // @ts-check
-// Configuration loader — YAML/JSON config with environment variable overrides
+// Configuration loader — JSON config with optional .env-style overrides
 
 import { readFileSync, existsSync } from 'node:fs';
-import { parse as parseYaml } from 'yaml';
 
 /** @import { S7ProxyConfig, FailoverConfig, DaqConfig, WebApiConfig } from './protocol/types.js' */
+
+/**
+ * @param {string} raw
+ * @returns {Record<string, string>}
+ */
+function parseEnvFile(raw) {
+  /** @type {Record<string, string>} */
+  const env = {};
+  for (const line of raw.split(/\r?\n/u)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const separatorIndex = trimmed.indexOf('=');
+    if (separatorIndex === -1) continue;
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed.slice(separatorIndex + 1).trim().replace(/^['"]|['"]$/g, '');
+    if (key) env[key] = value;
+  }
+  return env;
+}
 
 /** @type {FailoverConfig} */
 const DEFAULT_FAILOVER = {
@@ -64,25 +82,30 @@ const DEFAULT_CONFIG = {
  * @returns {S7ProxyConfig}
  */
 export function loadConfig(configPath) {
-  const path = configPath ?? process.env['S7PROXY_CONFIG'] ?? 'config/default.yaml';
+  const path = configPath ?? process.env['S7PROXY_CONFIG'] ?? 'config/default.json';
 
   /** @type {Partial<S7ProxyConfig>} */
   let fileConfig = {};
+  /** @type {Record<string, string>} */
+  let fileEnv = {};
 
   if (existsSync(path)) {
     const raw = readFileSync(path, 'utf-8');
-    if (path.endsWith('.json')) {
+    if (path.endsWith('.env')) {
+      fileEnv = parseEnvFile(raw);
+    } else if (path.endsWith('.json')) {
       fileConfig = JSON.parse(raw);
     } else {
-      fileConfig = parseYaml(raw) ?? {};
+      throw new Error(`Unsupported config format for "${path}". Use .json or .env.`);
     }
   }
 
   // Environment variable overrides
-  const envPort = process.env['S7PROXY_PORT'];
-  const envIp = process.env['S7PROXY_IP'];
-  const envLogLevel = process.env['S7PROXY_LOG_LEVEL'];
-  const envWebPort = process.env['S7PROXY_WEB_PORT'];
+  const env = { ...fileEnv, ...process.env };
+  const envPort = env['S7PROXY_PORT'];
+  const envIp = env['S7PROXY_IP'];
+  const envLogLevel = env['S7PROXY_LOG_LEVEL'];
+  const envWebPort = env['S7PROXY_WEB_PORT'];
 
   /** @type {S7ProxyConfig} */
   const config = {

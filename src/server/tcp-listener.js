@@ -2,7 +2,7 @@
 // TCP listener — accepts incoming S7 client connections
 
 import { createServer } from 'node:net';
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 
 /** @import { Server, Socket } from 'node:net' */
 /** @import pino from 'pino' */

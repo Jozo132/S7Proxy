@@ -8,7 +8,7 @@ S7Comm proxy and client library with an AssemblyScript WASM protocol engine. Con
 - **Connection pooling** — multiple PLC connections with automatic health checks and failover/failback
 - **Data acquisition (DAQ)** — subscription-based periodic reads with scan groups, read coalescing, priority queues, and caching
 - **Structured DB access** — define PLC data block layouts, read/write as plain JS objects with automatic encode/decode
-- **REST + WebSocket API** — Fastify HTTP endpoints and real-time WebSocket push with slow-consumer protection
+- **REST + WebSocket API** — lightweight built-in HTTP endpoints and real-time WebSocket push with slow-consumer protection
 - **S7Comm proxy** — transparent TCP proxy with TSAP/IP-based routing and allow/deny filtering
 - **snap7 compatibility** — drop-in `S7Client` and `S7Server` replacements for the `node-snap7` API
 - **Worker thread mode** — run the proxy in an isolated worker
@@ -17,7 +17,7 @@ S7Comm proxy and client library with an AssemblyScript WASM protocol engine. Con
 ## Install
 
 ```bash
-npm install S7Proxy
+npm install s7proxy
 ```
 
 Requires Node.js >= 20.
@@ -28,18 +28,18 @@ Requires Node.js >= 20.
 
 ```bash
 # Start with default config
-npx S7Proxy
+npx s7proxy
 
 # Start with custom config
-npx S7Proxy config/my-plc.yaml
+npx s7proxy config/my-plc.json
 ```
 
 ### As a library
 
 ```js
-import { ProxyServer, loadConfig } from 'S7Proxy';
+import { ProxyServer, loadConfig } from 's7proxy';
 
-const config = loadConfig('./config/default.yaml');
+const config = loadConfig('./config/default.json');
 const server = new ProxyServer(config);
 
 // Register struct definitions before or after start
@@ -84,7 +84,7 @@ await server.stop();
 import {
   PlcConnection, WasmBridge,
   loadWasmEngine, createWasmImports,
-} from 'S7Proxy';
+} from 's7proxy';
 
 const engine = await loadWasmEngine(createWasmImports());
 const bridge = new WasmBridge(engine);
@@ -103,7 +103,7 @@ conn.disconnect();
 ### snap7-compatible client
 
 ```js
-import { S7Client } from 'S7Proxy';
+import { S7Client } from 's7proxy';
 
 const client = new S7Client();
 client.ConnectTo('192.168.1.10', 0, 1, (err) => {
@@ -230,39 +230,45 @@ Connect to `ws://host:8080/ws`. Messages are JSON.
 
 ## Configuration
 
-Configuration is loaded from YAML. Environment variables override file values.
+Configuration is loaded from JSON. For simple deployments, `S7PROXY_CONFIG` can also point at a `.env` file that sets scalar overrides like ports and log level.
 
-```yaml
-listen:
-  ip: 0.0.0.0
-  port: 102
-
-targets:
-  - id: plc1
-    primary: { ip: 192.168.1.10, rack: 0, slot: 1 }
-    backups:
-      - { ip: 192.168.1.11, rack: 0, slot: 1 }
-    maxConnections: 4
-
-failover:
-  healthCheckIntervalMs: 3000
-  failoverThreshold: 3
-  failbackMode: auto
-
-webApi:
-  enabled: true
-  port: 8080
-  cors: { origin: '*' }
-  rateLimit: { max: 100, windowMs: 60000 }
-
-daq:
-  minScanIntervalMs: 20
-  maxGapBytes: 32
-  cacheEnabled: true
-  cacheTtlMs: 5000
-
-logging:
-  level: info
+```json
+{
+  "listen": {
+    "ip": "0.0.0.0",
+    "port": 102
+  },
+  "targets": [
+    {
+      "id": "plc1",
+      "primary": { "ip": "192.168.1.10", "rack": 0, "slot": 1 },
+      "backups": [
+        { "ip": "192.168.1.11", "rack": 0, "slot": 1 }
+      ],
+      "maxConnections": 4
+    }
+  ],
+  "failover": {
+    "healthCheckIntervalMs": 3000,
+    "failoverThreshold": 3,
+    "failbackMode": "auto"
+  },
+  "webApi": {
+    "enabled": true,
+    "port": 8080,
+    "cors": { "origin": "*" },
+    "rateLimit": { "max": 100, "windowMs": 60000 }
+  },
+  "daq": {
+    "minScanIntervalMs": 20,
+    "maxGapBytes": 32,
+    "cacheEnabled": true,
+    "cacheTtlMs": 5000
+  },
+  "logging": {
+    "level": "info"
+  }
+}
 ```
 
 ### Environment Variables
@@ -305,14 +311,14 @@ npm run dev
 ```
 assembly/        AssemblyScript WASM engine (TPKT, COTP, S7Comm)
 build/           Compiled s7engine.wasm
-config/          Default YAML configuration
+config/          Default JSON configuration
 src/
-  api/           REST (Fastify) + WebSocket server
+  api/           REST + WebSocket server
   client/        PLC connections, pool, failover, health probes
   compat/        node-snap7 drop-in replacements
   daq/           Data acquisition, scan groups, caching
-  logging/       Pino logger
-  metrics/       Prometheus metrics
+  logging/       Lightweight structured logger
+  metrics/       Lightweight Prometheus text collector
   protocol/      Types, constants, frame assembly, DB struct codec
   router/        S7Comm proxy routing
   server/        TCP listener, client sessions

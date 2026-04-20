@@ -1,7 +1,7 @@
 // @ts-check
 // Scan group — periodic scan task for a set of tags with the same interval
 
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { ReadCoalescer } from './read-coalescer.js';
 
 /** @import { TagDefinition, PriorityLevel } from '../protocol/types.js' */

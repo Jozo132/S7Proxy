@@ -2,7 +2,7 @@
 // TCP liveness probe for PLC endpoint health checking
 
 import { Socket } from 'node:net';
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { S7_DEFAULT_PORT } from '../protocol/constants.js';
 
 /** @import { PlcEndpoint } from '../protocol/types.js' */

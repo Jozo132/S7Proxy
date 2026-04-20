@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // @ts-check
-// Standalone CLI entry point with SQLite persistence
+// Standalone CLI entry point with JSON persistence
 
 import { resolve } from 'node:path';
 import { loadConfig } from './config.js';
@@ -15,8 +15,10 @@ if (process.stdout.isTTY && config.logging.pretty === undefined) {
   config.logging.pretty = true;
 }
 
-// Initialize SQLite persistence (data/s7proxy.db by default)
-const dbPath = process.env['S7PROXY_DB_PATH'] ?? resolve('data', 's7proxy.db');
+// Initialize JSON persistence. For compatibility, S7PROXY_DB_PATH may still
+// point at a legacy .db-style path; AdminStore will persist a .json file
+// alongside it.
+const dbPath = process.env['S7PROXY_DB_PATH'] ?? resolve('data', 's7proxy.json');
 const store = new AdminStore(dbPath);
 
 // Merge config and persisted targets, honoring database overrides and disabled IDs.

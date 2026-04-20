@@ -1,7 +1,7 @@
 // @ts-check
 // Drop-in replacement for node-snap7 S7Client — backed by S7Proxy's WASM engine + PlcConnection
 
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { PlcConnection } from '../client/plc-connection.js';
 import { WasmBridge } from '../wasm/bridge.js';
 import { loadWasmEngine, resetWasmCache } from '../wasm/loader.js';

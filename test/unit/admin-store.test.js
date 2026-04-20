@@ -1,4 +1,5 @@
 // @ts-check
+import { existsSync } from 'node:fs';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { AdminStore } from '../../src/admin/store.js';
 import { join } from 'node:path';
@@ -201,6 +202,9 @@ describe('AdminStore', () => {
     s1.setSetting('mode', 'production');
     s1.setTargetDisabled('plc-z', true);
     s1.close();
+
+    expect(existsSync(join(tmpDir, 'persist.json'))).toBe(true);
+    expect(existsSync(dbPath)).toBe(false);
 
     const s2 = new AdminStore(dbPath);
     expect(s2.getStruct('Persistent')?.db).toBe(99);

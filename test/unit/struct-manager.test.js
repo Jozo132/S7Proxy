@@ -275,7 +275,7 @@ describe('StructManager read key filter (offline validation)', () => {
 describe('StructManager DAQ integration', () => {
   it('decodes struct:data from DAQ subscription events', () => {
     // Create a mock DAQ engine (EventEmitter)
-    const { EventEmitter } = require('eventemitter3');
+    const { EventEmitter } = require('node:events');
     const mockDaq = /** @type {any} */ (new EventEmitter());
     mockDaq.subscribe = vi.fn(() => 'sub-1');
     mockDaq.unsubscribe = vi.fn();
@@ -322,7 +322,7 @@ describe('StructManager DAQ integration', () => {
   });
 
   it('unsubscribe cleans up', () => {
-    const { EventEmitter } = require('eventemitter3');
+    const { EventEmitter } = require('node:events');
     const mockDaq = /** @type {any} */ (new EventEmitter());
     mockDaq.subscribe = vi.fn(() => 'sub-2');
     mockDaq.unsubscribe = vi.fn();
@@ -418,7 +418,7 @@ describe('StructManager error handling', () => {
 
 describe('StructManager shutdown', () => {
   it('clears everything', () => {
-    const { EventEmitter } = require('eventemitter3');
+    const { EventEmitter } = require('node:events');
     const mockDaq = /** @type {any} */ (new EventEmitter());
     mockDaq.subscribe = vi.fn(() => 'sub-99');
     mockDaq.unsubscribe = vi.fn();

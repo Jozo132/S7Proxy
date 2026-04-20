@@ -344,7 +344,7 @@ export class ProxyServer {
           this.#structs,
         );
       } else {
-        // Admin-only mode: create a minimal Fastify instance
+        // Admin-only mode: create a minimal HTTP app instance
         this.#restServer = new RestServer(
           /** @type {any} */ (null), /** @type {any} */ (null),
           this.#metrics, this.#config.webApi, this.#logger,
@@ -353,20 +353,14 @@ export class ProxyServer {
 
       // 5b. Register admin routes and static file serving
       if (this.#adminStore) {
-        const fastify = this.#restServer.server;
+        const app = this.#restServer.server;
 
-        // Serve admin UI from public/ directory
-        const { default: fastifyStatic } = await import('@fastify/static');
         const { resolve, dirname } = await import('node:path');
         const { fileURLToPath } = await import('node:url');
         const __dirname = dirname(fileURLToPath(import.meta.url));
-        await fastify.register(fastifyStatic, {
-          root: resolve(__dirname, '..', 'public'),
-          prefix: '/admin/',
-          decorateReply: false,
-        });
+        app.serveStatic('/admin/', resolve(__dirname, '..', 'public'));
         // Redirect /admin to /admin/
-        fastify.get('/admin', (_, reply) => reply.redirect('/admin/'));
+        app.get('/admin', (_, reply) => reply.redirect('/admin/'));
 
         this.#adminAuth = new AdminAuth(this.#adminStore);
 
@@ -382,7 +376,7 @@ export class ProxyServer {
           removeTarget: (/** @type {string} */ targetId) => this.removeTarget(targetId),
         };
 
-        const { getAllTargets } = registerAdminRoutes(fastify, adminCtx, this.#adminAuth);
+        const { getAllTargets } = registerAdminRoutes(app, adminCtx, this.#adminAuth);
 
         // Build getState function for admin WS
         const getAdminState = () => {

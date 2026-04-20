@@ -5,7 +5,7 @@
 // and DAQ engine to provide named-field read/write/subscribe with automatic
 // encode/decode.
 
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { DBStruct } from './db-struct.js';
 import { S7AreaDB, S7WLBit, S7WLByte, S7_MSG_ACK, S7_MSG_ACK_DATA, S7_MSG_USERDATA } from './constants.js';
 

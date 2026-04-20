@@ -1,7 +1,7 @@
 // @ts-check
 // DAQ engine — manages subscriptions, scan groups, and priority queue integration
 
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 import { PriorityQueue } from './priority-queue.js';
 import { TagRegistry } from './tag-registry.js';
 import { DataCache } from './data-cache.js';

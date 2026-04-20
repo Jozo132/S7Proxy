@@ -1,7 +1,7 @@
 // @ts-check
 // Proxy router — maps inbound client sessions to outbound PLC connections
 
-import { EventEmitter } from 'eventemitter3';
+import { EventEmitter } from 'node:events';
 
 /** @import { ClientSession } from '../server/client-session.js' */
 /** @import { ConnectionPool } from '../client/connection-pool.js' */
