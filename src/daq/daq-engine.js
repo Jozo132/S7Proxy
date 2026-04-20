@@ -202,7 +202,8 @@ export class DaqEngine extends EventEmitter {
         }
 
         const frame = this.#bridge.buildReadRequest(read.area, read.dbNum, read.start, read.amount, read.wordLen);
-        const pduRef = (Date.now() & 0xFFFF);
+        // Extract pduRef from the built frame: TPKT(4) + COTP DT(3) + S7 header offset 4-5
+        const pduRef = frame.readUInt16BE(11);
         const response = await conn.sendRequest(frame, pduRef);
 
         // Update cache for each tag in this coalesced read

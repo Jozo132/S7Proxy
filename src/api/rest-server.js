@@ -33,8 +33,11 @@ export class RestServer {
     this.#logger = logger.child({ component: 'rest' });
 
     this.#app = Fastify({ logger: false });
-    this.#setup(pool, daq, metrics);
+    this.#setupPromise = this.#setup(pool, daq, metrics);
   }
+
+  /** @type {Promise<void>} */
+  #setupPromise;
 
   /**
    * @param {ConnectionPool} pool
@@ -55,6 +58,7 @@ export class RestServer {
   }
 
   async start() {
+    await this.#setupPromise;
     const address = await this.#app.listen({
       host: this.#config.host ?? '0.0.0.0',
       port: this.#config.port ?? 8080,

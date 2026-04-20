@@ -1,0 +1,48 @@
+// @ts-check
+// Shared test helpers — boots demo server + WASM bridge for integration tests
+
+import { startDemoServer } from './demo-server.js';
+import { loadWasmEngine, resetWasmCache } from '../src/wasm/loader.js';
+import { WasmBridge } from '../src/wasm/bridge.js';
+import { createWasmImports } from '../src/wasm/imports.js';
+import { createLogger } from '../src/logging/logger.js';
+
+/** @typedef {import('./demo-server.js').DemoServer} DemoServer */
+
+/**
+ * @typedef {Object} TestContext
+ * @property {DemoServer} demo
+ * @property {WasmBridge} bridge
+ * @property {import('pino').Logger} logger
+ */
+
+/** @type {TestContext | null} */
+let ctx = null;
+
+/**
+ * Set up the demo PLC server and WASM bridge. Reuses a single instance
+ * across all tests in the same vitest worker.
+ * @returns {Promise<TestContext>}
+ */
+export async function setup() {
+  if (ctx) return ctx;
+
+  const logger = createLogger({ level: 'silent' });
+  const demo = await startDemoServer({ silent: true });
+  const imports = createWasmImports(logger);
+  const engine = await loadWasmEngine(imports);
+  const bridge = new WasmBridge(engine);
+
+  ctx = { demo, bridge, logger };
+  return ctx;
+}
+
+/**
+ * Tear everything down.
+ */
+export async function teardown() {
+  if (!ctx) return;
+  ctx.demo.stop();
+  resetWasmCache();
+  ctx = null;
+}

@@ -163,8 +163,8 @@ export function cotp_buildCC(srcRef: u16, dstRef: u16, outPtr: usize): u32 {
  *  Returns 3 (bytes written). Payload follows after. */
 export function cotp_buildDT(lastUnit: bool, outPtr: usize): u32 {
   store<u8>(outPtr, 0x02);  // LI = 2
-  store<u8>(outPtr + 1, lastUnit ? 0xF0 : 0x70);  // PDU type + EOT flag in high nibble
-  store<u8>(outPtr + 2, 0x00);  // TPDU number
+  store<u8>(outPtr + 1, 0xF0);  // PDU type: DT (always 0xF0)
+  store<u8>(outPtr + 2, lastUnit ? 0x80 : 0x00);  // EOT flag (bit 7) + TPDU-NR
   return 3;
 }
 
