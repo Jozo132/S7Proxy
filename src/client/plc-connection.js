@@ -39,7 +39,7 @@ export class PlcConnection extends EventEmitter {
   /** @type {Map<number, { resolve: (data: Buffer) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }>} */
   #pendingResponses = new Map();
 
-  /** @type {(() => void) | undefined} */
+  /** @type {((value?: any) => void) | undefined} */
   #connectResolve;
   /** @type {((err: Error) => void) | undefined} */
   #connectReject;

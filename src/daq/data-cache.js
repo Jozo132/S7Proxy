@@ -18,13 +18,15 @@ export class DataCache {
    * @param {string} tagName
    * @param {Buffer} value
    * @param {number} [quality=192]
+   * @param {string} [source='daq']
    */
-  set(tagName, value, quality = 192) {
+  set(tagName, value, quality = 192, source = 'daq') {
     this.#cache.set(tagName, {
       tagName,
       value,
       quality,
       timestamp: Date.now(),
+      source,
     });
   }
 

@@ -109,7 +109,7 @@ export function loadConfig(configPath) {
     logging: {
       ...DEFAULT_CONFIG.logging,
       ...fileConfig.logging,
-      ...(envLogLevel ? { level: envLogLevel } : {}),
+      ...(envLogLevel ? { level: /** @type {import('./protocol/types.js').LogConfig['level']} */ (envLogLevel) } : {}),
     },
     metrics: { ...DEFAULT_CONFIG.metrics, ...fileConfig.metrics },
   };

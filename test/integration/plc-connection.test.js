@@ -13,7 +13,8 @@ import {
 let ctx;
 
 /** Extract the PDU reference from a built S7 frame.
- *  Layout: TPKT(4) + COTP DT(3) + S7 header bytes 4-5 = pduRef */
+ *  Layout: TPKT(4) + COTP DT(3) + S7 header bytes 4-5 = pduRef
+ *  @param {Buffer} frame */
 function getPduRef(frame) {
   return frame.readUInt16BE(11);
 }

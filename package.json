@@ -48,6 +48,7 @@
     "yaml": "^2.8.3"
   },
   "devDependencies": {
+    "@types/node": "^25.6.0",
     "assemblyscript": "^0.28.14",
     "node-snap7": "^1.0.9",
     "vitest": "^4.1.4"

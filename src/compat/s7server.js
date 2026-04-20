@@ -38,6 +38,7 @@ import {
  */
 
 // ─── S7 area code → server area code mapping ───
+/** @type {Record<number, number>} */
 const s7AreaToSrvArea = {
   [S7AreaPE]: 0,
   [S7AreaPA]: 1,
@@ -48,6 +49,7 @@ const s7AreaToSrvArea = {
 };
 
 // ─── Server area code → S7 area code ───
+/** @type {Record<number, number>} */
 const srvAreaToS7Area = {
   0: S7AreaPE,
   1: S7AreaPA,
@@ -374,6 +376,7 @@ export class S7Server extends EventEmitter {
   //  Internal server implementation
   // ═══════════════════════════════════════════════
 
+  /** @param {string} ip */
   async #startAsync(ip) {
     if (this.#status === S7Server.SrvRunning) return;
 

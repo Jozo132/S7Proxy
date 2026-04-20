@@ -38,27 +38,18 @@
 // ─── Session ───
 
 /**
- * @typedef {'NEW' | 'CONNECTED' | 'COTP_PENDING' | 'COTP_CONNECTED' | 'S7_SETUP_PENDING' | 'ESTABLISHED' | 'CLOSED' | 'ERROR'} SessionState
+ * @typedef {'COTP_WAIT' | 'S7_WAIT' | 'ACTIVE' | 'CLOSED'} SessionState
  */
 
 /**
  * @typedef {Object} SessionInfo
  * @property {string} id
+ * @property {string} remoteAddress
  * @property {SessionState} state
- * @property {string} clientAddr
- * @property {number} clientPort
  * @property {string | null} targetId
- * @property {number} srcTsap
- * @property {number} dstTsap
- * @property {number} pduSize
- * @property {number} maxAmq
- * @property {number} pduCount
- * @property {number} createdAt
+ * @property {number} connectedAt
  * @property {number} lastActivityAt
- * @property {number} lastPduRef
- * @property {number} errorClass
- * @property {number} errorCode
- * @property {string} [errorDetail]
+ * @property {number} pduSize
  */
 
 // ─── Failover ───
@@ -100,7 +91,7 @@
 // ─── Priority Queue ───
 
 /**
- * @typedef {'critical' | 'high' | 'normal' | 'low'} PriorityLevel
+ * @typedef {'critical' | 'high' | 'normal' | 'low' | 'background'} PriorityLevel
  */
 
 /**
@@ -116,7 +107,7 @@
  * @property {(data: Buffer) => void} resolve
  * @property {(err: Error) => void} reject
  * @property {number} createdAt
- * @property {number} [enqueuedAt]
+ * @property {number} enqueuedAt
  * @property {number} timeoutMs
  * @property {RequestSource} source
  */
@@ -126,12 +117,13 @@
 /**
  * @typedef {Object} TagDefinition
  * @property {string} name
- * @property {string} area
- * @property {number} offset
+ * @property {number} area
+ * @property {number} start
+ * @property {number} amount
+ * @property {number} wordLen
  * @property {number} [dbNum]
- * @property {string} [type]
- * @property {number} [amount]
  * @property {string} target
+ * @property {number} [scanIntervalMs]
  */
 
 /**
@@ -150,7 +142,7 @@
  * @property {string} tagName
  * @property {Buffer} value
  * @property {number} timestamp
- * @property {'good' | 'uncertain' | 'bad'} quality
+ * @property {number} quality
  * @property {string} source
  */
 
@@ -181,7 +173,7 @@
 
 /**
  * @typedef {Object} LogConfig
- * @property {'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal'} level
+ * @property {'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal' | 'silent'} level
  * @property {boolean} [pretty]
  */
 
@@ -234,3 +226,5 @@
  * @property {number} connectedAt
  * @property {number} lastActivityAt
  */
+
+export {};

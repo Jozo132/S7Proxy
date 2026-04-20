@@ -5,6 +5,9 @@
 
 import snap7 from 'node-snap7';
 
+/** @type {*} */
+const snap7Any = snap7;
+
 const DEFAULT_IP = '127.0.0.1';
 
 /**
@@ -15,7 +18,7 @@ const DEFAULT_IP = '127.0.0.1';
 
 /**
  * @typedef {Object} DemoServer
- * @property {import('node-snap7').S7Server} server
+ * @property {*} server
  * @property {{ db1: Buffer, db2: Buffer, mk: Buffer, pe: Buffer, pa: Buffer }} areas
  * @property {() => void} stop
  */
@@ -63,7 +66,7 @@ export async function startDemoServer(opts = {}) {
   const ip = opts.ip ?? DEFAULT_IP;
   const silent = opts.silent ?? false;
 
-  const server = new snap7.S7Server();
+  const server = new snap7Any.S7Server();
 
   // Memory areas
   const db1 = Buffer.alloc(100);

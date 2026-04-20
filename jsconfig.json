@@ -8,8 +8,8 @@
     "noEmit": true,
     "resolveJsonModule": true,
     "skipLibCheck": true,
-    "baseUrl": "."
+    "types": ["node"]
   },
-  "include": ["src/**/*.js"],
+  "include": ["src/**/*.js", "test/**/*.js"],
   "exclude": ["node_modules", "build", "assembly", "dist"]
 }

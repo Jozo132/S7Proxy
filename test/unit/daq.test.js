@@ -14,9 +14,9 @@ describe('PriorityQueue', () => {
   beforeEach(() => { q = new PriorityQueue(); });
 
   it('should enqueue and dequeue in priority order', () => {
-    q.enqueue({ id: 'a', priority: 'low', enqueuedAt: Date.now(), payload: {} });
-    q.enqueue({ id: 'b', priority: 'critical', enqueuedAt: Date.now(), payload: {} });
-    q.enqueue({ id: 'c', priority: 'normal', enqueuedAt: Date.now(), payload: {} });
+    q.enqueue(/** @type {*} */ ({ id: 'a', priority: 'low', enqueuedAt: Date.now(), payload: {} }));
+    q.enqueue(/** @type {*} */ ({ id: 'b', priority: 'critical', enqueuedAt: Date.now(), payload: {} }));
+    q.enqueue(/** @type {*} */ ({ id: 'c', priority: 'normal', enqueuedAt: Date.now(), payload: {} }));
 
     expect(q.size).toBe(3);
     const first = q.dequeue();
@@ -29,8 +29,8 @@ describe('PriorityQueue', () => {
 
   it('should dequeue same-priority items FIFO', () => {
     const t0 = Date.now();
-    q.enqueue({ id: 'x', priority: 'normal', enqueuedAt: t0, payload: {} });
-    q.enqueue({ id: 'y', priority: 'normal', enqueuedAt: t0 + 1, payload: {} });
+    q.enqueue(/** @type {*} */ ({ id: 'x', priority: 'normal', enqueuedAt: t0, payload: {} }));
+    q.enqueue(/** @type {*} */ ({ id: 'y', priority: 'normal', enqueuedAt: t0 + 1, payload: {} }));
 
     expect(q.dequeue()?.id).toBe('x');
     expect(q.dequeue()?.id).toBe('y');
@@ -38,14 +38,14 @@ describe('PriorityQueue', () => {
 
   it('isEmpty and clear', () => {
     expect(q.isEmpty).toBe(true);
-    q.enqueue({ id: 'z', priority: 'high', enqueuedAt: Date.now(), payload: {} });
+    q.enqueue(/** @type {*} */ ({ id: 'z', priority: 'high', enqueuedAt: Date.now(), payload: {} }));
     expect(q.isEmpty).toBe(false);
     q.clear();
     expect(q.isEmpty).toBe(true);
   });
 
   it('peek returns head without removing', () => {
-    q.enqueue({ id: 'p', priority: 'high', enqueuedAt: Date.now(), payload: {} });
+    q.enqueue(/** @type {*} */ ({ id: 'p', priority: 'high', enqueuedAt: Date.now(), payload: {} }));
     expect(q.peek()?.id).toBe('p');
     expect(q.size).toBe(1);
   });
@@ -58,14 +58,14 @@ describe('TagRegistry', () => {
   beforeEach(() => { reg = new TagRegistry(); });
 
   it('should register and retrieve tags', () => {
-    const tag = { name: 'DB1.DBW0', area: 0x84, dbNumber: 1, start: 0, amount: 1, wordLen: 0x02 };
+    const tag = { name: 'DB1.DBW0', area: 0x84, dbNum: 1, start: 0, amount: 1, wordLen: 0x02, target: 'plc1' };
     reg.registerTag(tag);
     expect(reg.getTag('DB1.DBW0')).toEqual(tag);
     expect(reg.getAllTags()).toHaveLength(1);
   });
 
   it('should manage subscriptions', () => {
-    const sub = { id: 'sub1', targetId: 'plc1', tags: [], intervalMs: 1000 };
+    const sub = { id: 'sub1', targetId: 'plc1', tags: [], intervalMs: 1000, createdAt: Date.now(), active: true };
     reg.addSubscription(sub);
     expect(reg.getSubscription('sub1')).toBeDefined();
     expect(reg.getAllSubscriptions()).toHaveLength(1);

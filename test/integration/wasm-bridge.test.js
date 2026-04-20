@@ -30,13 +30,13 @@ describe('WasmBridge', () => {
   });
 
   it('should build COTP Connection Confirm', () => {
-    const frame = ctx.bridge.buildCotpCC();
+    const frame = ctx.bridge.buildCotpCC(0, 0);
     expect(frame).toBeInstanceOf(Buffer);
     expect(frame.length).toBeGreaterThan(0);
   });
 
   it('should build S7 Setup Communication', () => {
-    const frame = ctx.bridge.buildSetupComm();
+    const frame = ctx.bridge.buildSetupComm(1, 1, 480);
     expect(frame).toBeInstanceOf(Buffer);
     expect(frame.length).toBeGreaterThan(0);
   });
@@ -61,7 +61,7 @@ describe('WasmBridge', () => {
   });
 
   it('should build COTP Disconnect Request', () => {
-    const frame = ctx.bridge.buildCotpDR();
+    const frame = ctx.bridge.buildCotpDR(0, 0);
     expect(frame).toBeInstanceOf(Buffer);
     expect(frame.length).toBeGreaterThan(0);
   });

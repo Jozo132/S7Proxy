@@ -4,7 +4,7 @@
 import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import loader from '@assemblyscript/loader';
+import * as loader from '@assemblyscript/loader';
 
 /**
  * @typedef {Object} WasmExports
@@ -98,7 +98,7 @@ export async function loadWasmEngine(imports) {
   if (cachedEngine) return cachedEngine;
 
   const wasmBytes = await readFile(WASM_PATH);
-  const wasmModule = await WebAssembly.compile(wasmBytes);
+  const wasmModule = await WebAssembly.compile(new Uint8Array(wasmBytes.buffer, wasmBytes.byteOffset, wasmBytes.byteLength));
 
   /** @type {WasmImports} */
   const hostImports = {

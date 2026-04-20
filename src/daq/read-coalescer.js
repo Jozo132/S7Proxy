@@ -82,7 +82,7 @@ export class ReadCoalescer {
   #startRead(tag) {
     return {
       area: tag.area,
-      dbNum: tag.dbNum,
+      dbNum: tag.dbNum ?? 0,
       start: tag.start,
       amount: tag.amount,
       wordLen: tag.wordLen,
