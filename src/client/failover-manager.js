@@ -141,7 +141,7 @@ export class FailoverManager extends EventEmitter {
 
     const nextIdx = this.#getNextEndpointIndex();
     if (nextIdx === -1) {
-      this.#logger.error('All endpoints failed — no more backups');
+      this.#logger.error('All endpoints failed - no more backups');
       return;
     }
 
@@ -161,13 +161,13 @@ export class FailoverManager extends EventEmitter {
     if (ep !== this.#target.primary) return;
 
     if (this.#config.failbackMode === 'manual') {
-      this.#logger.info('Primary recovered — manual failback required');
+      this.#logger.info('Primary recovered - manual failback required');
       return;
     }
 
     if (this.#failbackTimer) return;
 
-    this.#logger.info(`Primary recovered — scheduling failback in ${this.#config.failbackDelayMs}ms`);
+    this.#logger.info(`Primary recovered - scheduling failback in ${this.#config.failbackDelayMs}ms`);
     this.#failbackTimer = setTimeout(() => {
       this.#failbackTimer = null;
       const from = this.activeEndpoint;

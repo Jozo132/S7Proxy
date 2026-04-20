@@ -7,13 +7,126 @@
 
 import { EventEmitter } from 'eventemitter3';
 import { DBStruct } from './db-struct.js';
-import { S7AreaDB, S7WLByte } from './constants.js';
+import { S7AreaDB, S7WLBit, S7WLByte, S7_MSG_ACK, S7_MSG_ACK_DATA, S7_MSG_USERDATA } from './constants.js';
 
 /** @import { ConnectionPool } from '../client/connection-pool.js' */
 /** @import { WasmBridge } from '../wasm/bridge.js' */
 /** @import { DaqEngine } from '../daq/daq-engine.js' */
 /** @import { S7StructDef, S7Value } from './db-struct.js' */
 /** @import pino from 'pino' */
+
+const TPKT_COTP_HEADER_SIZE = 7;
+const S7_BASE_HEADER_SIZE = 10;
+const S7_ERROR_HEADER_SIZE = 12;
+
+/**
+ * @param {number} messageType
+ * @returns {number}
+ */
+function getS7HeaderSize(messageType) {
+  return messageType === S7_MSG_ACK_DATA || messageType === S7_MSG_USERDATA
+    ? S7_ERROR_HEADER_SIZE
+    : S7_BASE_HEADER_SIZE;
+}
+
+/**
+ * @param {WasmBridge} bridge
+ * @param {Buffer} response
+ * @returns {{ pdu: import('./types.js').ParsedPDU, dataStart: number }}
+ */
+function parseS7Response(bridge, response) {
+  const { pdu } = bridge.parseFrame(response);
+  if (!pdu) {
+    throw new Error(`Invalid S7 response: expected S7 PDU, got frame length ${response.length}`);
+  }
+  return {
+    pdu,
+    dataStart: TPKT_COTP_HEADER_SIZE + getS7HeaderSize(pdu.messageType) + pdu.paramLength,
+  };
+}
+
+/**
+ * @param {import('./db-struct.js').S7StructItem | undefined} item
+ * @returns {boolean}
+ */
+function isScalarBitItem(item) {
+  if (!item) return false;
+  const type = String(item.type ?? '').toUpperCase();
+  const size = item.size && item.size > 0 ? Math.round(item.size) : 1;
+  return (type === 'BOOL' || type === 'BIT') && size === 1;
+}
+
+/**
+ * @param {string | undefined} offset
+ * @returns {{ byteOffset: number, bitOffset: number, bitAddress: number } | null}
+ */
+function parseByteBitOffset(offset) {
+  if (typeof offset !== 'string') return null;
+  const match = /^(\d+)\.(\d+)$/.exec(offset.trim());
+  if (!match) return null;
+
+  const byteOffset = Number.parseInt(match[1], 10);
+  const bitOffset = Number.parseInt(match[2], 10);
+  if (!Number.isSafeInteger(byteOffset) || !Number.isSafeInteger(bitOffset) || bitOffset < 0 || bitOffset > 7) {
+    return null;
+  }
+
+  return {
+    byteOffset,
+    bitOffset,
+    bitAddress: (byteOffset * 8) + bitOffset,
+  };
+}
+
+/**
+ * @param {DBStruct} struct
+ * @param {Record<string, S7Value>} values
+ * @returns {{ fieldName: string, byteOffset: number, bitOffset: number, value: boolean } | null}
+ */
+function getAtomicBitWriteCandidate(struct, values) {
+  const entries = Object.entries(values);
+  if (entries.length !== 1) return null;
+
+  const [fieldName, rawValue] = entries[0];
+  const item = struct.items.find((entry) => entry.name === fieldName);
+  if (!item) return null;
+  if (!isScalarBitItem(item)) return null;
+
+  const offset = parseByteBitOffset(item.offset);
+  if (!offset) return null;
+
+  return {
+    fieldName,
+    byteOffset: offset.byteOffset,
+    bitOffset: offset.bitOffset,
+    value: !!rawValue,
+  };
+}
+
+/**
+ * @param {WasmBridge} bridge
+ * @param {Buffer} response
+ */
+function assertSuccessfulWriteResponse(bridge, response) {
+  const { pdu, dataStart: dataItemStart } = parseS7Response(bridge, response);
+  if (pdu.messageType === S7_MSG_ACK) {
+    if (pdu.errorClass !== 0 || pdu.errorCode !== 0) {
+      throw new Error(`S7 write ACK error: class 0x${pdu.errorClass.toString(16)}, code 0x${pdu.errorCode.toString(16)}`);
+    }
+    return;
+  }
+
+  const returnCode = response[dataItemStart];
+  if (returnCode == null) {
+    throw new Error(`Invalid S7 write response: expected at least ${dataItemStart + 1} bytes, got ${response.length}`);
+  }
+  if (pdu.messageType !== S7_MSG_ACK_DATA) {
+    throw new Error(`Invalid S7 write response message type: 0x${pdu.messageType.toString(16)}`);
+  }
+  if (returnCode !== 0xFF) {
+    throw new Error(`S7 write error, return code: 0x${returnCode.toString(16)}`);
+  }
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -24,6 +137,17 @@ import { S7AreaDB, S7WLByte } from './constants.js';
  * @property {string}   targetId    - PLC target ID
  * @property {number}   intervalMs  - Scan interval
  * @property {string}   tagName     - Internal tag name
+ * @property {string[]} [keys]      - Optional subset of struct fields
+ */
+
+/**
+ * @typedef {Object} StructMeta
+ * @property {string | undefined} [targetId]
+ * @property {string | undefined} [description]
+ * @property {'none' | 'struct' | 'items' | undefined} [subscribeMode]
+ * @property {string[] | undefined} [subscribeItems]
+ * @property {number | undefined} [subscribeIntervalMs]
+ * @property {string | undefined} [subscribeTargetId]
  */
 
 
@@ -33,6 +157,9 @@ import { S7AreaDB, S7WLByte } from './constants.js';
 export class StructManager extends EventEmitter {
   /** @type {Map<string, DBStruct>} */
   #structs = new Map();
+
+  /** @type {Map<string, StructMeta>} */
+  #structMeta = new Map();
 
   /** @type {Map<string, StructSubscription>} */
   #structSubs = new Map();
@@ -118,6 +245,14 @@ export class StructManager extends EventEmitter {
   register(def) {
     const struct = new DBStruct(def);
     this.#structs.set(struct.name, struct);
+    this.#structMeta.set(struct.name, {
+      targetId: def.targetId,
+      description: def.description,
+      subscribeMode: def.subscribeMode,
+      subscribeItems: def.subscribeItems,
+      subscribeIntervalMs: def.subscribeIntervalMs,
+      subscribeTargetId: def.subscribeTargetId,
+    });
     this.#logger?.info({ struct: struct.name, db: struct.db, size: struct.size }, 'Struct registered');
     this.emit('registered', struct.name, struct);
     return struct;
@@ -137,7 +272,11 @@ export class StructManager extends EventEmitter {
    * @param {string} name
    */
   unregister(name) {
+    for (const sub of this.getStructSubscriptions().filter((entry) => entry.structName === name)) {
+      this.unsubscribe(sub.subId);
+    }
     this.#structs.delete(name);
+    this.#structMeta.delete(name);
     this.#valueCache.delete(name);
     this.emit('unregistered', name);
   }
@@ -167,7 +306,7 @@ export class StructManager extends EventEmitter {
 
   /**
    * Get struct info for all registered structs.
-   * @returns {Array<{ name: string, db: number, offset: number, size: number, fields: string[] }>}
+   * @returns {Array<{ name: string, db: number, offset: number, size: number, registered: true, fields: string[], items: Array<{ name: string, type: string, size?: number, strlen?: number, offset?: string }>, targetId?: string, subscribeMode?: 'none' | 'struct' | 'items', subscribeItems?: string[] }>}
    */
   listInfo() {
     return [...this.#structs.values()].map((s) => ({
@@ -175,7 +314,18 @@ export class StructManager extends EventEmitter {
       db: s.db,
       offset: s.offset,
       size: s.size,
+      registered: true,
       fields: s.items.map((i) => i.name),
+      items: s.items.map((i) => ({
+        name: i.name,
+        type: i.type,
+        size: i.size,
+        strlen: i.strlen,
+        offset: i.offset,
+      })),
+      targetId: this.#structMeta.get(s.name)?.targetId,
+      subscribeMode: this.#structMeta.get(s.name)?.subscribeMode,
+      subscribeItems: this.#structMeta.get(s.name)?.subscribeItems,
     }));
   }
 
@@ -191,6 +341,7 @@ export class StructManager extends EventEmitter {
   async read(name, keys, targetId) {
     const struct = this.#requireStruct(name);
     const { pool, bridge } = this.#requireConnection();
+    this.#resolveActiveTarget(name, targetId);
 
     const conn = pool.acquire();
     if (!conn) throw new Error('No PLC connection available');
@@ -203,8 +354,14 @@ export class StructManager extends EventEmitter {
     const response = await conn.sendRequest(frame, pduRef);
 
     // Parse S7 response: TPKT(4) + COTP(3) + S7 header(12) + param(2) = offset 21
-    const dataItemStart = 21;
+    const { pdu, dataStart: dataItemStart } = parseS7Response(bridge, response);
     const returnCode = response[dataItemStart];
+    if (returnCode == null || response.length < dataItemStart + 4) {
+      throw new Error(`Invalid S7 read response: expected at least ${dataItemStart + 4} bytes, got ${response.length}`);
+    }
+    if (pdu.messageType !== S7_MSG_ACK_DATA) {
+      throw new Error(`Invalid S7 read response message type: 0x${pdu.messageType.toString(16)}`);
+    }
     if (returnCode !== 0xFF) {
       throw new Error(`S7 read error, return code: 0x${returnCode.toString(16)}`);
     }
@@ -237,6 +394,31 @@ export class StructManager extends EventEmitter {
   async write(name, values, targetId) {
     const struct = this.#requireStruct(name);
     const { pool, bridge } = this.#requireConnection();
+    this.#resolveActiveTarget(name, targetId);
+
+    const atomicBitWrite = getAtomicBitWriteCandidate(struct, values);
+    if (atomicBitWrite) {
+      const conn = pool.acquire();
+      if (!conn) throw new Error('No PLC connection available');
+
+      const frame = bridge.buildBitWriteRequest(
+        S7AreaDB,
+        struct.db,
+        atomicBitWrite.byteOffset,
+        atomicBitWrite.bitOffset,
+        atomicBitWrite.value,
+      );
+      const pduRef = frame.readUInt16BE(11);
+      const response = await conn.sendRequest(frame, pduRef);
+      assertSuccessfulWriteResponse(bridge, response);
+
+      try {
+        await this.read(name, undefined, targetId);
+      } catch {
+        this.#valueCache.delete(name);
+      }
+      return;
+    }
 
     // Merge with cached values for safe partial writes
     let base = this.#valueCache.get(name);
@@ -258,13 +440,7 @@ export class StructManager extends EventEmitter {
     );
     const pduRef = frame.readUInt16BE(11);
     const response = await conn.sendRequest(frame, pduRef);
-
-    // Check write response: offset 21, return code 0xFF = success
-    const dataItemStart = 21;
-    const returnCode = response[dataItemStart];
-    if (returnCode !== 0xFF) {
-      throw new Error(`S7 write error, return code: 0x${returnCode.toString(16)}`);
-    }
+    assertSuccessfulWriteResponse(bridge, response);
 
     // Update local cache with merged values
     this.#valueCache.set(name, merged);
@@ -276,19 +452,21 @@ export class StructManager extends EventEmitter {
    * Subscribe to a struct via DAQ — scans the PLC at the given interval
    * and emits decoded values on each cycle.
    * @param {string} name
-   * @param {string} targetId
+    * @param {string | undefined} targetId
    * @param {number} intervalMs
+   * @param {string[]} [keys]
    * @returns {string} subscription ID
    */
-  subscribe(name, targetId, intervalMs) {
+  subscribe(name, targetId, intervalMs, keys) {
     const struct = this.#requireStruct(name);
     const daq = this.#requireDaq();
+    const resolvedTargetId = this.#resolveActiveTarget(name, targetId);
 
-    const tagName = `struct:${name}`;
+    const tagName = `struct:${name}:${this.#structSubs.size + 1}`;
 
     // Create a single tag covering the entire struct byte range
     const subId = daq.subscribe({
-      targetId,
+      targetId: resolvedTargetId,
       tags: [{
         name: tagName,
         area: S7AreaDB,
@@ -296,12 +474,13 @@ export class StructManager extends EventEmitter {
         dbNum: struct.db,
         amount: struct.size,
         wordLen: S7WLByte,
+        target: resolvedTargetId,
       }],
       intervalMs,
     });
 
     /** @type {StructSubscription} */
-    const sub = { subId, structName: name, targetId, intervalMs, tagName };
+    const sub = { subId, structName: name, targetId: resolvedTargetId, intervalMs, tagName, keys };
     this.#structSubs.set(subId, sub);
     this.#tagToStruct.set(tagName, name);
 
@@ -354,18 +533,22 @@ export class StructManager extends EventEmitter {
     if (!tag || !tag.value) return;
 
     const buf = Buffer.from(tag.value, 'hex');
-    const values = struct.decodeToMap(buf);
-    this.#valueCache.set(sub.structName, values);
+    const decoded = struct.decodeToMap(buf);
+    const selected = sub.keys?.length
+      ? Object.fromEntries(sub.keys.filter((key) => key in decoded).map((key) => [key, decoded[key]]))
+      : decoded;
+    const mergedValues = { ...(this.#valueCache.get(sub.structName) ?? {}), ...selected };
+    this.#valueCache.set(sub.structName, mergedValues);
 
     // Emit per-struct event
-    this.emit(`struct:data:${sub.structName}`, values);
+    this.emit(`struct:data:${sub.structName}`, selected);
 
     // Emit general event
     this.emit('struct:data', {
       structName: sub.structName,
       subscriptionId: subId,
       targetId: sub.targetId,
-      values,
+      values: selected,
       timestamp: Date.now(),
     });
   }
@@ -394,11 +577,30 @@ export class StructManager extends EventEmitter {
     return this.#daq;
   }
 
+  /**
+   * @param {string} name
+   * @param {string} [targetId]
+   * @returns {string}
+   */
+  #resolveActiveTarget(name, targetId) {
+    const requestedTargetId = targetId
+      ?? this.#structMeta.get(name)?.targetId
+      ?? this.#structMeta.get(name)?.subscribeTargetId
+      ?? this.#defaultTargetId;
+
+    if (this.#pool && this.#pool.targetId !== requestedTargetId) {
+      throw new Error(`Target "${requestedTargetId}" is not active`);
+    }
+
+    return requestedTargetId;
+  }
+
   shutdown() {
     for (const subId of this.#structSubs.keys()) {
       this.unsubscribe(subId);
     }
     this.#structs.clear();
+    this.#structMeta.clear();
     this.#valueCache.clear();
     this.#tagToStruct.clear();
     this.removeAllListeners();

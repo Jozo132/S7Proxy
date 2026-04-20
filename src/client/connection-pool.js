@@ -99,7 +99,7 @@ export class ConnectionPool extends EventEmitter {
       const conn = new PlcConnection(connId, this.#targetId, endpoint, this.#bridge, this.#logger, this.#requestTimeoutMs);
 
       conn.on('close', () => {
-        this.#logger.warn({ connId }, 'Connection closed — reconnecting');
+        this.#logger.warn({ connId }, 'Connection closed - reconnecting');
         this.#reconnect(conn, endpoint);
       });
 
@@ -147,7 +147,7 @@ export class ConnectionPool extends EventEmitter {
       await conn.connect();
       this.#logger.info({ connId }, 'Reconnected successfully');
     } catch (err) {
-      this.#logger.error({ connId, err }, 'Reconnection failed — retrying in 5s');
+      this.#logger.error({ connId, err }, 'Reconnection failed - retrying in 5s');
       setTimeout(() => this.#reconnect(conn, endpoint), 5000);
     }
   }

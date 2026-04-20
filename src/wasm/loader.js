@@ -36,6 +36,7 @@ import * as loader from '@assemblyscript/loader';
  * @property {(maxAmqCalling: number, maxAmqCalled: number, pduSize: number, outPtr: number) => number} s7_buildSetupComm
  * @property {(area: number, dbNum: number, start: number, amount: number, wordLen: number, outPtr: number) => number} s7_buildReadRequest
  * @property {(area: number, dbNum: number, start: number, amount: number, wordLen: number, dataPtr: number, dataLen: number, outPtr: number) => number} s7_buildWriteRequest
+ * @property {(area: number, dbNum: number, byteOffset: number, bitOffset: number, value: number, outPtr: number) => number} s7_buildBitWriteRequest
  * @property {(itemsPtr: number, itemCount: number, outPtr: number) => number} s7_buildMultiReadRequest
  * @property {() => number} s7_getMessageType
  * @property {() => number} s7_getFunctionCode

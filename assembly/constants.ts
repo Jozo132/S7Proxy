@@ -71,11 +71,14 @@ export const S7_FN_END_UPLOAD: u8 = 0x1F;
 export const S7_FN_PLC_CONTROL: u8 = 0x28;
 export const S7_FN_PLC_STOP: u8 = 0x29;
 
-// ─── S7 Transport Sizes (for read/write item encoding) ───
-export const S7_TRANSPORT_SIZE_BIT: u8 = 0x01;
-export const S7_TRANSPORT_SIZE_BYTE: u8 = 0x02;
+// ─── S7 Write-data Transport Sizes ───
+// These are the transport/result codes used in the WRITE_VAR data section,
+// which differ from the S7ANY item transport size constants above.
+export const S7_TRANSPORT_SIZE_BIT: u8 = 0x03;
+export const S7_TRANSPORT_SIZE_BYTE: u8 = 0x04;
 export const S7_TRANSPORT_SIZE_INT: u8 = 0x05;
-export const S7_TRANSPORT_SIZE_REAL: u8 = 0x08;
+export const S7_TRANSPORT_SIZE_REAL: u8 = 0x07;
+export const S7_TRANSPORT_SIZE_OCTET: u8 = 0x09;
 
 // ─── S7 Return Codes ───
 export const S7_RESULT_OK: u8 = 0xFF;

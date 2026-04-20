@@ -23,6 +23,10 @@ import { WebSocketServer, WebSocket } from 'ws';
 export class WsServer extends EventEmitter {
   /** @type {WebSocketServer | null} */
   #wss = null;
+  /** @type {HttpServer | null} */
+  #server = null;
+  /** @type {((req: import('node:http').IncomingMessage, socket: import('node:stream').Duplex, head: Buffer) => void) | null} */
+  #upgradeHandler = null;
   /** @type {Map<string, WsClient>} */
   #clients = new Map();
   /** @type {DaqEngine} */
@@ -58,7 +62,22 @@ export class WsServer extends EventEmitter {
    * @param {HttpServer} server
    */
   attach(server) {
-    this.#wss = new WebSocketServer({ server, path: '/ws' });
+    this.#server = server;
+    this.#wss = new WebSocketServer({ noServer: true });
+
+    this.#upgradeHandler = (req, socket, head) => {
+      const url = new URL(req.url ?? '', 'http://localhost');
+      if (url.pathname !== '/ws') return;
+
+      socket.on('error', (err) => {
+        this.#logger.debug({ err }, 'WebSocket upgrade socket error');
+      });
+
+      this.#wss?.handleUpgrade(req, socket, head, (ws) => {
+        this.#wss?.emit('connection', ws, req);
+      });
+    };
+    server.on('upgrade', this.#upgradeHandler);
 
     this.#wss.on('connection', (ws) => {
       this.#handleConnection(ws);
@@ -83,6 +102,12 @@ export class WsServer extends EventEmitter {
       client.ws.close(1001, 'Server shutdown');
     }
     this.#clients.clear();
+
+    if (this.#server && this.#upgradeHandler) {
+      this.#server.removeListener('upgrade', this.#upgradeHandler);
+      this.#upgradeHandler = null;
+      this.#server = null;
+    }
 
     if (this.#wss) {
       this.#wss.close();
@@ -291,7 +316,7 @@ export class WsServer extends EventEmitter {
         if (client.droppedFrames >= maxDropped) {
           const elapsed = Date.now() - client.droppedSince;
           if (elapsed < dropWindow) {
-            this.#logger.warn({ clientId: client.id }, 'Slow consumer — disconnecting');
+            this.#logger.warn({ clientId: client.id }, 'Slow consumer - disconnecting');
             this.#metrics.wsSlowConsumerDisconnects.inc();
             client.ws.close(4000, 'Slow consumer');
             continue;

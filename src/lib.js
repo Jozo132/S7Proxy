@@ -25,6 +25,7 @@ export { Metrics } from './metrics/metrics.js';
 export { createLogger } from './logging/logger.js';
 export { FrameAssembler } from './protocol/frame-assembler.js';
 export { DBStruct, calculateSize, decode, encode } from './protocol/db-struct.js';
+export { AdminStore } from './admin/store.js';
 export { S7Client } from './compat/s7client.js';
 export { S7Server } from './compat/s7server.js';
 export * from './protocol/constants.js';

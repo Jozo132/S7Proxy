@@ -79,6 +79,12 @@ const OBJECT_TYPES = new Set(['IEC_TIMER']);
  * @property {string}        name   - Human label
  * @property {number}        db     - DB number
  * @property {number}        offset - Start byte offset in the DB
+ * @property {string}        [targetId] - Preferred PLC target for this struct
+ * @property {string}        [description]
+ * @property {'none' | 'struct' | 'items'} [subscribeMode]
+ * @property {string[]}      [subscribeItems]
+ * @property {number}        [subscribeIntervalMs]
+ * @property {string}        [subscribeTargetId]
  * @property {S7StructItem[]} items - Fields
  */
 

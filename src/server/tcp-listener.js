@@ -16,6 +16,8 @@ export class TcpListener extends EventEmitter {
   #host;
   /** @type {Server | null} */
   #server = null;
+  /** @type {Set<Socket>} */
+  #sockets = new Set();
 
   /**
    * @param {number} port
@@ -36,6 +38,10 @@ export class TcpListener extends EventEmitter {
   async start() {
     return new Promise((resolve, reject) => {
       const server = createServer((socket) => {
+        this.#sockets.add(socket);
+        socket.on('close', () => {
+          this.#sockets.delete(socket);
+        });
         this.#logger.debug({ remote: `${socket.remoteAddress}:${socket.remotePort}` }, 'New client connection');
         this.emit('connection', socket);
       });
@@ -59,9 +65,13 @@ export class TcpListener extends EventEmitter {
   async stop() {
     if (!this.#server) return;
     return new Promise((resolve) => {
+      for (const socket of this.#sockets) {
+        socket.destroy();
+      }
       this.#server?.close(() => {
         this.#logger.info('TCP listener stopped');
         this.#server = null;
+        this.#sockets.clear();
         resolve();
       });
     });

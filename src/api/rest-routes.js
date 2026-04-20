@@ -9,12 +9,14 @@
 
 /**
  * @param {FastifyInstance} app
- * @param {ConnectionPool} pool
- * @param {DaqEngine} daq
+ * @param {() => ConnectionPool | null} getPool
+ * @param {() => DaqEngine | null} getDaq
  * @param {Metrics} metrics
  * @param {StructManager} [structs]
  */
-export function registerRoutes(app, pool, daq, metrics, structs) {
+export function registerRoutes(app, getPool, getDaq, metrics, structs) {
+  const noActiveTarget = { error: 'No active target configured' };
+
   // Health check
   app.get('/api/health', async () => {
     return { status: 'ok', timestamp: Date.now() };
@@ -22,7 +24,12 @@ export function registerRoutes(app, pool, daq, metrics, structs) {
 
   // --- Connection endpoints ---
 
-  app.get('/api/targets', async () => {
+  app.get('/api/targets', async (_req, reply) => {
+    const pool = getPool();
+    if (!pool) {
+      reply.code(503);
+      return noActiveTarget;
+    }
     return {
       targetId: pool.targetId,
       connections: pool.connections.map((c) => c.info),
@@ -33,6 +40,11 @@ export function registerRoutes(app, pool, daq, metrics, structs) {
 
   // Force failover/failback
   app.post('/api/targets/failover', async (_req, reply) => {
+    const pool = getPool();
+    if (!pool) {
+      reply.code(503);
+      return noActiveTarget;
+    }
     try {
       await pool.failoverManager.forceFailover();
       return { status: 'failover_triggered' };
@@ -43,6 +55,11 @@ export function registerRoutes(app, pool, daq, metrics, structs) {
   });
 
   app.post('/api/targets/failback', async (_req, reply) => {
+    const pool = getPool();
+    if (!pool) {
+      reply.code(503);
+      return noActiveTarget;
+    }
     try {
       await pool.failoverManager.forceFailback();
       return { status: 'failback_triggered' };
@@ -55,6 +72,12 @@ export function registerRoutes(app, pool, daq, metrics, structs) {
   // --- DAQ Read ---
 
   app.get('/api/read', async (req, reply) => {
+    const daq = getDaq();
+    if (!daq) {
+      reply.code(503);
+      return noActiveTarget;
+    }
+
     const tagName = /** @type {string | undefined} */ (/** @type {any} */ (req.query).tag);
 
     if (!tagName) {
@@ -82,11 +105,22 @@ export function registerRoutes(app, pool, daq, metrics, structs) {
 
   // --- DAQ Subscription management ---
 
-  app.get('/api/subscriptions', async () => {
+  app.get('/api/subscriptions', async (_req, reply) => {
+    const daq = getDaq();
+    if (!daq) {
+      reply.code(503);
+      return noActiveTarget;
+    }
     return daq.getSubscriptions();
   });
 
   app.post('/api/subscriptions', async (req, reply) => {
+    const daq = getDaq();
+    if (!daq) {
+      reply.code(503);
+      return noActiveTarget;
+    }
+
     const body = /** @type {any} */ (req.body) ?? {};
     const { targetId, tags, intervalMs } = body;
 
@@ -111,7 +145,12 @@ export function registerRoutes(app, pool, daq, metrics, structs) {
     return { id: subId, targetId, tags: tags.length, intervalMs };
   });
 
-  app.delete('/api/subscriptions/:subId', async (req, _reply) => {
+  app.delete('/api/subscriptions/:subId', async (req, reply) => {
+    const daq = getDaq();
+    if (!daq) {
+      reply.code(503);
+      return noActiveTarget;
+    }
     const { subId } = /** @type {{ subId: string }} */ (/** @type {any} */ (req.params));
     daq.unsubscribe(subId);
     return { status: 'removed' };
@@ -119,7 +158,12 @@ export function registerRoutes(app, pool, daq, metrics, structs) {
 
   // --- Scan groups ---
 
-  app.get('/api/scan-groups', async () => {
+  app.get('/api/scan-groups', async (_req, reply) => {
+    const daq = getDaq();
+    if (!daq) {
+      reply.code(503);
+      return noActiveTarget;
+    }
     return daq.getScanGroupStats();
   });
 

@@ -236,6 +236,29 @@ export class WasmBridge {
     return this.readFromTx(0, totalLen);
   }
 
+  /**
+   * Build S7 Write Var request frame for a single atomic bit write.
+   * @param {number} area
+   * @param {number} dbNum
+   * @param {number} byteOffset
+   * @param {number} bitOffset
+   * @param {boolean} value
+   * @returns {Buffer}
+   */
+  buildBitWriteRequest(area, dbNum, byteOffset, bitOffset, value) {
+    const e = this.#engine.exports;
+    this.#refreshMemoryView();
+
+    e.scratchReset();
+    const scratchPtr = e.scratchAlloc(256);
+    const s7Len = e.s7_buildBitWriteRequest(area, dbNum, byteOffset, bitOffset, value ? 1 : 0, scratchPtr);
+
+    const txBase = e.getTxBufferOffset();
+    const totalLen = e.frame_build(scratchPtr, s7Len, txBase);
+
+    return this.readFromTx(0, totalLen);
+  }
+
   /** @returns {WasmExports} */
   get exports() {
     return this.#engine.exports;

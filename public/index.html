@@ -1,0 +1,1167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>S7Proxy Admin</title>
+<style>
+/* ─── Variables & Reset ──────────────────────────────────────────── */
+:root {
+  --bg: #080b12; --surface: #0f1219; --surface-2: #161b26; --surface-3: #1c2333;
+  --border: #1e2736; --border-2: #2a3548;
+  --text: #e8ecf4; --text-2: #b0b8c9; --dim: #5e6b82;
+  --accent: #3b82f6; --accent-h: #2563eb; --accent-soft: rgba(59,130,246,.12);
+  --green: #10b981; --green-soft: rgba(16,185,129,.12);
+  --red: #ef4444; --red-soft: rgba(239,68,68,.12);
+  --amber: #f59e0b; --amber-soft: rgba(245,158,11,.12);
+  --r: 6px; --r-lg: 10px;
+  --font: -apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+  --mono: 'Consolas','Monaco','Fira Code',monospace;
+  --transition: 150ms ease;
+}
+*,*::before,*::after { margin:0; padding:0; box-sizing:border-box; }
+html { font-size: 14px; }
+body { font-family: var(--font); background: var(--bg); color: var(--text); line-height: 1.5; -webkit-font-smoothing: antialiased; }
+::selection { background: var(--accent); color: #fff; }
+::-webkit-scrollbar { width:6px; height:6px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:var(--border-2); border-radius:3px; }
+
+/* ─── Login ──────────────────────────────────────────────────────── */
+.login-screen { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:var(--bg); z-index:200; }
+.login-card { width:360px; padding:40px 32px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r-lg); text-align:center; }
+.login-logo { font-size:28px; font-weight:700; letter-spacing:-0.5px; margin-bottom:4px; }
+.login-logo span { color:var(--accent); }
+.login-sub { color:var(--dim); font-size:13px; margin-bottom:28px; }
+.login-card form { display:flex; flex-direction:column; gap:12px; }
+.login-card input { padding:10px 14px; border:1px solid var(--border); border-radius:var(--r); background:var(--bg); color:var(--text); font-size:14px; font-family:var(--font); outline:none; transition:border var(--transition); }
+.login-card input:focus { border-color:var(--accent); }
+.login-err { color:var(--red); font-size:12px; min-height:18px; margin-top:4px; }
+
+/* ─── Header ─────────────────────────────────────────────────────── */
+.header { display:flex; align-items:center; gap:16px; padding:0 24px; height:52px; background:var(--surface); border-bottom:1px solid var(--border); position:sticky; top:0; z-index:50; }
+.header-brand { display:flex; align-items:center; gap:10px; }
+.header-brand h1 { font-size:16px; font-weight:700; letter-spacing:-0.3px; }
+.header-brand h1 span { color:var(--accent); }
+.header-sep { width:1px; height:20px; background:var(--border); margin:0 4px; }
+.header-tag { font-size:11px; color:var(--dim); padding:2px 8px; border:1px solid var(--border); border-radius:999px; white-space:nowrap; }
+.header-right { margin-left:auto; display:flex; align-items:center; gap:12px; }
+.ws-dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; transition:background var(--transition); }
+.ws-dot.ok { background:var(--green); box-shadow:0 0 6px var(--green); }
+.ws-dot.err { background:var(--red); box-shadow:0 0 6px var(--red); }
+.ws-dot.warn { background:var(--amber); }
+.header-dim { font-size:12px; color:var(--dim); white-space:nowrap; }
+
+/* ─── Container & Layout ─────────────────────────────────────────── */
+.container { max-width:1440px; margin:0 auto; padding:20px 24px; }
+.page-toolbar { display:flex; align-items:flex-end; justify-content:space-between; gap:16px; margin-bottom:20px; flex-wrap:wrap; }
+.page-title h2 { font-size:18px; font-weight:600; margin-bottom:2px; }
+.page-title p { color:var(--dim); font-size:12px; }
+
+/* ─── Stats Strip ────────────────────────────────────────────────── */
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; margin-bottom:20px; }
+.stat-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--r); padding:14px 16px; transition:border-color var(--transition); }
+.stat-card:hover { border-color:var(--border-2); }
+.stat-card .k { display:block; font-size:11px; color:var(--dim); text-transform:uppercase; letter-spacing:.5px; }
+.stat-card .v { display:block; font-size:20px; font-weight:700; margin-top:4px; }
+
+/* ─── Target Cards ───────────────────────────────────────────────── */
+.target-stack { display:flex; flex-direction:column; gap:12px; }
+.t-card { background:var(--surface); border:1px solid var(--border); border-radius:var(--r-lg); overflow:hidden; transition:border-color var(--transition); }
+.t-card:hover { border-color:var(--border-2); }
+.t-card.detached { border-style:dashed; opacity:.85; }
+.t-head { display:flex; align-items:center; gap:12px; padding:16px 20px; flex-wrap:wrap; }
+.t-head-info { flex:1; min-width:200px; }
+.t-head-info h3 { font-size:16px; font-weight:600; }
+.t-head-info p { color:var(--dim); font-size:12px; }
+.t-head-actions { display:flex; gap:6px; flex-wrap:wrap; }
+.t-badges { display:flex; gap:6px; margin-top:6px; flex-wrap:wrap; }
+.t-meta { display:grid; grid-template-columns:repeat(auto-fit,minmax(175px,1fr)); gap:8px; padding:0 20px 14px; }
+.meta-cell { background:var(--bg); border:1px solid var(--border); border-radius:var(--r); padding:10px 12px; }
+.meta-cell .k { display:block; font-size:10px; color:var(--dim); text-transform:uppercase; letter-spacing:.5px; }
+.meta-cell .v { display:block; font-family:var(--mono); font-size:13px; font-weight:600; margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.t-section { padding:0 20px 16px; }
+.t-section-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:8px; }
+.t-section-head h4 { font-size:12px; text-transform:uppercase; letter-spacing:.5px; color:var(--dim); }
+
+/* ─── Tables ─────────────────────────────────────────────────────── */
+.scroll-x { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; padding:8px 10px; border-bottom:1px solid var(--border); color:var(--dim); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.4px; white-space:nowrap; }
+td { padding:8px 10px; border-bottom:1px solid var(--border); vertical-align:middle; }
+tr:hover>td { background:var(--accent-soft); }
+.empty-row { color:var(--dim); font-style:italic; text-align:center; padding:20px 10px; }
+
+/* ─── Live Data ──────────────────────────────────────────────────── */
+.live-row>td { padding:0; background:var(--bg); }
+.live-row>td>div { padding:8px 20px; }
+.live-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:6px; }
+.live-cell { display:flex; align-items:center; gap:8px; padding:5px 8px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r); transition:border-color var(--transition); }
+.live-cell:hover { border-color:var(--border-2); }
+.live-cell .finfo { min-width:0; max-width:160px; display:flex; align-items:center; gap:6px; flex:1 1 auto; }
+.live-cell .fname { min-width:0; max-width:74px; color:var(--text); font-size:11px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.live-cell .fmeta { min-width:0; color:var(--dim); font-size:10px; font-family:var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.live-cell .fval { flex:1 1 72px; min-width:0; font-family:var(--mono); font-size:12px; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.live-cell .ftype { font-size:10px; color:var(--dim); background:var(--surface-2); padding:1px 6px; border-radius:999px; border:1px solid var(--border); }
+.live-cell .fval.flash { animation:val-flash .6s ease; }
+@keyframes val-flash {
+  0% { color:var(--accent); background:var(--accent-soft); border-radius:2px; }
+  100% { color:var(--text); background:transparent; }
+}
+.live-cell .fedit { display:flex; gap:3px; }
+.live-cell .fedit .btn.xs { padding:1px 4px; min-width:20px; justify-content:center; }
+.edit-input { padding:2px 5px; width:86px; border:1px solid var(--accent); border-radius:var(--r); background:var(--bg); color:var(--text); font-family:var(--mono); font-size:11px; outline:none; }
+.edit-input:focus { box-shadow:0 0 0 2px var(--accent-soft); }
+.live-empty { color:var(--dim); font-size:11px; font-style:italic; padding:4px 0; }
+.expand-btn { cursor:pointer; font-size:10px; color:var(--dim); padding:4px 6px; border-radius:var(--r); transition:all var(--transition); user-select:none; }
+.expand-btn:hover { color:var(--text); background:var(--accent-soft); }
+.no-data { color:var(--dim); font-size:12px; padding:12px; text-align:center; }
+
+/* ─── Buttons & Badges ───────────────────────────────────────────── */
+.btn { display:inline-flex; align-items:center; gap:5px; padding:7px 14px; border-radius:var(--r); border:1px solid var(--border); background:var(--surface-2); color:var(--text); cursor:pointer; font-size:13px; font-weight:500; font-family:var(--font); transition:all var(--transition); white-space:nowrap; line-height:1.2; }
+.btn:hover { border-color:var(--accent); background:var(--accent-soft); }
+.btn:active { transform:scale(.97); }
+.btn.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+.btn.primary:hover { background:var(--accent-h); }
+.btn.danger { border-color:var(--red); color:var(--red); }
+.btn.danger:hover { background:var(--red-soft); }
+.btn.sm { padding:4px 10px; font-size:12px; }
+.btn.xs { padding:2px 6px; font-size:11px; }
+.btn.ghost { background:transparent; border-color:transparent; }
+.btn.ghost:hover { background:var(--accent-soft); border-color:transparent; }
+.badge { display:inline-flex; align-items:center; padding:2px 8px; border-radius:999px; font-size:11px; font-weight:600; line-height:1.4; }
+.badge.ok { background:var(--green-soft); color:var(--green); }
+.badge.warn { background:var(--amber-soft); color:var(--amber); }
+.badge.err { background:var(--red-soft); color:var(--red); }
+.badge.info { background:var(--accent-soft); color:var(--accent); }
+
+/* ─── Forms ──────────────────────────────────────────────────────── */
+.form-row { display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap; }
+.field { flex:1; min-width:120px; }
+.field.grow-2 { flex:2; min-width:200px; }
+.field>label { display:block; font-size:11px; color:var(--dim); margin-bottom:3px; text-transform:uppercase; letter-spacing:.3px; }
+.field input,.field select,.field textarea { width:100%; padding:7px 10px; border:1px solid var(--border); border-radius:var(--r); background:var(--bg); color:var(--text); font-size:13px; font-family:var(--font); outline:none; transition:border var(--transition); }
+.field input:focus,.field select:focus,.field textarea:focus { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-soft); }
+.field input:read-only { opacity:.6; cursor:not-allowed; }
+.field textarea { min-height:80px; resize:vertical; }
+
+/* ─── Modals ─────────────────────────────────────────────────────── */
+.overlay { position:fixed; inset:0; background:rgba(0,0,0,.65); display:none; align-items:center; justify-content:center; z-index:100; backdrop-filter:blur(2px); }
+.overlay.show { display:flex; }
+.modal { background:var(--surface); border:1px solid var(--border); border-radius:var(--r-lg); padding:24px; max-height:90vh; overflow-y:auto; }
+.modal.md { width:min(560px,calc(100vw - 32px)); }
+.modal.wide { width:min(1140px,calc(100vw - 32px)); }
+.modal h2 { font-size:16px; font-weight:600; margin-bottom:18px; display:flex; align-items:center; gap:8px; }
+.modal .actions { display:flex; gap:8px; justify-content:flex-end; margin-top:18px; }
+
+/* ─── Editor Table (struct fields) ───────────────────────────────── */
+.editor-shell { background:var(--bg); border:1px solid var(--border); border-radius:var(--r); padding:12px; }
+.editor-table th,.editor-table td { white-space:nowrap; }
+.editor-table input,.editor-table select { width:100%; min-width:88px; }
+.editor-table .cell-tight { width:82px; }
+.editor-table .cell-wide { min-width:170px; }
+.editor-row.drag-over td { background:var(--accent-soft); }
+.drag-handle { width:30px; padding:4px 6px; cursor:grab; font-family:var(--mono); color:var(--dim); }
+.drag-handle:active { cursor:grabbing; }
+
+/* ─── Toasts ─────────────────────────────────────────────────────── */
+.toast-container { position:fixed; bottom:20px; right:20px; z-index:300; display:flex; flex-direction:column-reverse; gap:8px; max-width:380px; }
+.toast { padding:10px 16px; border-radius:var(--r); font-size:13px; color:#fff; transform:translateX(110%); transition:transform .3s ease, opacity .3s ease; opacity:0; pointer-events:auto; }
+.toast.show { transform:translateX(0); opacity:1; }
+.toast.ok { background:#047857; }
+.toast.err { background:#b91c1c; }
+.toast.info { background:#1d4ed8; }
+.toast.warn { background:#92400e; }
+
+/* ─── Confirm Dialog ─────────────────────────────────────────────── */
+.confirm-body { font-size:14px; line-height:1.6; margin-bottom:4px; }
+
+/* ─── Misc ───────────────────────────────────────────────────────── */
+.mono { font-family:var(--mono); font-size:12px; }
+.subtle { color:var(--dim); font-size:12px; }
+.pill { display:inline-block; padding:2px 8px; border:1px solid var(--border); border-radius:999px; font-size:11px; color:var(--dim); max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.refresh-hint { font-size:11px; color:var(--dim); }
+.toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+.gap-6 { gap:6px; }
+.mt-8 { margin-top:8px; }
+
+/* ─── Responsive ─────────────────────────────────────────────────── */
+@media(max-width:860px) {
+  .modal,.modal.wide,.modal.md { width:calc(100vw - 16px); min-width:0; }
+  .header { padding:0 12px; gap:10px; }
+  .container { padding:14px 12px; }
+  .t-meta { grid-template-columns:1fr 1fr; }
+}
+@media(max-width:560px) {
+  .stats { grid-template-columns:1fr 1fr; }
+  .t-meta { grid-template-columns:1fr; }
+  .live-grid { grid-template-columns:1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ─── Login Screen ─────────────────────────────────────────────── -->
+<div class="login-screen" id="login-screen">
+  <div class="login-card">
+    <div class="login-logo">S7<span>Proxy</span></div>
+    <p class="login-sub">Admin Console</p>
+    <form id="login-form" autocomplete="off">
+      <input type="password" id="login-pw" placeholder="Enter password" autofocus autocomplete="current-password">
+      <button type="submit" class="btn primary" style="width:100%;justify-content:center">Sign In</button>
+    </form>
+    <p id="login-error" class="login-err"></p>
+  </div>
+</div>
+
+<!-- ─── Main Application ─────────────────────────────────────────── -->
+<div id="app" style="display:none">
+  <div class="header">
+    <div class="header-brand">
+      <h1>S7<span>Proxy</span></h1>
+      <div class="header-sep"></div>
+      <span class="header-tag">Admin</span>
+    </div>
+    <div class="header-right">
+      <span class="ws-dot" id="ws-dot"></span>
+      <span class="header-dim" id="ws-label">Connecting…</span>
+      <div class="header-sep"></div>
+      <span class="header-dim" id="uptime-label"></span>
+      <div class="header-sep"></div>
+      <button class="btn ghost sm" onclick="doLogout()">Sign out</button>
+    </div>
+  </div>
+  <div class="container">
+    <div class="page-toolbar">
+      <div class="page-title">
+        <h2>PLC Targets</h2>
+        <p>Manage PLC targets, struct definitions, and live process data.</p>
+      </div>
+      <div class="toolbar">
+        <button class="btn primary" onclick="openTargetModal()">+ Add Target</button>
+      </div>
+    </div>
+    <div class="stats" id="stats-strip"></div>
+    <div class="target-stack" id="target-stack"></div>
+  </div>
+</div>
+
+<!-- ─── Toast Container ──────────────────────────────────────────── -->
+<div class="toast-container" id="toasts"></div>
+
+<!-- ─── Confirm Dialog ───────────────────────────────────────────── -->
+<div class="overlay" id="confirm-overlay">
+  <div class="modal md" style="max-width:420px">
+    <h2>Confirm</h2>
+    <div class="confirm-body" id="confirm-msg"></div>
+    <div class="actions">
+      <button class="btn" onclick="confirmAnswer(false)">Cancel</button>
+      <button class="btn danger" onclick="confirmAnswer(true)">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─── Struct Modal ─────────────────────────────────────────────── -->
+<div class="overlay" id="struct-overlay">
+  <div class="modal wide">
+    <h2 id="struct-modal-title">Add Struct</h2>
+    <div class="form-row">
+      <div class="field grow-2"><label>Name</label><input id="sf-name" placeholder="MotorStatus"></div>
+      <div class="field"><label>PLC Target</label><input id="sf-target" placeholder="plc1" readonly></div>
+      <div class="field"><label>DB Number</label><input id="sf-db" type="number" placeholder="10"></div>
+      <div class="field"><label>Base Offset</label><input id="sf-offset" type="number" value="0"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>Description</label><input id="sf-desc" placeholder="Optional description"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>DAQ Mode</label>
+        <select id="sf-daq-mode"><option value="none">Disabled</option><option value="struct">Entire struct</option><option value="items">Selected items</option></select>
+      </div>
+      <div class="field"><label>DAQ Interval (ms)</label><input id="sf-interval" type="number" placeholder="500"></div>
+      <div class="field"><label>Total Size</label><div id="sf-total-size" class="subtle" style="padding:8px 10px;border:1px solid var(--border);border-radius:var(--r);background:var(--bg)">0 bytes</div></div>
+    </div>
+    <div class="editor-shell">
+      <div class="toolbar" style="margin-bottom:8px">
+        <button class="btn primary sm" id="sf-add-row">+ Add Field</button>
+        <span class="refresh-hint">Drag handle to reorder. Offsets preview the S7 layout.</span>
+      </div>
+      <div class="scroll-x">
+        <table class="editor-table">
+          <thead><tr><th></th><th class="cell-wide">Name</th><th>Type</th><th class="cell-tight">Count</th><th class="cell-tight">Str Len</th><th class="cell-tight">DAQ</th><th class="cell-tight">Offset</th><th></th></tr></thead>
+          <tbody id="sf-items-body"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn" onclick="closeStructModal()">Cancel</button>
+      <button class="btn primary" onclick="saveStruct()">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- ─── Target Modal ─────────────────────────────────────────────── -->
+<div class="overlay" id="target-overlay">
+  <div class="modal md">
+    <h2 id="target-modal-title">Add Target</h2>
+    <div class="form-row">
+      <div class="field"><label>Target ID</label><input id="tf-id" placeholder="plc1"></div>
+      <div class="field"><label>Primary IP</label><input id="tf-ip" placeholder="192.168.1.10"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>Rack</label><input id="tf-rack" type="number" value="0"></div>
+      <div class="field"><label>Slot</label><input id="tf-slot" type="number" value="1"></div>
+      <div class="field"><label>Port</label><input id="tf-port" type="number" placeholder="102"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>Max Connections</label><input id="tf-max" type="number" value="4"></div>
+      <div class="field"><label>Request Timeout (ms)</label><input id="tf-timeout" type="number" placeholder="3000"></div>
+      <div class="field"><label>Keep Alive (ms)</label><input id="tf-keepalive" type="number" placeholder="30000"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>Reconnect Backoff (comma-separated ms)</label><input id="tf-backoff" placeholder="1000,2000,4000,8000"></div>
+    </div>
+    <div class="form-row">
+      <div class="field"><label>Backups (JSON array)</label><textarea id="tf-backups" class="mono" placeholder='[{"ip":"192.168.1.11","rack":0,"slot":1}]'></textarea></div>
+    </div>
+    <div class="actions">
+      <button class="btn" onclick="closeTargetModal()">Cancel</button>
+      <button class="btn primary" onclick="saveTarget()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ═════════════════════════════════════════════════════════════════════
+   Constants
+   ═════════════════════════════════════════════════════════════════════ */
+const TYPE_OPTIONS = ['SINT','USINT','INT','UINT','WORD','DINT','UDINT','DWORD','REAL','FLOAT','LREAL','DOUBLE','CHAR','STRING','BOOL','BIT','BYTE','TIME','TIMER','S5TIME','IEC_TIMER'];
+const TYPE_SIZES = {SINT:1,USINT:1,INT:2,UINT:2,WORD:2,DINT:4,UDINT:4,DWORD:4,REAL:4,FLOAT:4,LREAL:8,DOUBLE:8,CHAR:1,STRING:256,BIT:1,BOOL:1,BYTE:1,TIME:4,TIMER:4,S5TIME:2,IEC_TIMER:16};
+
+/* ═════════════════════════════════════════════════════════════════════
+   State
+   ═════════════════════════════════════════════════════════════════════ */
+let state = null;
+let ws = null;
+let wsReconnectTimer = null;
+let editingStruct = null;
+let editingTarget = null;
+let structItems = [];
+let dragIdx = null;
+const expandedStructs = new Set();
+const editingFields = new Map();  // "structName:fieldName" → true
+
+/* ═════════════════════════════════════════════════════════════════════
+   Utilities
+   ═════════════════════════════════════════════════════════════════════ */
+const esc = v => String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+const fmtTime = ms => { if (!ms) return '–'; const s = Math.floor(ms/1000); if (s<60) return s+'s'; if (s<3600) return Math.floor(s/60)+'m '+s%60+'s'; return Math.floor(s/3600)+'h '+Math.floor(s%3600/60)+'m'; };
+const isBool = t => { const u = String(t||'').toUpperCase(); return u==='BOOL'||u==='BIT'; };
+const isStr = t => String(t||'').toUpperCase()==='STRING';
+const roundEven = v => v + (v & 1);
+const tSize = t => TYPE_SIZES[String(t||'').toUpperCase()] ?? 2;
+const isNumeric = t => { const u = String(t||'').toUpperCase(); return ['SINT','USINT','INT','UINT','WORD','DINT','UDINT','DWORD','REAL','FLOAT','LREAL','DOUBLE','TIME','TIMER','S5TIME','BYTE'].includes(u); };
+const isFloat = t => { const u = String(t||'').toUpperCase(); return u==='REAL'||u==='FLOAT'||u==='LREAL'||u==='DOUBLE'; };
+
+/* ═════════════════════════════════════════════════════════════════════
+   Auth
+   ═════════════════════════════════════════════════════════════════════ */
+function getToken() { return sessionStorage.getItem('s7proxy_token'); }
+function setToken(t) { t ? sessionStorage.setItem('s7proxy_token', t) : sessionStorage.removeItem('s7proxy_token'); }
+
+async function doLogin(e) {
+  e.preventDefault();
+  const pw = document.getElementById('login-pw').value;
+  const errEl = document.getElementById('login-error');
+  errEl.textContent = '';
+  try {
+    const res = await fetch('/admin/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Login failed');
+    setToken(data.token);
+    showApp();
+  } catch (err) {
+    errEl.textContent = err.message;
+  }
+}
+
+function doLogout() {
+  const token = getToken();
+  if (token) fetch('/admin/api/auth/logout', { method: 'POST', headers: authHeaders() }).catch(() => {});
+  setToken(null);
+  disconnectWs();
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('login-pw').value = '';
+  document.getElementById('login-error').textContent = '';
+}
+
+function authHeaders() {
+  const token = getToken();
+  const h = { 'Content-Type': 'application/json' };
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  return h;
+}
+
+async function checkAuth() {
+  const token = getToken();
+  if (!token) return false;
+  try {
+    const res = await fetch('/admin/api/auth/check', { headers: authHeaders() });
+    const data = await res.json();
+    return data.valid === true;
+  } catch { return false; }
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   API Helpers
+   ═════════════════════════════════════════════════════════════════════ */
+async function api(path, opts = {}) {
+  const res = await fetch(path, { headers: authHeaders(), ...opts });
+  if (res.status === 401) { doLogout(); throw new Error('Session expired'); }
+  const ct = res.headers.get('content-type') || '';
+  const body = ct.includes('json') ? await res.json() : await res.text();
+  if (!res.ok) throw new Error((body && typeof body === 'object' && body.error) ? body.error : typeof body === 'string' ? body : res.statusText);
+  return body;
+}
+const get = p => api(p);
+const post = (p, b) => api(p, { method: 'POST', body: JSON.stringify(b) });
+const put = (p, b) => api(p, { method: 'PUT', body: JSON.stringify(b) });
+const del = p => api(p, { method: 'DELETE' });
+
+/* ═════════════════════════════════════════════════════════════════════
+   WebSocket
+   ═════════════════════════════════════════════════════════════════════ */
+function connectWs() {
+  disconnectWs();
+  const token = getToken();
+  if (!token) return;
+
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = `${proto}://${location.host}/admin/ws?token=${encodeURIComponent(token)}`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    document.getElementById('ws-dot').className = 'ws-dot ok';
+    document.getElementById('ws-label').textContent = 'Live';
+    if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  };
+
+  ws.onclose = () => {
+    document.getElementById('ws-dot').className = 'ws-dot err';
+    document.getElementById('ws-label').textContent = 'Disconnected';
+    ws = null;
+    scheduleReconnect();
+  };
+
+  ws.onerror = () => {};
+
+  ws.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      handleWsMessage(msg);
+    } catch {}
+  };
+}
+
+function disconnectWs() {
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  if (ws) { ws.onclose = null; ws.close(); ws = null; }
+}
+
+function scheduleReconnect() {
+  if (wsReconnectTimer) return;
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null;
+    if (getToken()) connectWs();
+  }, 3000);
+}
+
+function sendWs(msg) {
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+
+function needsLiveGridRefresh(structName, fields) {
+  if (!expandedStructs.has(structName)) return false;
+  return !(fields || []).some(name => document.getElementById('lv-' + structName + ':' + name));
+}
+
+function handleWsMessage(msg) {
+  switch (msg.type) {
+    case 'state':
+      state = msg;
+      render();
+      break;
+
+    case 'struct-data':
+      if (state) {
+        const s = state.structs?.find(s => s.name === msg.struct);
+        if (s) {
+          const shouldRefreshPreview = needsLiveGridRefresh(s.name, s.fields);
+          s.cached = msg.values;
+          if (shouldRefreshPreview) {
+            renderTargets();
+            break;
+          }
+          updateLiveData(msg.struct, msg.values);
+        }
+      }
+      break;
+
+    case 'write-ok':
+      toast('Written to ' + msg.struct, 'ok');
+      // If no subscription, read back
+      if (state) {
+        const s = state.structs?.find(st => st.name === msg.struct);
+        if (s && !s.subscription) sendWs({ type: 'read-struct', name: msg.struct });
+      }
+      break;
+
+    case 'error':
+      toast(msg.error, 'err');
+      break;
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   Toasts & Confirm
+   ═════════════════════════════════════════════════════════════════════ */
+function toast(message, type = 'info') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.textContent = message;
+  const c = document.getElementById('toasts');
+  c.appendChild(el);
+  requestAnimationFrame(() => el.classList.add('show'));
+  setTimeout(() => {
+    el.classList.remove('show');
+    setTimeout(() => el.remove(), 300);
+  }, 4000);
+}
+
+let _confirmResolve = null;
+function confirmDialog(message) {
+  return new Promise(resolve => {
+    _confirmResolve = resolve;
+    document.getElementById('confirm-msg').textContent = message;
+    document.getElementById('confirm-overlay').classList.add('show');
+  });
+}
+function confirmAnswer(val) {
+  document.getElementById('confirm-overlay').classList.remove('show');
+  _confirmResolve?.(val);
+  _confirmResolve = null;
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   Struct Layout Helpers
+   ═════════════════════════════════════════════════════════════════════ */
+function normItem(item) {
+  return { name: String(item?.name||''), type: String(item?.type||'BOOL').toUpperCase(), size: Math.max(1,parseInt(item?.size,10)||1), strlen: Math.max(1,parseInt(item?.strlen,10)||254), daqSelected: !!item?.daqSelected };
+}
+
+function calcLayout(items, startOff = 0) {
+  let bytes = 0, bits = 0;
+  const rows = [];
+  for (const raw of items) {
+    const it = normItem(raw);
+    const type = it.type, count = it.size;
+    const strlen = isStr(type) ? roundEven((it.strlen||254)+2) : 0;
+    const scalar = tSize(type), bool = isBool(type);
+    rows.push({ offset: (startOff+bytes+0.1*bits).toFixed(1), item: it });
+    if (count > 1) {
+      if (bits > 0) { bytes+=1; bits=0; }
+      bytes = roundEven(bytes);
+      if (bool) bytes += 2*Math.ceil(count/16);
+      else bytes += isStr(type) ? strlen*count : scalar*count;
+      bytes = roundEven(bytes);
+    } else if (bool) {
+      bits += 1;
+      if (bits >= 8) { bytes+=1; bits=0; }
+    } else {
+      if (bits > 0) { bytes+=1; bits=0; }
+      if (scalar > 1) bytes = roundEven(bytes);
+      bytes += isStr(type) ? strlen : scalar;
+    }
+  }
+  if (bits > 0) bytes += 1;
+  return { rows, totalSize: roundEven(bytes) };
+}
+
+function curLayout() {
+  const base = parseInt(document.getElementById('sf-offset').value,10) || 0;
+  return calcLayout(structItems, base);
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   Rendering
+   ═════════════════════════════════════════════════════════════════════ */
+function render() {
+  if (!state) return;
+  renderStats();
+  renderTargets();
+}
+
+function renderStats() {
+  const el = document.getElementById('stats-strip');
+  const targets = state?.targets || [];
+  const structs = state?.structs || [];
+  const conns = state?.connections || [];
+  const active = targets.find(t => t.active)?.id || 'None';
+  el.innerHTML = `
+    <div class="stat-card"><span class="k">Targets</span><span class="v">${esc(targets.length)}</span></div>
+    <div class="stat-card"><span class="k">Structs</span><span class="v">${esc(structs.length)}</span></div>
+    <div class="stat-card"><span class="k">Connections</span><span class="v">${esc(conns.length)}</span></div>
+    <div class="stat-card"><span class="k">Active Target</span><span class="v" style="font-size:16px">${esc(active)}</span></div>
+    <div class="stat-card"><span class="k">Uptime</span><span class="v" style="font-size:16px">${esc(fmtTime(state?.uptime))}</span></div>
+  `;
+  document.getElementById('uptime-label').textContent = 'Up ' + fmtTime(state?.uptime);
+}
+
+function renderTargets() {
+  const stack = document.getElementById('target-stack');
+  const buckets = getTargetBuckets();
+
+  if (!buckets.length) {
+    stack.innerHTML = '<div class="t-card"><div style="padding:32px;text-align:center;color:var(--dim)">No targets configured. Click <strong>+ Add Target</strong> to get started.</div></div>';
+    return;
+  }
+
+  stack.innerHTML = buckets.map(b => {
+    const t = b.target;
+    const conns = t ? (state?.connections||[]).filter(c => c.targetId === t.id) : [];
+    const badges = t
+      ? `<span class="badge ${t.active?'ok':'warn'}">${t.active?'Active':'Standby'}</span>`
+        + `<span class="badge ${t.source==='config'?'warn':'info'}">${esc(t.source||'database')}</span>`
+        + (conns.length ? `<span class="badge ok">${conns.length} conn</span>` : '<span class="badge warn">No connections</span>')
+      : '<span class="badge warn">Unassigned</span>';
+
+    const meta = t ? `<div class="t-meta">
+      <div class="meta-cell"><span class="k">Primary</span><span class="v">${esc(t.primary.ip)}:${esc(t.primary.port??102)}</span></div>
+      <div class="meta-cell"><span class="k">Rack / Slot</span><span class="v">${esc(t.primary.rack)} / ${esc(t.primary.slot)}</span></div>
+      <div class="meta-cell"><span class="k">Connections</span><span class="v">${esc(conns.length)} / ${esc(t.maxConnections??4)}</span></div>
+      <div class="meta-cell"><span class="k">Backups</span><span class="v">${t.backups?.length ? esc(t.backups.map(b=>b.ip).join(', ')) : 'None'}</span></div>
+    </div>` : '';
+
+    const btns = t ? `
+      <button class="btn sm primary" onclick='openStructForTarget(${JSON.stringify(t.id)})'>+ Struct</button>
+      <button class="btn sm" onclick='editTarget(${JSON.stringify(t.id)})'>Edit</button>
+      <button class="btn sm danger" onclick='deleteTarget(${JSON.stringify(t.id)})'>Delete</button>
+    ` : '';
+
+    const structRows = b.structs.length ? b.structs
+      .sort((a,b) => a.name.localeCompare(b.name))
+      .map(s => renderStructRow(s)).join('')
+      : '<tr><td colspan="8" class="empty-row">No structs defined</td></tr>';
+
+    return `<section class="t-card${t?'':' detached'}">
+      <div class="t-head">
+        <div class="t-head-info">
+          <h3>${esc(b.title)}</h3>
+          <p>${esc(b.message)}</p>
+          <div class="t-badges">${badges}</div>
+        </div>
+        <div class="t-head-actions">${btns}</div>
+      </div>
+      ${meta}
+      <div class="t-section">
+        <div class="t-section-head"><h4>Structs</h4><span class="subtle">${b.structs.length} defined</span></div>
+        <div class="scroll-x"><table>
+          <thead><tr><th style="width:30px"></th><th>Name</th><th>Address</th><th>Size</th><th>Fields</th><th>DAQ</th><th>Status</th><th></th></tr></thead>
+          <tbody>${structRows}</tbody>
+        </table></div>
+      </div>
+    </section>`;
+  }).join('');
+}
+
+function renderStructRow(s) {
+  const expanded = expandedStructs.has(s.name);
+  const st = getStructStatus(s);
+  const daq = getStructDaq(s);
+  const hasCached = s.cached && Object.keys(s.cached).length > 0;
+
+  let mainRow = `<tr>
+    <td><span class="expand-btn" onclick="toggleExpand('${esc(s.name)}')">${expanded ? '▼' : '▶'}</span></td>
+    <td><strong>${esc(s.name)}</strong></td>
+    <td class="mono">DB${esc(s.db)}+${esc(s.offset)}</td>
+    <td>${esc(s.size ?? '–')}B</td>
+    <td class="subtle">${esc((s.fields||[]).length)}</td>
+    <td><span class="subtle">${esc(daq)}</span></td>
+    <td><span class="badge ${st.cls}">${esc(st.label)}</span></td>
+    <td>
+      <div class="toolbar gap-6">
+        ${hasCached || s.registered !== false ? `<button class="btn xs" onclick="readStruct('${esc(s.name)}')">Read</button>` : ''}
+        <button class="btn xs" onclick='editStruct(${JSON.stringify(s.name)})'>Edit</button>
+        <button class="btn xs danger" onclick='deleteStruct(${JSON.stringify(s.name)})'>Del</button>
+      </div>
+    </td>
+  </tr>`;
+
+  if (expanded) {
+    mainRow += `<tr class="live-row"><td colspan="8"><div>${renderLiveGrid(s)}</div></td></tr>`;
+  }
+  return mainRow;
+}
+
+function renderLiveGrid(s) {
+  const cached = s.cached;
+  const fields = s.fields || [];
+  const items = s.items || [];
+
+  if (!cached || !Object.keys(cached).length) {
+    if (!fields.length) return '<div class="live-empty">No fields defined</div>';
+    return '<div class="live-empty">No cached data — trigger a <strong>Read</strong> or enable DAQ</div>';
+  }
+
+  const cells = fields.map(name => {
+    const item = items.find(i => i.name === name);
+    const type = item?.type || '?';
+    const offset = item?.offset || '—';
+    const val = cached[name];
+    const key = s.name + ':' + name;
+    const editing = editingFields.has(key);
+
+    const displayVal = val === undefined ? '–' : isBool(type) ? String(!!val) : typeof val === 'object' ? JSON.stringify(val) : String(val);
+
+    if (editing) {
+      return `<div class="live-cell">
+        <span class="finfo"><span class="fname">${esc(name)}</span><span class="fmeta">${esc(type)} • ${esc(offset)}</span></span>
+        <span class="fval">${isBool(type)
+          ? `<label style="cursor:pointer"><input type="checkbox" id="ei-${esc(key)}"${val?' checked':''} style="margin-right:4px">${val?'true':'false'}</label>`
+          : `<input class="edit-input" id="ei-${esc(key)}" type="text" value="${esc(displayVal)}">`
+        }</span>
+        <span class="fedit">
+          <button class="btn xs primary" onclick="saveField('${esc(s.name)}','${esc(name)}','${esc(type)}')">✓</button>
+          <button class="btn xs" onclick="cancelEdit('${esc(key)}')">✗</button>
+        </span>
+      </div>`;
+    }
+
+    return `<div class="live-cell">
+      <span class="finfo"><span class="fname">${esc(name)}</span><span class="fmeta">${esc(type)} • ${esc(offset)}</span></span>
+      <span class="fval" id="lv-${esc(key)}">${esc(displayVal)}</span>
+      <span class="fedit"><button class="btn xs ghost" onclick="startEdit('${esc(key)}')">✎</button></span>
+    </div>`;
+  });
+
+  return `<div class="live-grid">${cells.join('')}</div>`;
+}
+
+function updateLiveData(structName, values) {
+  if (!values) return;
+  const s = state?.structs?.find(st => st.name === structName);
+  for (const [name, val] of Object.entries(values)) {
+    const key = structName + ':' + name;
+    if (editingFields.has(key)) continue;
+    const el = document.getElementById('lv-' + key);
+    if (el) {
+      const item = s?.items?.find(i => i.name === name);
+      const type = item?.type || '?';
+      const display = val === undefined ? '–' : isBool(type) ? String(!!val) : typeof val === 'object' ? JSON.stringify(val) : String(val);
+      if (el.textContent !== display) {
+        el.textContent = display;
+        el.classList.remove('flash');
+        void el.offsetWidth;
+        el.classList.add('flash');
+      }
+    }
+  }
+}
+
+/* ─── Bucket / Status Helpers ──────────────────────────────────── */
+function getTargetBuckets() {
+  const targets = (state?.targets||[]).map(t => ({
+    key: 'target:'+t.id, title: t.id, message: t.active ? 'Active runtime target' : 'Configured target', target: t, structs: []
+  }));
+  const map = new Map(targets.map(b => [b.key, b]));
+  for (const s of state?.structs || []) {
+    if (s.targetId && map.has('target:'+s.targetId)) { map.get('target:'+s.targetId).structs.push(s); continue; }
+    const fk = s.targetId ? 'missing:'+s.targetId : 'unassigned';
+    if (!map.has(fk)) map.set(fk, {
+      key: fk, title: s.targetId ? 'Detached: '+s.targetId : 'Unassigned Structs',
+      message: s.targetId ? 'Structs reference a target not currently configured.' : 'Legacy structs without a bound PLC target.',
+      target: null, structs: []
+    });
+    map.get(fk).structs.push(s);
+  }
+  return [...targets, ...[...map.values()].filter(b => !b.target)];
+}
+
+function getStructStatus(s) {
+  if (s.registered === false) return { label: 'Stored', cls: 'warn' };
+  if (s.targetId && s.activeTarget === false) return { label: 'Target inactive', cls: 'warn' };
+  return { label: 'Ready', cls: 'ok' };
+}
+
+function getStructDaq(s) {
+  if (s.subscription) {
+    return s.subscription.keys?.length ? `Items(${s.subscription.keys.length}) @${s.subscription.intervalMs}ms` : `Struct @${s.subscription.intervalMs}ms`;
+  }
+  if (s.subscribeMode === 'items') return 'Items (configured)';
+  if (s.subscribeMode === 'struct') return 'Struct (configured)';
+  return 'Off';
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   Live Data Editing
+   ═════════════════════════════════════════════════════════════════════ */
+function toggleExpand(name) {
+  expandedStructs.has(name) ? expandedStructs.delete(name) : expandedStructs.add(name);
+  renderTargets();
+}
+
+function startEdit(key) {
+  editingFields.set(key, true);
+  renderTargets();
+  const el = document.getElementById('ei-' + key);
+  if (el && el.tagName === 'INPUT' && el.type !== 'checkbox') { el.focus(); el.select(); }
+}
+
+function cancelEdit(key) {
+  editingFields.delete(key);
+  renderTargets();
+}
+
+function saveField(structName, fieldName, type) {
+  const key = structName + ':' + fieldName;
+  const el = document.getElementById('ei-' + key);
+  if (!el) return;
+
+  let value;
+  if (isBool(type)) {
+    value = el.checked;
+  } else if (isFloat(type)) {
+    value = parseFloat(el.value);
+    if (isNaN(value)) { toast('Invalid decimal value', 'err'); return; }
+  } else if (isNumeric(type)) {
+    value = parseInt(el.value, 10);
+    if (isNaN(value)) { toast('Invalid integer value', 'err'); return; }
+  } else {
+    value = el.value;
+  }
+
+  editingFields.delete(key);
+
+  if (ws?.readyState === WebSocket.OPEN) {
+    sendWs({ type: 'write-struct', name: structName, values: { [fieldName]: value } });
+  } else {
+    post(`/admin/api/structs/${encodeURIComponent(structName)}/write`, { values: { [fieldName]: value } })
+      .then(() => toast('Value written', 'ok'))
+      .catch(err => toast(err.message, 'err'));
+  }
+  renderTargets();
+}
+
+function readStruct(name) {
+  if (ws?.readyState === WebSocket.OPEN) {
+    sendWs({ type: 'read-struct', name });
+  } else {
+    post(`/admin/api/structs/${encodeURIComponent(name)}/read`, {})
+      .then(data => {
+        if (state) {
+          const s = state.structs?.find(st => st.name === name);
+          if (s) { s.cached = data.values; render(); }
+        }
+        toast('Read complete', 'ok');
+      })
+      .catch(err => toast(err.message, 'err'));
+  }
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   Struct Modal
+   ═════════════════════════════════════════════════════════════════════ */
+function openStructForTarget(targetId) { openStructModal({ targetId }); }
+
+function openStructModal(data) {
+  const isEdit = Boolean(data?.name);
+  const hasBound = Boolean(data?.targetId);
+  editingStruct = isEdit ? data.name : null;
+  document.getElementById('struct-modal-title').textContent = isEdit ? 'Edit Struct' : 'Add Struct';
+  document.getElementById('sf-name').value = data?.name || '';
+  document.getElementById('sf-name').disabled = isEdit;
+  document.getElementById('sf-target').value = data?.targetId || '';
+  document.getElementById('sf-target').readOnly = hasBound;
+  document.getElementById('sf-db').value = data?.db ?? '';
+  document.getElementById('sf-offset').value = data?.offset ?? 0;
+  document.getElementById('sf-desc').value = data?.description || '';
+  document.getElementById('sf-daq-mode').value = data?.subscribeMode || 'none';
+  document.getElementById('sf-interval').value = data?.subscribeIntervalMs || '';
+  const sel = new Set(data?.subscribeItems || []);
+  structItems = (data?.items?.length ? data.items : [{ name:'', type:'BOOL', size:1, strlen:32, daqSelected:false }])
+    .map(i => ({ name:i.name||'', type:String(i.type||'BOOL').toUpperCase(), size:i.size??1, strlen:i.strlen??32, daqSelected:sel.has(i.name) }));
+  renderEditorRows();
+  document.getElementById('struct-overlay').classList.add('show');
+}
+
+function closeStructModal() { document.getElementById('struct-overlay').classList.remove('show'); editingStruct = null; structItems = []; }
+
+function renderEditorRows() {
+  const body = document.getElementById('sf-items-body');
+  const daqMode = document.getElementById('sf-daq-mode').value;
+  const layout = curLayout();
+  if (!structItems.length) { body.innerHTML = '<tr><td colspan="8" class="empty-row">No fields yet</td></tr>'; updateSizePreview(); return; }
+  body.innerHTML = structItems.map((raw, i) => {
+    const it = normItem(raw);
+    const off = layout.rows[i]?.offset ?? '-';
+    return `<tr class="editor-row" data-drop="${i}">
+      <td><button class="btn ghost xs drag-handle" draggable="true" data-drag="${i}">::</button></td>
+      <td class="cell-wide"><input data-i="${i}" data-f="name" value="${esc(it.name)}" placeholder="field_${i+1}"></td>
+      <td><select data-i="${i}" data-f="type">${TYPE_OPTIONS.map(t=>`<option value="${t}"${it.type===t?' selected':''}>${t}</option>`).join('')}</select></td>
+      <td class="cell-tight"><input type="number" min="1" data-i="${i}" data-f="size" value="${esc(it.size)}"></td>
+      <td class="cell-tight"><input type="number" min="1" data-i="${i}" data-f="strlen" value="${esc(it.strlen)}"${isStr(it.type)?'':' disabled'}></td>
+      <td class="cell-tight">${daqMode==='items'?`<input type="checkbox" data-i="${i}" data-f="daqSelected"${it.daqSelected?' checked':''}>` :'<span class="subtle">–</span>'}</td>
+      <td class="mono cell-tight">${esc(off)}</td>
+      <td><button class="btn xs danger" data-rm="${i}">✕</button></td>
+    </tr>`;
+  }).join('');
+  updateSizePreview();
+}
+
+function updateSizePreview() {
+  const layout = curLayout();
+  document.getElementById('sf-total-size').textContent = layout.totalSize + ' bytes';
+}
+
+function updateItem(i, f, v) {
+  const it = normItem(structItems[i]);
+  if (f==='name') it.name = String(v||'');
+  if (f==='type') it.type = String(v||'BOOL').toUpperCase();
+  if (f==='size') it.size = Math.max(1, parseInt(v,10)||1);
+  if (f==='strlen') it.strlen = Math.max(1, parseInt(v,10)||32);
+  if (f==='daqSelected') it.daqSelected = !!v;
+  structItems[i] = it;
+  renderEditorRows();
+}
+
+function moveItem(from, to) {
+  if (from===to||from==null||to==null) return;
+  const next = [...structItems];
+  const [moved] = next.splice(from, 1);
+  next.splice(to, 0, moved);
+  structItems = next;
+  renderEditorRows();
+}
+
+// Editor event delegation
+const editorBody = document.getElementById('sf-items-body');
+editorBody.addEventListener('input', e => {
+  const t = e.target;
+  if (!(t instanceof HTMLInputElement || t instanceof HTMLSelectElement)) return;
+  const i = parseInt(t.dataset.i??'-1',10), f = t.dataset.f;
+  if (i<0||!f) return;
+  if (t instanceof HTMLInputElement && t.type==='checkbox') updateItem(i, f, t.checked);
+  else updateItem(i, f, t.value);
+});
+editorBody.addEventListener('click', e => {
+  const btn = e.target.closest('button[data-rm]');
+  if (btn) { const i = parseInt(btn.dataset.rm,10); if (i>=0) { structItems.splice(i,1); renderEditorRows(); } }
+});
+editorBody.addEventListener('dragstart', e => {
+  const h = e.target.closest('button[data-drag]');
+  if (!h) return;
+  dragIdx = parseInt(h.dataset.drag,10);
+  e.dataTransfer.effectAllowed = 'move';
+  e.dataTransfer.setData('text/plain', String(dragIdx));
+});
+editorBody.addEventListener('dragover', e => {
+  const row = e.target.closest('tr[data-drop]');
+  if (row) { e.preventDefault(); row.classList.add('drag-over'); }
+});
+editorBody.addEventListener('dragleave', e => {
+  const row = e.target.closest('tr[data-drop]');
+  if (row) row.classList.remove('drag-over');
+});
+editorBody.addEventListener('drop', e => {
+  const row = e.target.closest('tr[data-drop]');
+  if (!row) return;
+  e.preventDefault(); row.classList.remove('drag-over');
+  const to = parseInt(row.dataset.drop,10);
+  if (dragIdx>=0 && to>=0) moveItem(dragIdx, to);
+  dragIdx = null;
+});
+editorBody.addEventListener('dragend', () => { dragIdx=null; document.querySelectorAll('.drag-over').forEach(r=>r.classList.remove('drag-over')); });
+
+document.getElementById('sf-add-row').addEventListener('click', () => { structItems.push({name:'',type:'BOOL',size:1,strlen:32,daqSelected:false}); renderEditorRows(); });
+document.getElementById('sf-daq-mode').addEventListener('change', renderEditorRows);
+document.getElementById('sf-offset').addEventListener('input', updateSizePreview);
+
+async function editStruct(name) {
+  try {
+    const list = await get('/admin/api/structs');
+    const s = list.find(e => e.name === name);
+    if (s) openStructModal(s);
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+async function saveStruct() {
+  try {
+    const name = document.getElementById('sf-name').value.trim();
+    const targetId = document.getElementById('sf-target').value.trim() || undefined;
+    const db = parseInt(document.getElementById('sf-db').value, 10);
+    const offset = parseInt(document.getElementById('sf-offset').value, 10) || 0;
+    const description = document.getElementById('sf-desc').value.trim() || undefined;
+    const subscribeMode = document.getElementById('sf-daq-mode').value;
+    const subscribeIntervalMs = parseInt(document.getElementById('sf-interval').value, 10) || undefined;
+
+    if (!name || Number.isNaN(db)) throw new Error('Name and DB number are required');
+    if (!structItems.length) throw new Error('At least one field is required');
+    if (subscribeMode !== 'none' && !targetId) throw new Error('PLC target required for DAQ');
+    if (subscribeMode !== 'none' && !subscribeIntervalMs) throw new Error('DAQ interval required');
+
+    const items = structItems.map((raw, i) => {
+      const it = normItem(raw);
+      if (!it.name.trim()) throw new Error(`Row ${i+1} needs a field name`);
+      const o = { name: it.name.trim(), type: it.type };
+      if (it.size > 1) o.size = it.size;
+      if (isStr(it.type)) o.strlen = it.strlen;
+      return o;
+    });
+
+    const subscribeItems = subscribeMode === 'items' ? structItems.filter(i => i.daqSelected).map(i => i.name.trim()).filter(Boolean) : undefined;
+    if (subscribeMode === 'items' && (!subscribeItems || !subscribeItems.length)) throw new Error('Select at least one field for item-level DAQ');
+
+    const body = { name, targetId, db, offset, items, description, subscribeMode, subscribeItems, subscribeIntervalMs };
+    if (editingStruct) await put('/admin/api/structs/' + encodeURIComponent(name), body);
+    else await post('/admin/api/structs', body);
+    closeStructModal();
+    toast(editingStruct ? 'Struct updated' : 'Struct created', 'ok');
+    sendWs({ type: 'get-state' });
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+async function deleteStruct(name) {
+  if (!await confirmDialog('Delete struct "' + name + '"?')) return;
+  try {
+    await del('/admin/api/structs/' + encodeURIComponent(name));
+    toast('Struct deleted', 'ok');
+    sendWs({ type: 'get-state' });
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   Target Modal
+   ═════════════════════════════════════════════════════════════════════ */
+function openTargetModal(data) {
+  editingTarget = data?.id || null;
+  document.getElementById('target-modal-title').textContent = data ? 'Edit Target' : 'Add Target';
+  document.getElementById('tf-id').value = data?.id || '';
+  document.getElementById('tf-id').disabled = !!data;
+  document.getElementById('tf-ip').value = data?.primary?.ip || '';
+  document.getElementById('tf-rack').value = data?.primary?.rack ?? 0;
+  document.getElementById('tf-slot').value = data?.primary?.slot ?? 1;
+  document.getElementById('tf-port').value = data?.primary?.port ?? '';
+  document.getElementById('tf-max').value = data?.maxConnections ?? 4;
+  document.getElementById('tf-timeout').value = data?.requestTimeoutMs ?? '';
+  document.getElementById('tf-keepalive').value = data?.keepAliveIntervalMs ?? '';
+  document.getElementById('tf-backoff').value = Array.isArray(data?.reconnectBackoffMs) ? data.reconnectBackoffMs.join(',') : '';
+  document.getElementById('tf-backups').value = data?.backups?.length ? JSON.stringify(data.backups, null, 2) : '';
+  document.getElementById('target-overlay').classList.add('show');
+}
+
+function closeTargetModal() { document.getElementById('target-overlay').classList.remove('show'); editingTarget = null; }
+
+function editTarget(id) {
+  const t = (state?.targets||[]).find(e => e.id === id);
+  if (t) openTargetModal(t);
+}
+
+async function saveTarget() {
+  try {
+    const id = document.getElementById('tf-id').value.trim();
+    const ip = document.getElementById('tf-ip').value.trim();
+    const rack = parseInt(document.getElementById('tf-rack').value, 10) || 0;
+    const slot = parseInt(document.getElementById('tf-slot').value, 10) || 1;
+    const port = parseInt(document.getElementById('tf-port').value, 10) || undefined;
+    const maxConnections = parseInt(document.getElementById('tf-max').value, 10) || 4;
+    const requestTimeoutMs = parseInt(document.getElementById('tf-timeout').value, 10) || undefined;
+    const keepAliveIntervalMs = parseInt(document.getElementById('tf-keepalive').value, 10) || undefined;
+    const reconnectBackoffMs = document.getElementById('tf-backoff').value.trim()
+      ? document.getElementById('tf-backoff').value.split(',').map(v => parseInt(v.trim(),10)).filter(v => !isNaN(v))
+      : undefined;
+    const backupsRaw = document.getElementById('tf-backups').value.trim();
+    const backups = backupsRaw ? JSON.parse(backupsRaw) : undefined;
+    if (!id || !ip) throw new Error('Target ID and primary IP are required');
+
+    const body = { id, primary: { ip, rack, slot, ...(port?{port}:{}) }, backups, maxConnections, requestTimeoutMs, keepAliveIntervalMs, reconnectBackoffMs };
+    if (editingTarget) await put('/admin/api/targets/' + encodeURIComponent(id), body);
+    else await post('/admin/api/targets', body);
+    closeTargetModal();
+    toast(editingTarget ? 'Target updated' : 'Target created', 'ok');
+    sendWs({ type: 'get-state' });
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+async function deleteTarget(id) {
+  if (!await confirmDialog('Delete target "' + id + '"? Config targets will be disabled.')) return;
+  try {
+    await del('/admin/api/targets/' + encodeURIComponent(id));
+    toast('Target deleted', 'ok');
+    sendWs({ type: 'get-state' });
+  } catch (err) { toast(err.message, 'err'); }
+}
+
+/* ═════════════════════════════════════════════════════════════════════
+   Modal overlay close handlers
+   ═════════════════════════════════════════════════════════════════════ */
+document.querySelectorAll('.overlay').forEach(ov => ov.addEventListener('click', e => {
+  if (e.target !== ov) return;
+  if (ov.id === 'struct-overlay') closeStructModal();
+  else if (ov.id === 'target-overlay') closeTargetModal();
+  else if (ov.id === 'confirm-overlay') confirmAnswer(false);
+}));
+
+// Keyboard: Escape closes modals, Enter submits edit fields
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    if (document.getElementById('confirm-overlay').classList.contains('show')) { confirmAnswer(false); return; }
+    if (document.getElementById('struct-overlay').classList.contains('show')) { closeStructModal(); return; }
+    if (document.getElementById('target-overlay').classList.contains('show')) { closeTargetModal(); return; }
+    // Cancel any active field edit
+    if (editingFields.size) { editingFields.clear(); renderTargets(); }
+  }
+  if (e.key === 'Enter' && e.target.classList?.contains('edit-input')) {
+    e.preventDefault();
+    const id = e.target.id;
+    if (id?.startsWith('ei-')) {
+      const key = id.slice(3);
+      const [structName, ...rest] = key.split(':');
+      const fieldName = rest.join(':');
+      const s = state?.structs?.find(st => st.name === structName);
+      const item = s?.items?.find(i => i.name === fieldName);
+      if (item) saveField(structName, fieldName, item.type);
+    }
+  }
+});
+
+/* ═════════════════════════════════════════════════════════════════════
+   Initialization
+   ═════════════════════════════════════════════════════════════════════ */
+async function showApp() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  connectWs();
+  // Fallback: fetch state via REST if WS hasn't delivered yet
+  try {
+    state = await get('/admin/api/state');
+    render();
+  } catch {}
+}
+
+document.getElementById('login-form').addEventListener('submit', doLogin);
+
+(async () => {
+  const ok = await checkAuth();
+  if (ok) showApp();
+  else {
+    document.getElementById('login-screen').style.display = 'flex';
+  }
+})();
+</script>
+</body>
+</html>

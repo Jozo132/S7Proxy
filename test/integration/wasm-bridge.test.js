@@ -5,7 +5,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { setup, teardown } from '../helpers.js';
 import {
   COTP_CR, COTP_CC, COTP_DT,
-  S7AreaDB, S7WLByte, S7WLWord,
+  S7AreaDB, S7WLBit, S7WLByte, S7WLWord,
 } from '../../src/protocol/constants.js';
 
 /** @type {import('../helpers.js').TestContext} */
@@ -58,6 +58,23 @@ describe('WasmBridge', () => {
     const frame = ctx.bridge.buildWriteRequest(S7AreaDB, 2, 0, 4, S7WLByte, data);
     expect(frame).toBeInstanceOf(Buffer);
     expect(frame.length).toBeGreaterThan(0);
+    expect(frame[32]).toBe(0x04);
+    expect(frame.readUInt16BE(33)).toBe(32);
+  });
+
+  it('should build an atomic bit write request for DB2.DBX4.3', () => {
+    const frame = ctx.bridge.buildBitWriteRequest(S7AreaDB, 2, 4, 3, true);
+    expect(frame).toBeInstanceOf(Buffer);
+    expect(frame.length).toBeGreaterThan(0);
+    expect(frame[22]).toBe(S7WLBit);
+    expect(frame[23]).toBe(0x00);
+    expect(frame[24]).toBe(0x01);
+    expect(frame[28]).toBe(0x00);
+    expect(frame[29]).toBe(0x00);
+    expect(frame[30]).toBe(0x23);
+    expect(frame[32]).toBe(0x03);
+    expect(frame.readUInt16BE(33)).toBe(1);
+    expect(frame[35]).toBe(0x01);
   });
 
   it('should build COTP Disconnect Request', () => {

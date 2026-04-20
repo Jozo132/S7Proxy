@@ -5,7 +5,9 @@
 import {
   S7_PROTOCOL_ID, S7_MSG_JOB, S7_MSG_ACK, S7_MSG_ACK_DATA, S7_MSG_USERDATA,
   S7_FN_SETUP_COMM, S7_FN_READ_VAR, S7_FN_WRITE_VAR,
-  S7_TRANSPORT_SIZE_BYTE,
+  S7_TRANSPORT_SIZE_BIT, S7_TRANSPORT_SIZE_BYTE, S7_TRANSPORT_SIZE_INT,
+  S7_TRANSPORT_SIZE_REAL, S7_TRANSPORT_SIZE_OCTET,
+  S7WLBit, S7WLChar, S7WLInt, S7WLDInt, S7WLReal, S7WLCounter, S7WLTimer,
   S7AreaDB,
 } from './constants';
 import {
@@ -25,6 +27,30 @@ let _functionCode: u8 = 0;
 let _headerSize: u32 = 0;
 let _paramOffset: u32 = 0;
 let _dataOffset: u32 = 0;
+
+function getWriteDataTransportSize(wordLen: u8): u8 {
+  switch (wordLen) {
+    case S7WLBit:
+      return S7_TRANSPORT_SIZE_BIT;
+    case S7WLInt:
+    case S7WLDInt:
+      return S7_TRANSPORT_SIZE_INT;
+    case S7WLReal:
+      return S7_TRANSPORT_SIZE_REAL;
+    case S7WLChar:
+    case S7WLCounter:
+    case S7WLTimer:
+      return S7_TRANSPORT_SIZE_OCTET;
+    default:
+      return S7_TRANSPORT_SIZE_BYTE;
+  }
+}
+
+function writeDataLengthUsesBytes(transportSize: u8): bool {
+  return transportSize === S7_TRANSPORT_SIZE_OCTET
+    || transportSize === S7_TRANSPORT_SIZE_REAL
+    || transportSize === S7_TRANSPORT_SIZE_BIT;
+}
 
 /** Parse S7Comm header from buffer at `ptr` with `len` bytes.
  *  Returns 0 on success, negative on error. */
@@ -176,6 +202,7 @@ export function s7_buildWriteRequest(
   dataPtr: usize, dataLen: u32, outPtr: usize
 ): u32 {
   const pduRef = nextPduRef();
+  const dataTransportSize = getWriteDataTransportSize(wordLen);
 
   // Data portion: return code (1) + transport size (1) + length (2) + data
   const dataPayloadLen: u16 = <u16>dataLen;
@@ -216,16 +243,28 @@ export function s7_buildWriteRequest(
 
   // Data portion
   store<u8>(outPtr + 24, 0x00);   // Return code (reserved for request)
-  store<u8>(outPtr + 25, S7_TRANSPORT_SIZE_BYTE);  // Transport size
-  // Length in bits for byte transport
-  const lenBits: u16 = dataPayloadLen * 8;
-  store<u8>(outPtr + 26, <u8>(lenBits >> 8));
-  store<u8>(outPtr + 27, <u8>(lenBits & 0xFF));
+  store<u8>(outPtr + 25, dataTransportSize);
+  const encodedLength: u16 = writeDataLengthUsesBytes(dataTransportSize)
+    ? dataPayloadLen
+    : <u16>(dataPayloadLen * 8);
+  store<u8>(outPtr + 26, <u8>(encodedLength >> 8));
+  store<u8>(outPtr + 27, <u8>(encodedLength & 0xFF));
 
   // Copy data
   memory.copy(outPtr + 28, dataPtr, dataLen);
 
   return 28 + dataLen;
+}
+
+/** Build S7 Write Var request PDU for a single atomic bit write.
+ *  `byteOffset` is the DB byte index and `bitOffset` is the bit inside that byte.
+ *  Returns bytes written. */
+export function s7_buildBitWriteRequest(
+  area: u8, dbNum: u16, byteOffset: u32, bitOffset: u8, value: u8, outPtr: usize
+): u32 {
+  const bitAddress: u32 = (byteOffset * 8) + <u32>(bitOffset & 0x07);
+  store<u8>(outPtr + 28, value !== 0 ? 1 : 0);
+  return s7_buildWriteRequest(area, dbNum, bitAddress, 1, S7WLBit, outPtr + 28, 1, outPtr);
 }
 
 /** Build S7 Multi-Read (ReadMultiVars) request PDU.

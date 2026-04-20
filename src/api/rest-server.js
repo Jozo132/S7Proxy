@@ -12,6 +12,7 @@ import { registerRoutes } from './rest-routes.js';
 /** @import { DaqEngine } from '../daq/daq-engine.js' */
 /** @import { Metrics } from '../metrics/metrics.js' */
 /** @import { StructManager } from '../protocol/struct-manager.js' */
+/** @import { Socket } from 'node:net' */
 /** @import pino from 'pino' */
 
 export class RestServer {
@@ -21,10 +22,16 @@ export class RestServer {
   #config;
   /** @type {pino.Logger} */
   #logger;
+  /** @type {ConnectionPool | null} */
+  #pool;
+  /** @type {DaqEngine | null} */
+  #daq;
+  /** @type {Set<Socket>} */
+  #sockets = new Set();
 
   /**
-   * @param {ConnectionPool} pool
-   * @param {DaqEngine} daq
+   * @param {ConnectionPool | null} pool
+   * @param {DaqEngine | null} daq
    * @param {Metrics} metrics
    * @param {WebApiConfig} config
    * @param {pino.Logger} logger
@@ -33,21 +40,27 @@ export class RestServer {
   constructor(pool, daq, metrics, config, logger, structs) {
     this.#config = config;
     this.#logger = logger.child({ component: 'rest' });
+    this.#pool = pool;
+    this.#daq = daq;
 
     this.#app = Fastify({ logger: false });
-    this.#setupPromise = this.#setup(pool, daq, metrics, structs);
+    this.#app.server.on('connection', (socket) => {
+      this.#sockets.add(socket);
+      socket.on('close', () => {
+        this.#sockets.delete(socket);
+      });
+    });
+    this.#setupPromise = this.#setup(metrics, structs);
   }
 
   /** @type {Promise<void>} */
   #setupPromise;
 
   /**
-   * @param {ConnectionPool} pool
-   * @param {DaqEngine} daq
    * @param {Metrics} metrics
    * @param {StructManager} [structs]
    */
-  async #setup(pool, daq, metrics, structs) {
+  async #setup(metrics, structs) {
     await this.#app.register(cors, {
       origin: this.#config.cors?.origin ?? '*',
     });
@@ -57,7 +70,17 @@ export class RestServer {
       timeWindow: this.#config.rateLimit?.windowMs ?? 60000,
     });
 
-    registerRoutes(this.#app, pool, daq, metrics, structs);
+    registerRoutes(this.#app, () => this.#pool, () => this.#daq, metrics, structs);
+  }
+
+  /**
+   * Update the runtime objects used by the REST routes.
+   * @param {ConnectionPool | null} pool
+   * @param {DaqEngine | null} daq
+   */
+  bindRuntime(pool, daq) {
+    this.#pool = pool;
+    this.#daq = daq;
   }
 
   async start() {
@@ -70,7 +93,12 @@ export class RestServer {
   }
 
   async stop() {
-    await this.#app.close();
+    const closePromise = this.#app.close();
+    for (const socket of this.#sockets) {
+      socket.destroy();
+    }
+    await closePromise;
+    this.#sockets.clear();
     this.#logger.info('REST API stopped');
   }
 

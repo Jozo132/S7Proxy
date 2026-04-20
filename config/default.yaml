@@ -4,20 +4,20 @@ listen:
   ip: "0.0.0.0"
   port: 102
 
-targets:
-  - id: plc1
-    primary:
-      ip: "192.168.1.10"
-      rack: 0
-      slot: 1
-    # backups:
-    #   - ip: "192.168.1.11"
-    #     rack: 0
-    #     slot: 1
-    maxConnections: 2
-    requestTimeoutMs: 3000
-    keepAliveIntervalMs: 30000
-    reconnectBackoffMs: [1000, 2000, 4000, 8000, 15000]
+targets: []
+  #- id: plc1
+  #  primary:
+  #    ip: "192.168.1.10"
+  #    rack: 0
+  #    slot: 1
+  #  # backups:
+  #  #   - ip: "192.168.1.11"
+  #  #     rack: 0
+  #  #     slot: 1
+  #  maxConnections: 2
+  #  requestTimeoutMs: 3000
+  #  keepAliveIntervalMs: 30000
+  #  reconnectBackoffMs: [1000, 2000, 4000, 8000, 15000]
 
 routing: []
   # - srcIp: "192.168.1.100"

@@ -2,6 +2,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { StructManager } from '../../src/protocol/struct-manager.js';
 import { DBStruct } from '../../src/protocol/db-struct.js';
+import { S7AreaDB, S7WLByte, S7_MSG_ACK, S7_MSG_ACK_DATA } from '../../src/protocol/constants.js';
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -19,6 +20,174 @@ function motorDef() {
       { name: 'label', type: 'STRING', strlen: 8 },
     ],
   };
+}
+
+/**
+ * @param {number | Buffer} value
+ * @returns {Buffer}
+ */
+function makeReadAckDataResponse(value) {
+  const payload = Buffer.isBuffer(value)
+    ? Buffer.from(value)
+    : (() => {
+      const buf = Buffer.alloc(2);
+      buf.writeInt16BE(value, 0);
+      return buf;
+    })();
+  const response = Buffer.alloc(25 + payload.length);
+  response[21] = 0xFF;
+  response[22] = 0x04;
+  response.writeUInt16BE(payload.length * 8, 23);
+  payload.copy(response, 25);
+  return response;
+}
+
+/** @returns {Buffer} */
+function makeWriteAckDataResponse() {
+  const response = Buffer.alloc(22);
+  response[21] = 0xFF;
+  return response;
+}
+
+/**
+ * @param {{ messageType: number, paramLength: number, response: Buffer }} writeReply
+ */
+function makeOnlineStructManager(writeReply) {
+  const conn = {
+    sendRequest: vi.fn()
+      .mockResolvedValueOnce(makeReadAckDataResponse(10))
+      .mockResolvedValueOnce(writeReply.response),
+  };
+
+  const bridge = {
+    buildReadRequest: vi.fn(() => {
+      const frame = Buffer.alloc(13);
+      frame.writeUInt16BE(0x1001, 11);
+      return frame;
+    }),
+    buildWriteRequest: vi.fn(() => {
+      const frame = Buffer.alloc(13);
+      frame.writeUInt16BE(0x1002, 11);
+      return frame;
+    }),
+    parseFrame: vi.fn()
+      .mockReturnValueOnce({
+        cotpType: 0xF0,
+        pdu: {
+          raw: Buffer.alloc(0),
+          messageType: S7_MSG_ACK_DATA,
+          functionCode: 0x04,
+          pduRef: 0x1001,
+          paramLength: 2,
+          dataLength: 6,
+          errorClass: 0,
+          errorCode: 0,
+        },
+      })
+      .mockReturnValueOnce({
+        cotpType: 0xF0,
+        pdu: {
+          raw: writeReply.response,
+          messageType: writeReply.messageType,
+          functionCode: 0,
+          pduRef: 0x1002,
+          paramLength: writeReply.paramLength,
+          dataLength: 0,
+          errorClass: 0,
+          errorCode: 0,
+        },
+      }),
+  };
+
+  const sm = new StructManager({
+    pool: /** @type {any} */ ({
+      targetId: 'plc1',
+      acquire: () => conn,
+    }),
+    bridge: /** @type {any} */ (bridge),
+  });
+
+  sm.register({
+    name: 'WriteDB',
+    db: 1,
+    offset: 0,
+    targetId: 'plc1',
+    items: [{ name: 'x', type: 'INT' }],
+  });
+
+  return { sm, conn, bridge };
+}
+
+function makeAtomicBitWriteStructManager() {
+  const writeResponse = makeWriteAckDataResponse();
+  const refreshedStruct = Buffer.from([0x02, 0x00, 0x00, 0x2A]);
+  const conn = {
+    sendRequest: vi.fn()
+      .mockResolvedValueOnce(writeResponse)
+      .mockResolvedValueOnce(makeReadAckDataResponse(refreshedStruct)),
+  };
+
+  const bridge = {
+    buildBitWriteRequest: vi.fn(() => {
+      const frame = Buffer.alloc(13);
+      frame.writeUInt16BE(0x2001, 11);
+      return frame;
+    }),
+    buildReadRequest: vi.fn(() => {
+      const frame = Buffer.alloc(13);
+      frame.writeUInt16BE(0x2002, 11);
+      return frame;
+    }),
+    parseFrame: vi.fn()
+      .mockReturnValueOnce({
+        cotpType: 0xF0,
+        pdu: {
+          raw: writeResponse,
+          messageType: S7_MSG_ACK_DATA,
+          functionCode: 0x05,
+          pduRef: 0x2001,
+          paramLength: 2,
+          dataLength: 1,
+          errorClass: 0,
+          errorCode: 0,
+        },
+      })
+      .mockReturnValueOnce({
+        cotpType: 0xF0,
+        pdu: {
+          raw: Buffer.alloc(0),
+          messageType: S7_MSG_ACK_DATA,
+          functionCode: 0x04,
+          pduRef: 0x2002,
+          paramLength: 2,
+          dataLength: 8,
+          errorClass: 0,
+          errorCode: 0,
+        },
+      }),
+  };
+
+  const sm = new StructManager({
+    pool: /** @type {any} */ ({
+      targetId: 'plc1',
+      acquire: () => conn,
+    }),
+    bridge: /** @type {any} */ (bridge),
+  });
+
+  sm.register({
+    name: 'BitDB',
+    db: 1,
+    offset: 4,
+    targetId: 'plc1',
+    items: [
+      { name: 'a', type: 'BOOL' },
+      { name: 'b', type: 'BOOL' },
+      { name: 'word', type: 'INT' },
+    ],
+  });
+
+  return { sm, conn, bridge };
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────
@@ -107,7 +276,7 @@ describe('StructManager DAQ integration', () => {
   it('decodes struct:data from DAQ subscription events', () => {
     // Create a mock DAQ engine (EventEmitter)
     const { EventEmitter } = require('eventemitter3');
-    const mockDaq = new EventEmitter();
+    const mockDaq = /** @type {any} */ (new EventEmitter());
     mockDaq.subscribe = vi.fn(() => 'sub-1');
     mockDaq.unsubscribe = vi.fn();
 
@@ -117,10 +286,15 @@ describe('StructManager DAQ integration', () => {
     ]});
 
     const subId = sm.subscribe('TestDB', 'plc1', 500);
+    const subscription = sm.getStructSubscriptions()[0];
     expect(subId).toBe('sub-1');
     expect(mockDaq.subscribe).toHaveBeenCalledWith({
       targetId: 'plc1',
-      tags: [expect.objectContaining({ name: 'struct:TestDB', area: 0x84 })],
+      tags: [expect.objectContaining({
+        name: expect.stringMatching(/^struct:TestDB:/),
+        area: 0x84,
+        target: 'plc1',
+      })],
       intervalMs: 500,
     });
 
@@ -135,7 +309,7 @@ describe('StructManager DAQ integration', () => {
     mockDaq.emit('subscription:data', 'sub-1', {
       targetId: 'plc1',
       groupId: 'plc1:500',
-      tags: [{ name: 'struct:TestDB', value: buf.toString('hex'), quality: 192, timestamp: Date.now() }],
+      tags: [{ name: subscription.tagName, value: buf.toString('hex'), quality: 192, timestamp: Date.now() }],
     });
 
     expect(structDataCb).toHaveBeenCalledWith(expect.objectContaining({
@@ -149,7 +323,7 @@ describe('StructManager DAQ integration', () => {
 
   it('unsubscribe cleans up', () => {
     const { EventEmitter } = require('eventemitter3');
-    const mockDaq = new EventEmitter();
+    const mockDaq = /** @type {any} */ (new EventEmitter());
     mockDaq.subscribe = vi.fn(() => 'sub-2');
     mockDaq.unsubscribe = vi.fn();
 
@@ -194,6 +368,50 @@ describe('StructManager error handling', () => {
     const sm = new StructManager();
     await expect(sm.write('Missing', { x: 1 })).rejects.toThrow('not registered');
   });
+
+  it('accepts bare ACK write responses without requiring a function code', async () => {
+    const { sm, conn } = makeOnlineStructManager({
+      messageType: S7_MSG_ACK,
+      paramLength: 2,
+      response: Buffer.alloc(19),
+    });
+
+    await expect(sm.write('WriteDB', { x: 42 })).resolves.toBeUndefined();
+    expect(conn.sendRequest).toHaveBeenCalledTimes(2);
+    expect(sm.getCachedValues('WriteDB')).toEqual({ x: 42 });
+  });
+
+  it('still accepts ACK_DATA write responses with a success return code', async () => {
+    const response = makeWriteAckDataResponse();
+
+    const { sm, conn } = makeOnlineStructManager({
+      messageType: S7_MSG_ACK_DATA,
+      paramLength: 2,
+      response,
+    });
+
+    await expect(sm.write('WriteDB', { x: 42 })).resolves.toBeUndefined();
+    expect(conn.sendRequest).toHaveBeenCalledTimes(2);
+    expect(sm.getCachedValues('WriteDB')).toEqual({ x: 42 });
+  });
+
+  it('writes a single BOOL as an atomic bit write and refreshes the struct cache', async () => {
+    const { sm, conn, bridge } = makeAtomicBitWriteStructManager();
+
+    await expect(sm.write('BitDB', { b: true })).resolves.toBeUndefined();
+
+    expect(bridge.buildBitWriteRequest).toHaveBeenCalledWith(
+      S7AreaDB,
+      1,
+      4,
+      1,
+      true,
+    );
+    expect(bridge.buildReadRequest).toHaveBeenCalledWith(S7AreaDB, 1, 4, 4, S7WLByte);
+    expect(bridge.buildBitWriteRequest.mock.invocationCallOrder[0]).toBeLessThan(bridge.buildReadRequest.mock.invocationCallOrder[0]);
+    expect(conn.sendRequest).toHaveBeenCalledTimes(2);
+    expect(sm.getCachedValues('BitDB')).toEqual({ a: false, b: true, word: 42 });
+  });
 });
 
 // ─── Shutdown ────────────────────────────────────────────────────────────────
@@ -201,7 +419,7 @@ describe('StructManager error handling', () => {
 describe('StructManager shutdown', () => {
   it('clears everything', () => {
     const { EventEmitter } = require('eventemitter3');
-    const mockDaq = new EventEmitter();
+    const mockDaq = /** @type {any} */ (new EventEmitter());
     mockDaq.subscribe = vi.fn(() => 'sub-99');
     mockDaq.unsubscribe = vi.fn();
 

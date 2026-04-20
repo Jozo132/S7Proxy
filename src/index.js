@@ -1,12 +1,39 @@
 #!/usr/bin/env node
 // @ts-check
-// Standalone CLI entry point
+// Standalone CLI entry point with SQLite persistence
 
+import { resolve } from 'node:path';
 import { loadConfig } from './config.js';
 import { ProxyServer } from './proxy-server.js';
+import { AdminStore } from './admin/store.js';
 
 const configPath = process.argv[2] || undefined;
 const config = loadConfig(configPath);
-const server = new ProxyServer(config);
+
+// Enable pretty logs when running in a terminal (not piped/redirected)
+if (process.stdout.isTTY && config.logging.pretty === undefined) {
+  config.logging.pretty = true;
+}
+
+// Initialize SQLite persistence (data/s7proxy.db by default)
+const dbPath = process.env['S7PROXY_DB_PATH'] ?? resolve('data', 's7proxy.db');
+const store = new AdminStore(dbPath);
+
+// Merge config and persisted targets, honoring database overrides and disabled IDs.
+const persistedTargets = store.loadTargets();
+const disabledTargetIds = new Set(store.getDisabledTargets());
+const mergedTargets = new Map(
+  config.targets
+    .filter((target) => !disabledTargetIds.has(target.id))
+    .map((target) => [target.id, target]),
+);
+
+for (const target of persistedTargets) {
+  if (!disabledTargetIds.has(target.id)) mergedTargets.set(target.id, target);
+}
+
+config.targets = [...mergedTargets.values()];
+
+const server = new ProxyServer(config, store);
 
 await server.start();

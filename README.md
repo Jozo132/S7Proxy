@@ -17,7 +17,7 @@ S7Comm proxy and client library with an AssemblyScript WASM protocol engine. Con
 ## Install
 
 ```bash
-npm install s7proxy
+npm install S7Proxy
 ```
 
 Requires Node.js >= 20.
@@ -28,16 +28,16 @@ Requires Node.js >= 20.
 
 ```bash
 # Start with default config
-npx s7proxy
+npx S7Proxy
 
 # Start with custom config
-npx s7proxy config/my-plc.yaml
+npx S7Proxy config/my-plc.yaml
 ```
 
 ### As a library
 
 ```js
-import { ProxyServer, loadConfig } from 's7proxy';
+import { ProxyServer, loadConfig } from 'S7Proxy';
 
 const config = loadConfig('./config/default.yaml');
 const server = new ProxyServer(config);
@@ -84,7 +84,7 @@ await server.stop();
 import {
   PlcConnection, WasmBridge,
   loadWasmEngine, createWasmImports,
-} from 's7proxy';
+} from 'S7Proxy';
 
 const engine = await loadWasmEngine(createWasmImports());
 const bridge = new WasmBridge(engine);
@@ -103,7 +103,7 @@ conn.disconnect();
 ### snap7-compatible client
 
 ```js
-import { S7Client } from 's7proxy';
+import { S7Client } from 'S7Proxy';
 
 const client = new S7Client();
 client.ConnectTo('192.168.1.10', 0, 1, (err) => {
@@ -122,7 +122,7 @@ client.ConnectTo('192.168.1.10', 0, 1, (err) => {
 ```js
 import { Worker } from 'node:worker_threads';
 
-const worker = new Worker('./node_modules/s7proxy/src/worker.js', {
+const worker = new Worker('./node_modules/S7Proxy/src/worker.js', {
   workerData: { config, autoStart: true },
 });
 

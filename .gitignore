@@ -4,4 +4,5 @@ build/*
 !build/s7engine.wasm
 package-lock.json
 nul
+data/*.db*
 

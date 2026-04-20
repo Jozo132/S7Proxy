@@ -6,10 +6,12 @@ import { Socket } from 'node:net';
 import { EventEmitter } from 'eventemitter3';
 import { FrameAssembler } from '../protocol/frame-assembler.js';
 import { WasmBridge } from '../wasm/bridge.js';
-import { S7_DEFAULT_PORT, CONNTYPE_PG, calcTsap, DEFAULT_PDU_SIZE, DEFAULT_AMQ, COTP_CC, S7_FN_SETUP_COMM } from '../protocol/constants.js';
+import { S7_DEFAULT_PORT, CONNTYPE_PG, calcTsap, DEFAULT_PDU_SIZE, DEFAULT_AMQ, COTP_CC, S7_FN_SETUP_COMM, S7_MSG_ACK } from '../protocol/constants.js';
 
 /** @import { PlcEndpoint, PlcConnectionInfo, ParsedPDU } from '../protocol/types.js' */
 /** @import pino from 'pino' */
+
+const ACK_FOLLOWUP_GRACE_MS = 100;
 
 export class PlcConnection extends EventEmitter {
   /** @readonly @type {string} */
@@ -36,7 +38,7 @@ export class PlcConnection extends EventEmitter {
   #connectedAt = 0;
   #lastActivityAt = 0;
 
-  /** @type {Map<number, { resolve: (data: Buffer) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> }>} */
+  /** @type {Map<number, { resolve: (data: Buffer) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout>; ackTimer?: ReturnType<typeof setTimeout>; ackFrame?: Buffer }>} */
   #pendingResponses = new Map();
 
   /** @type {((value?: any) => void) | undefined} */
@@ -156,6 +158,9 @@ export class PlcConnection extends EventEmitter {
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
+        const pending = this.#pendingResponses.get(pduRef);
+        if (!pending) return;
+        if (pending.ackTimer) clearTimeout(pending.ackTimer);
         this.#pendingResponses.delete(pduRef);
         this.#freeAmqSlots++;
         reject(new Error(`Request timeout (pduRef: ${pduRef})`));
@@ -248,7 +253,25 @@ export class PlcConnection extends EventEmitter {
 
       const pending = this.#pendingResponses.get(pdu.pduRef);
       if (pending) {
+        if (pdu.messageType === S7_MSG_ACK) {
+          pending.ackFrame = frame;
+          if (!pending.ackTimer) {
+            pending.ackTimer = setTimeout(() => {
+              const ackPending = this.#pendingResponses.get(pdu.pduRef);
+              if (!ackPending?.ackFrame) return;
+
+              clearTimeout(ackPending.timer);
+              ackPending.ackTimer = undefined;
+              this.#pendingResponses.delete(pdu.pduRef);
+              this.#freeAmqSlots++;
+              ackPending.resolve(ackPending.ackFrame);
+            }, Math.min(ACK_FOLLOWUP_GRACE_MS, this.#requestTimeoutMs));
+          }
+          return;
+        }
+
         clearTimeout(pending.timer);
+        if (pending.ackTimer) clearTimeout(pending.ackTimer);
         this.#pendingResponses.delete(pdu.pduRef);
         this.#freeAmqSlots++;
         pending.resolve(frame);
@@ -262,6 +285,7 @@ export class PlcConnection extends EventEmitter {
   #rejectAllPending(err) {
     for (const [, pending] of this.#pendingResponses) {
       clearTimeout(pending.timer);
+      if (pending.ackTimer) clearTimeout(pending.ackTimer);
       pending.reject(err);
     }
     this.#pendingResponses.clear();

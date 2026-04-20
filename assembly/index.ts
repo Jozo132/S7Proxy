@@ -41,7 +41,7 @@ export {
 
 // ─── S7Comm codec ───
 export {
-  s7_parse, s7_buildSetupComm, s7_buildReadRequest, s7_buildWriteRequest,
+  s7_parse, s7_buildSetupComm, s7_buildReadRequest, s7_buildWriteRequest, s7_buildBitWriteRequest,
   s7_buildMultiReadRequest,
   s7_getMessageType, s7_getFunctionCode, s7_getPduRef,
   s7_getParameterLength, s7_getDataLength,
