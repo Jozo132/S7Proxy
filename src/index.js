@@ -3,12 +3,28 @@
 // Standalone CLI entry point with JSON persistence
 
 import { resolve } from 'node:path';
+import { formatCliHelp, parseCliArgs } from './cli-options.js';
 import { loadConfig } from './config.js';
 import { ProxyServer } from './proxy-server.js';
 import { AdminStore } from './admin/store.js';
 
-const configPath = process.argv[2] || undefined;
-const config = loadConfig(configPath);
+let cli;
+try {
+  cli = parseCliArgs(process.argv.slice(2));
+} catch (error) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(message);
+  console.error('');
+  console.error(formatCliHelp());
+  process.exit(1);
+}
+
+if (cli.help) {
+  console.log(formatCliHelp());
+  process.exit(0);
+}
+
+const config = loadConfig(cli.configPath, cli.overrides);
 
 // Enable pretty logs when running in a terminal (not piped/redirected)
 if (process.stdout.isTTY && config.logging.pretty === undefined) {

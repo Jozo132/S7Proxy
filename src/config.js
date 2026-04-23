@@ -1,9 +1,10 @@
 // @ts-check
-// Configuration loader — JSON config with optional .env-style overrides
+// Configuration loader — JSON config with optional env and CLI overrides
 
 import { readFileSync, existsSync } from 'node:fs';
 
 /** @import { S7ProxyConfig, FailoverConfig, DaqConfig, WebApiConfig } from './protocol/types.js' */
+/** @import { CliOverrides } from './cli-options.js' */
 
 /**
  * @param {string} raw
@@ -79,9 +80,10 @@ const DEFAULT_CONFIG = {
 
 /**
  * @param {string} [configPath]
+ * @param {CliOverrides} [overrides]
  * @returns {S7ProxyConfig}
  */
-export function loadConfig(configPath) {
+export function loadConfig(configPath, overrides = {}) {
   const path = configPath ?? process.env['S7PROXY_CONFIG'] ?? 'config/default.json';
 
   /** @type {Partial<S7ProxyConfig>} */
@@ -105,6 +107,7 @@ export function loadConfig(configPath) {
   const envPort = env['S7PROXY_PORT'];
   const envIp = env['S7PROXY_IP'];
   const envLogLevel = env['S7PROXY_LOG_LEVEL'];
+  const envWebHost = env['S7PROXY_WEB_HOST'];
   const envWebPort = env['S7PROXY_WEB_PORT'];
 
   /** @type {S7ProxyConfig} */
@@ -116,12 +119,17 @@ export function loadConfig(configPath) {
       ...fileConfig.listen,
       ...(envIp ? { ip: envIp } : {}),
       ...(envPort ? { port: parseInt(envPort, 10) } : {}),
+      ...(overrides.listenIp ? { ip: overrides.listenIp } : {}),
+      ...(overrides.listenPort !== undefined ? { port: overrides.listenPort } : {}),
     },
     failover: { ...DEFAULT_FAILOVER, ...fileConfig.failover },
     webApi: {
       ...DEFAULT_WEBAPI,
       ...fileConfig.webApi,
+      ...(envWebHost ? { host: envWebHost } : {}),
       ...(envWebPort ? { port: parseInt(envWebPort, 10) } : {}),
+      ...(overrides.webHost ? { host: overrides.webHost } : {}),
+      ...(overrides.webPort !== undefined ? { port: overrides.webPort } : {}),
     },
     daq: {
       ...DEFAULT_DAQ,

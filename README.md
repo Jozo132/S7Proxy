@@ -32,6 +32,9 @@ npx s7proxy
 
 # Start with custom config
 npx s7proxy config/my-plc.json
+
+# Override bind address and ports from the CLI
+npx s7proxy config/my-plc.json --host 127.0.0.1 --port 1102 --web-host 127.0.0.1 --web-port 8081
 ```
 
 ### As a library
@@ -232,6 +235,19 @@ Connect to `ws://host:8080/ws`. Messages are JSON.
 
 Configuration is loaded from JSON. For simple deployments, `S7PROXY_CONFIG` can also point at a `.env` file that sets scalar overrides like ports and log level.
 
+CLI flags can override both environment variables and config file values:
+
+```bash
+npx s7proxy [config-path] [options]
+
+Options:
+  --host, --ip <host>    Override listen.ip
+  --port <port>          Override listen.port
+  --web-host <host>      Override webApi.host
+  --web-port <port>      Override webApi.port
+  --config <path>        Explicit config path
+```
+
 ```json
 {
   "listen": {
@@ -279,6 +295,7 @@ Configuration is loaded from JSON. For simple deployments, `S7PROXY_CONFIG` can 
 | `S7PROXY_PORT` | `listen.port` |
 | `S7PROXY_IP` | `listen.ip` |
 | `S7PROXY_LOG_LEVEL` | `logging.level` |
+| `S7PROXY_WEB_HOST` | `webApi.host` |
 | `S7PROXY_WEB_PORT` | `webApi.port` |
 
 ## Development
