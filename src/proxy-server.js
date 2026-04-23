@@ -21,12 +21,12 @@ import { AdminWsServer } from './admin/admin-ws.js';
 /** @import { S7ProxyConfig, PlcTarget } from './protocol/types.js' */
 /** @import { S7StructDef, S7Value } from './protocol/db-struct.js' */
 /** @import { AdminStore } from './admin/store.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from './logging/logger.js' */
 
 export class ProxyServer {
   /** @type {S7ProxyConfig} */
   #config;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
   /** @type {Metrics} */
   #metrics;

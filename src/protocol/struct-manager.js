@@ -13,7 +13,7 @@ import { S7AreaDB, S7WLBit, S7WLByte, S7_MSG_ACK, S7_MSG_ACK_DATA, S7_MSG_USERDA
 /** @import { WasmBridge } from '../wasm/bridge.js' */
 /** @import { DaqEngine } from '../daq/daq-engine.js' */
 /** @import { S7StructDef, S7Value } from './db-struct.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 const TPKT_COTP_HEADER_SIZE = 7;
 const S7_BASE_HEADER_SIZE = 10;
@@ -178,7 +178,7 @@ export class StructManager extends EventEmitter {
   #daq;
   /** @type {string} */
   #defaultTargetId;
-  /** @type {pino.Logger | null} */
+  /** @type {Logger | null} */
   #logger;
 
   /**
@@ -187,7 +187,7 @@ export class StructManager extends EventEmitter {
    *   bridge?: WasmBridge | null,
    *   daq?: DaqEngine | null,
    *   targetId?: string,
-   *   logger?: pino.Logger | null
+   *   logger?: Logger | null
    * }} [opts]
    */
   constructor(opts = {}) {
@@ -212,7 +212,7 @@ export class StructManager extends EventEmitter {
    *   bridge?: WasmBridge | null,
    *   daq?: DaqEngine | null,
    *   targetId?: string,
-   *   logger?: pino.Logger | null
+   *   logger?: Logger | null
    * }} opts
    */
   bind(opts) {

@@ -191,7 +191,7 @@ describe('Admin routes', () => {
     expect(store.getDisabledTargets()).toEqual(['plc-config']);
 
     const listRes = await app.inject({ method: 'GET', url: '/admin/api/targets' });
-    expect(listRes.json().find((target) => target.id === 'plc-config')).toBeUndefined();
+    expect(listRes.json().find((/** @type {{ id: string }} */ target) => target.id === 'plc-config')).toBeUndefined();
   });
 
   it('stores PLC-linked struct metadata and exposes it in admin listings', async () => {

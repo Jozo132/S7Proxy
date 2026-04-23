@@ -90,7 +90,7 @@ class HttpReply {
   }
 
   /**
-   * @param {unknown} payload
+   * @param {unknown} [payload]
    * @returns {HttpReply}
    */
   send(payload) {
@@ -272,7 +272,7 @@ export class HttpApp {
     const port = options.port ?? 0;
 
     await new Promise((resolvePromise, reject) => {
-      const onError = (err) => {
+      const onError = (/** @type {Error} */ err) => {
         this.server.off('listening', onListening);
         reject(err);
       };
@@ -316,7 +316,9 @@ export class HttpApp {
 
     if (options.payload !== undefined) {
       if (Buffer.isBuffer(options.payload) || typeof options.payload === 'string') {
-        request.body = options.payload;
+        request.body = Buffer.isBuffer(options.payload)
+          ? new Uint8Array(options.payload)
+          : options.payload;
       } else {
         headers['Content-Type'] = headers['Content-Type'] ?? 'application/json';
         request.body = JSON.stringify(options.payload);
@@ -482,7 +484,7 @@ export class HttpApp {
 
       try {
         const file = await readFile(safeTarget);
-        reply.header('Content-Type', CONTENT_TYPES[extname(safeTarget)] ?? 'application/octet-stream');
+        reply.header('Content-Type', /** @type {Record<string, string>} */ (CONTENT_TYPES)[extname(safeTarget)] ?? 'application/octet-stream');
         reply.send(file);
         return true;
       } catch {

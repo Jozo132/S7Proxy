@@ -5,10 +5,10 @@ import { createServer } from 'node:net';
 import { EventEmitter } from 'node:events';
 
 /** @import { Server, Socket } from 'node:net' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 export class TcpListener extends EventEmitter {
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
   /** @type {number} */
   #port;
@@ -22,7 +22,7 @@ export class TcpListener extends EventEmitter {
   /**
    * @param {number} port
    * @param {string} host
-   * @param {pino.Logger} logger
+   * @param {Logger} logger
    */
   constructor(port, host, logger) {
     super();

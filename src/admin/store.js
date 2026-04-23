@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, renameSync, writeFileSync 
 import { basename, dirname, extname, join, resolve } from 'node:path';
 
 /** @import { S7StructDef } from '../protocol/db-struct.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 /**
  * @typedef {Object} StoredStruct
@@ -113,12 +113,12 @@ export class AdminStore {
   #filePath;
   /** @type {StoreData} */
   #data;
-  /** @type {pino.Logger | null} */
+  /** @type {Logger | null} */
   #logger;
 
   /**
    * @param {string} persistencePath  - Path to the JSON store file, or a legacy .db-style path whose basename will be converted to .json
-   * @param {pino.Logger} [logger]
+   * @param {Logger} [logger]
    */
   constructor(persistencePath, logger) {
     this.#logger = logger ?? null;

@@ -45,7 +45,18 @@ describe('REST API', () => {
     await pool.start();
 
     const metrics = new Metrics();
-    daq = new DaqEngine(pool, ctx.bridge, { maxScanGroups: 16, defaultIntervalMs: 500, cacheTtlMs: 5000 }, ctx.logger, metrics);
+    /** @type {import('../../src/protocol/types.js').DaqConfig} */
+    const daqConfig = {
+      minScanIntervalMs: 20,
+      maxScanGroupsPerTarget: 16,
+      maxTagsPerSubscription: 500,
+      maxGapBytes: 4,
+      cacheEnabled: true,
+      cacheTtlMs: 5000,
+      priorityQueue: { fairnessWindow: 10, agingThresholdMs: 2000 },
+      slowClient: { maxSendBufferBytes: 65536, maxDroppedFrames: 100, dropWindowMs: 10000 },
+    };
+    daq = new DaqEngine(pool, ctx.bridge, daqConfig, ctx.logger, metrics);
 
     rest = new RestServer(pool, daq, metrics, { enabled: true, port: 0, host: '127.0.0.1' }, ctx.logger);
     await rest.start();

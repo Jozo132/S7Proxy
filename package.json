@@ -1,6 +1,6 @@
 {
   "name": "s7proxy",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "S7Comm proxy with AssemblyScript WASM protocol engine",
   "type": "module",
   "exports": {
@@ -41,6 +41,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "@types/ws": "^8.18.1",
     "assemblyscript": "^0.28.14",
     "node-snap7": "^1.0.9",
     "typescript": "^5.9.3",

@@ -40,10 +40,16 @@ describe('DaqEngine', () => {
     await pool.start();
 
     const metrics = new Metrics();
+    /** @type {import('../../src/protocol/types.js').DaqConfig} */
     const config = {
-      maxScanGroups: 16,
-      defaultIntervalMs: 500,
+      minScanIntervalMs: 20,
+      maxScanGroupsPerTarget: 16,
+      maxTagsPerSubscription: 500,
+      maxGapBytes: 4,
+      cacheEnabled: true,
       cacheTtlMs: 5000,
+      priorityQueue: { fairnessWindow: 10, agingThresholdMs: 2000 },
+      slowClient: { maxSendBufferBytes: 65536, maxDroppedFrames: 100, dropWindowMs: 10000 },
     };
     daq = new DaqEngine(pool, ctx.bridge, config, ctx.logger, metrics);
   });
@@ -58,7 +64,7 @@ describe('DaqEngine', () => {
     const subId = daq.subscribe({
       targetId: 'plc-daq',
       tags: [
-        { name: 'DB1.DBB0', area: S7AreaDB, dbNumber: 1, start: 0, amount: 2, wordLen: S7WLByte },
+        { name: 'DB1.DBB0', area: S7AreaDB, dbNum: 1, start: 0, amount: 2, wordLen: S7WLByte, target: 'plc-daq' },
       ],
       intervalMs: 500,
     });
@@ -83,7 +89,7 @@ describe('DaqEngine', () => {
     const subId = daq.subscribe({
       targetId: 'plc-daq',
       tags: [
-        { name: 'DB1.DBB10', area: S7AreaDB, dbNumber: 1, start: 10, amount: 4, wordLen: S7WLByte },
+        { name: 'DB1.DBB10', area: S7AreaDB, dbNum: 1, start: 10, amount: 4, wordLen: S7WLByte, target: 'plc-daq' },
       ],
       intervalMs: 200,
     });
@@ -105,7 +111,7 @@ describe('DaqEngine', () => {
     const subId = daq.subscribe({
       targetId: 'plc-daq',
       tags: [
-        { name: 'DB1.DBB20', area: S7AreaDB, dbNumber: 1, start: 20, amount: 1, wordLen: S7WLByte },
+        { name: 'DB1.DBB20', area: S7AreaDB, dbNum: 1, start: 20, amount: 1, wordLen: S7WLByte, target: 'plc-daq' },
       ],
       intervalMs: 1000,
     });
@@ -120,7 +126,7 @@ describe('DaqEngine', () => {
     const subId = daq.subscribe({
       targetId: 'plc-daq',
       tags: [
-        { name: 'DB1.DBB30', area: S7AreaDB, dbNumber: 1, start: 30, amount: 2, wordLen: S7WLByte },
+        { name: 'DB1.DBB30', area: S7AreaDB, dbNum: 1, start: 30, amount: 2, wordLen: S7WLByte, target: 'plc-daq' },
       ],
       intervalMs: 200,
     });

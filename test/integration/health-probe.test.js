@@ -19,7 +19,7 @@ describe('HealthProbe', () => {
 
   it('should probe the demo server and report healthy', async () => {
     const probe = new HealthProbe(
-      { ip: '127.0.0.1' },
+      { ip: '127.0.0.1', rack: 0, slot: 1 },
       2000, // intervalMs
       1000, // timeoutMs
       3,    // failThreshold
@@ -34,7 +34,7 @@ describe('HealthProbe', () => {
 
   it('should report unhealthy for unreachable host', async () => {
     const probe = new HealthProbe(
-      { ip: '192.0.2.1' },   // TEST-NET — won't respond
+      { ip: '192.0.2.1', rack: 0, slot: 1 },   // TEST-NET — won't respond
       2000,
       500,   // short timeout
       1,     // fail after 1
@@ -47,7 +47,7 @@ describe('HealthProbe', () => {
 
   it('should emit threshold:recovered after enough successes', async () => {
     const probe = new HealthProbe(
-      { ip: '127.0.0.1' },
+      { ip: '127.0.0.1', rack: 0, slot: 1 },
       100,   // fast interval
       1000,
       3,

@@ -8,7 +8,7 @@ import { COTP_CR, COTP_DT, COTP_DR, S7_FN_SETUP_COMM, DEFAULT_PDU_SIZE, DEFAULT_
 /** @import { Socket } from 'node:net' */
 /** @import { SessionState, SessionInfo, ParsedPDU } from '../protocol/types.js' */
 /** @import { WasmBridge } from '../wasm/bridge.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 let sessionCounter = 0;
 
@@ -19,7 +19,7 @@ export class ClientSession extends EventEmitter {
   #socket;
   /** @type {WasmBridge} */
   #bridge;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
 
   /** @type {SessionState} */
@@ -35,7 +35,7 @@ export class ClientSession extends EventEmitter {
   /**
    * @param {Socket} socket
    * @param {WasmBridge} bridge
-   * @param {pino.Logger} logger
+   * @param {Logger} logger
    */
   constructor(socket, bridge, logger) {
     super();

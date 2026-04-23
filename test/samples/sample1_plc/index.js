@@ -109,9 +109,9 @@ async function readWithCompat() {
   console.log(`  Connected via S7Client  (PDU ${client.PduLength()})`);
 
   const buf = await new Promise((resolve, reject) => {
-    client.DBRead(DB_NUMBER, BYTE_OFFSET, READ_BYTES, (/** @type {number} */ err, /** @type {Buffer} */ data) => {
+    client.DBRead(DB_NUMBER, BYTE_OFFSET, READ_BYTES, (/** @type {number} */ err, data) => {
       if (err) return reject(new Error(`S7Client DBRead failed: ${client.ErrorText(err)}`));
-      resolve(data);
+      resolve(/** @type {Buffer} */ (data));
     });
   });
 

@@ -14,7 +14,7 @@ import { wordLenToBytes } from '../protocol/constants.js';
 /** @import { DaqSubscription, DaqConfig, TagDefinition, CachedValue } from '../protocol/types.js' */
 /** @import { Metrics } from '../metrics/metrics.js' */
 /** @import { CoalescedRead } from './read-coalescer.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 export class DaqEngine extends EventEmitter {
   /** @type {ConnectionPool} */
@@ -23,7 +23,7 @@ export class DaqEngine extends EventEmitter {
   #bridge;
   /** @type {DaqConfig} */
   #config;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
   /** @type {Metrics} */
   #metrics;
@@ -47,7 +47,7 @@ export class DaqEngine extends EventEmitter {
    * @param {ConnectionPool} pool
    * @param {WasmBridge} bridge
    * @param {DaqConfig} config
-   * @param {pino.Logger} logger
+   * @param {Logger} logger
    * @param {Metrics} metrics
    */
   constructor(pool, bridge, config, logger, metrics) {

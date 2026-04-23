@@ -7,7 +7,7 @@ import { FailoverManager } from './failover-manager.js';
 
 /** @import { PlcTarget, PlcEndpoint, FailoverConfig } from '../protocol/types.js' */
 /** @import { WasmBridge } from '../wasm/bridge.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 export class ConnectionPool extends EventEmitter {
   /** @type {string} */
@@ -16,7 +16,7 @@ export class ConnectionPool extends EventEmitter {
   #target;
   /** @type {WasmBridge} */
   #bridge;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
   /** @type {number} */
   #poolSize;
@@ -35,7 +35,7 @@ export class ConnectionPool extends EventEmitter {
    * @param {PlcTarget} target
    * @param {WasmBridge} bridge
    * @param {FailoverConfig} failoverConfig
-   * @param {pino.Logger} logger
+   * @param {Logger} logger
    * @param {number} [poolSize=2]
    * @param {number} [requestTimeoutMs=3000]
    */

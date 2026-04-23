@@ -5,14 +5,14 @@ import { EventEmitter } from 'node:events';
 import { HealthProbe } from './health-probe.js';
 
 /** @import { PlcTarget, PlcEndpoint, FailoverState, FailoverConfig, EndpointHealth } from '../protocol/types.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 export class FailoverManager extends EventEmitter {
   /** @type {PlcTarget} */
   #target;
   /** @type {FailoverConfig} */
   #config;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
 
   /** @type {FailoverState} */
@@ -27,7 +27,7 @@ export class FailoverManager extends EventEmitter {
   /**
    * @param {PlcTarget} target
    * @param {FailoverConfig} globalDefaults
-   * @param {pino.Logger} logger
+   * @param {Logger} logger
    */
   constructor(target, globalDefaults, logger) {
     super();

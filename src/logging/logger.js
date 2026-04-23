@@ -97,9 +97,9 @@ export class Logger {
     if (this.#pretty) {
       const prefix = `[${entry.time}] ${level.toUpperCase()}`;
       const tail = message ? ` ${message}` : '';
-      const extras = { ...entry };
-      delete extras.level;
-      delete extras.time;
+      const extras = /** @type {Record<string, unknown>} */ ({ ...entry });
+      delete extras['level'];
+      delete extras['time'];
       delete extras.msg;
       const serializedExtras = Object.keys(extras).length > 0 ? ` ${JSON.stringify(extras)}` : '';
       console.error(`${prefix}${tail}${serializedExtras}`);

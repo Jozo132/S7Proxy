@@ -9,7 +9,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 /** @import { DaqConfig } from '../protocol/types.js' */
 /** @import { Metrics } from '../metrics/metrics.js' */
 /** @import { StructManager } from '../protocol/struct-manager.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 /**
  * @typedef {Object} WsClient
@@ -35,7 +35,7 @@ export class WsServer extends EventEmitter {
   #config;
   /** @type {Metrics} */
   #metrics;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
   /** @type {StructManager | null} */
   #structs;
@@ -45,7 +45,7 @@ export class WsServer extends EventEmitter {
    * @param {DaqEngine} daq
    * @param {DaqConfig} config
    * @param {Metrics} metrics
-   * @param {pino.Logger} logger
+   * @param {Logger} logger
    * @param {StructManager} [structs]
    */
   constructor(daq, config, metrics, logger, structs) {

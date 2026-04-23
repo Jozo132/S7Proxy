@@ -9,7 +9,7 @@ import { WasmBridge } from '../wasm/bridge.js';
 import { S7_DEFAULT_PORT, CONNTYPE_PG, calcTsap, DEFAULT_PDU_SIZE, DEFAULT_AMQ, COTP_CC, S7_FN_SETUP_COMM, S7_MSG_ACK } from '../protocol/constants.js';
 
 /** @import { PlcEndpoint, PlcConnectionInfo, ParsedPDU } from '../protocol/types.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 const ACK_FOLLOWUP_GRACE_MS = 100;
 
@@ -26,7 +26,7 @@ export class PlcConnection extends EventEmitter {
   #frameAssembler = new FrameAssembler();
   /** @type {WasmBridge} */
   #bridge;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
 
   /** @type {PlcConnectionInfo['state']} */
@@ -53,7 +53,7 @@ export class PlcConnection extends EventEmitter {
    * @param {string} targetId
    * @param {PlcEndpoint} endpoint
    * @param {WasmBridge} bridge
-   * @param {pino.Logger} logger
+   * @param {Logger} logger
    * @param {number} [requestTimeoutMs=3000]
    */
   constructor(id, targetId, endpoint, bridge, logger, requestTimeoutMs = 3000) {

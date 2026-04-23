@@ -7,7 +7,7 @@ import { EventEmitter } from 'node:events';
 /** @import { ConnectionPool } from '../client/connection-pool.js' */
 /** @import { RoutingRule, FilterRule, S7ProxyConfig, PlcTarget, ParsedPDU } from '../protocol/types.js' */
 /** @import { Metrics } from '../metrics/metrics.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 export class ProxyRouter extends EventEmitter {
   /** @type {ConnectionPool} */
@@ -18,7 +18,7 @@ export class ProxyRouter extends EventEmitter {
   #filters;
   /** @type {Map<string, PlcTarget>} */
   #targets;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
   /** @type {Metrics} */
   #metrics;
@@ -26,7 +26,7 @@ export class ProxyRouter extends EventEmitter {
   /**
    * @param {ConnectionPool} pool
    * @param {S7ProxyConfig} config
-   * @param {pino.Logger} logger
+   * @param {Logger} logger
    * @param {Metrics} metrics
    */
   constructor(pool, config, logger, metrics) {

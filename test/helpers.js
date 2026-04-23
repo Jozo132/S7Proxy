@@ -13,7 +13,7 @@ import { createLogger } from '../src/logging/logger.js';
  * @typedef {Object} TestContext
  * @property {DemoServer} demo
  * @property {WasmBridge} bridge
- * @property {import('pino').Logger} logger
+ * @property {import('../src/logging/logger.js').Logger} logger
  */
 
 /** @type {TestContext | null} */

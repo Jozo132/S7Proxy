@@ -5,7 +5,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 
 /** @import { StructManager } from '../protocol/struct-manager.js' */
 /** @import { AdminAuth } from './auth.js' */
-/** @import pino from 'pino' */
+/** @import { Logger } from '../logging/logger.js' */
 
 export class AdminWsServer {
   /** @type {WebSocketServer | null} */
@@ -22,7 +22,7 @@ export class AdminWsServer {
   #auth;
   /** @type {() => any} */
   #getState;
-  /** @type {pino.Logger} */
+  /** @type {Logger} */
   #logger;
   #counter = 0;
   /** @type {ReturnType<typeof setTimeout> | null} */
@@ -33,7 +33,7 @@ export class AdminWsServer {
    *   structs: StructManager,
    *   auth: AdminAuth,
    *   getState: () => any,
-   *   logger: pino.Logger,
+   *   logger: Logger,
    * }} opts
    */
   constructor({ structs, auth, getState, logger }) {
