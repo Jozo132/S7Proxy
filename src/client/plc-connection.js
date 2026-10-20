@@ -41,12 +41,18 @@ export class PlcConnection extends EventEmitter {
   /** @type {Map<number, { resolve: (data: Buffer) => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout>; ackTimer?: ReturnType<typeof setTimeout>; ackFrame?: Buffer }>} */
   #pendingResponses = new Map();
 
-  /** @type {((value?: any) => void) | undefined} */
+  /** @type {(() => void) | undefined} */
   #connectResolve;
   /** @type {((err: Error) => void) | undefined} */
   #connectReject;
   /** @type {number} */
   #requestTimeoutMs;
+  /** @type {Promise<void> | null} */
+  #connectPromise = null;
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  #connectTimer;
+  /** @type {Promise<void> | null} */
+  #disconnectPromise = null;
 
   /**
    * @param {string} id
@@ -88,56 +94,64 @@ export class PlcConnection extends EventEmitter {
     };
   }
 
-  /** Open TCP connection, perform COTP + S7 handshake. Resolves when ready. */
-  async connect() {
-    if (this.#state === 'ready') return;
+  /** Open TCP connection, perform COTP + S7 handshake. @returns {Promise<void>} */
+  connect() {
+    if (this.#disconnectPromise) return this.#disconnectPromise.then(() => this.connect());
+    if (this.#state === 'ready') return Promise.resolve();
+    if (this.#connectPromise) return this.#connectPromise;
 
     this.#state = 'connecting';
     this.#frameAssembler.reset();
 
-    return new Promise((resolve, reject) => {
+    this.#connectPromise = new Promise((resolve, reject) => {
       this.#connectResolve = resolve;
       this.#connectReject = reject;
+    });
+    const promise = this.#connectPromise;
+    const socket = new Socket();
+    this.#socket = socket;
 
-      const socket = new Socket();
-      this.#socket = socket;
+    this.#connectTimer = setTimeout(() => {
+      this.#failConnection(new Error(`Connection timeout to ${this.endpoint.ip} (state: ${this.#state})`));
+    }, this.#requestTimeoutMs * 2);
 
-      const timeout = setTimeout(() => {
-        socket.destroy();
-        this.#state = 'error';
-        reject(new Error(`Connection timeout to ${this.endpoint.ip}`));
-      }, this.#requestTimeoutMs * 2);
+    socket.on('data', (/** @type {Buffer} */ data) => {
+      if (this.#socket === socket) this.#onData(data);
+    });
+    socket.on('error', (err) => {
+      if (this.#socket !== socket) return;
+      this.#failConnection(err);
+      this.emit('error', err);
+    });
+    socket.on('close', () => {
+      if (this.#socket !== socket) return;
+      this.#logger.debug('Socket closed');
+      this.#socket = null;
+      this.#state = 'closed';
+      const err = new Error('Connection closed');
+      this.#settleConnect(err);
+      this.#rejectAllPending(err);
+      this.emit('close');
+    });
 
+    try {
+      socket.setNoDelay(true);
+      socket.setKeepAlive(true, 1000);
       socket.connect(this.endpoint.port ?? S7_DEFAULT_PORT, this.endpoint.ip, () => {
-        clearTimeout(timeout);
+        if (this.#socket !== socket || this.#state !== 'connecting') return;
         this.#logger.debug('TCP connected');
         this.#state = 'cotp';
         this.#connectedAt = Date.now();
-        this.#sendCotpCR();
-      });
-
-      socket.on('data', (/** @type {Buffer} */ data) => this.#onData(data));
-
-      socket.on('error', (err) => {
-        clearTimeout(timeout);
-        this.#logger.error({ err }, 'Socket error');
-        this.#state = 'error';
-        this.#rejectAllPending(err);
-        if (this.#connectReject) {
-          this.#connectReject(err);
-          this.#connectResolve = undefined;
-          this.#connectReject = undefined;
+        try {
+          this.#sendCotpCR();
+        } catch (err) {
+          this.#failConnection(err instanceof Error ? err : new Error(String(err)));
         }
-        this.emit('error', err);
       });
-
-      socket.on('close', () => {
-        this.#logger.debug('Socket closed');
-        this.#state = 'closed';
-        this.#rejectAllPending(new Error('Connection closed'));
-        this.emit('close');
-      });
-    });
+    } catch (err) {
+      this.#failConnection(err instanceof Error ? err : new Error(String(err)));
+    }
+    return promise;
   }
 
   /**
@@ -153,17 +167,16 @@ export class PlcConnection extends EventEmitter {
     if (this.#freeAmqSlots <= 0) {
       throw new Error('No free AMQ slots');
     }
+    if (this.#pendingResponses.has(pduRef)) {
+      throw new Error(`Duplicate pending PDU reference: ${pduRef}`);
+    }
 
     this.#freeAmqSlots--;
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        const pending = this.#pendingResponses.get(pduRef);
-        if (!pending) return;
-        if (pending.ackTimer) clearTimeout(pending.ackTimer);
-        this.#pendingResponses.delete(pduRef);
-        this.#freeAmqSlots++;
-        reject(new Error(`Request timeout (pduRef: ${pduRef})`));
+        if (!this.#pendingResponses.has(pduRef)) return;
+        this.#failConnection(new Error(`Request timeout (pduRef: ${pduRef})`));
       }, this.#requestTimeoutMs);
 
       this.#pendingResponses.set(pduRef, { resolve, reject, timer });
@@ -184,23 +197,54 @@ export class PlcConnection extends EventEmitter {
   }
 
   /** @returns {Promise<void>} */
-  async disconnect() {
-    if (this.#socket && !this.#socket.destroyed) {
-      const dr = this.#bridge.buildCotpDR(1, 0, 0);
-      this.#socket.write(dr);
-
-      return new Promise((resolve) => {
-        this.#socket?.once('close', resolve);
-        this.#socket?.end();
-        setTimeout(() => {
-          if (this.#socket && !this.#socket.destroyed) {
-            this.#socket.destroy();
-          }
-          resolve();
-        }, 2000);
-      });
-    }
+  disconnect() {
+    if (this.#disconnectPromise) return this.#disconnectPromise;
+    const socket = this.#socket;
+    const wasReady = this.#state === 'ready';
     this.#state = 'closed';
+    const err = new Error('Connection closed');
+    this.#settleConnect(err);
+    this.#rejectAllPending(err);
+    if (!socket || socket.destroyed) return Promise.resolve();
+
+    this.#disconnectPromise = new Promise((resolve) => {
+      const timer = setTimeout(() => socket.destroy(), 2000);
+      socket.once('close', () => {
+        clearTimeout(timer);
+        this.#disconnectPromise = null;
+        resolve();
+      });
+    });
+    try {
+      if (wasReady) socket.end(this.#bridge.buildCotpDR(1, 0, 0));
+      else socket.destroy();
+    } catch (err) {
+      this.#logger.error({ err }, 'Disconnect failed');
+      socket.destroy();
+    }
+    return this.#disconnectPromise;
+  }
+
+  /** @param {Error} [err] */
+  #settleConnect(err) {
+    clearTimeout(this.#connectTimer);
+    this.#connectTimer = undefined;
+    const resolve = this.#connectResolve;
+    const reject = this.#connectReject;
+    this.#connectResolve = undefined;
+    this.#connectReject = undefined;
+    this.#connectPromise = null;
+    if (err) reject?.(err);
+    else resolve?.();
+  }
+
+  /** @param {Error} err */
+  #failConnection(err) {
+    this.#logger.error({ err }, 'PLC connection failed');
+    this.#state = 'error';
+    this.#settleConnect(err);
+    this.#rejectAllPending(err);
+    this.#socket?.destroy();
   }
 
   #sendCotpCR() {
@@ -212,14 +256,11 @@ export class PlcConnection extends EventEmitter {
 
   /** @param {Buffer} data */
   #onData(data) {
-    const frames = this.#frameAssembler.feed(data);
-
-    for (const frame of frames) {
-      try {
-        this.#handleFrame(frame);
-      } catch (err) {
-        this.#logger.error({ err }, 'Frame handling error');
-      }
+    try {
+      const frames = this.#frameAssembler.feed(data);
+      for (const frame of frames) this.#handleFrame(frame);
+    } catch (err) {
+      this.#failConnection(err instanceof Error ? err : new Error(String(err)));
     }
   }
 
@@ -239,11 +280,7 @@ export class PlcConnection extends EventEmitter {
       this.#logger.debug('S7 Setup Communication completed');
       this.#state = 'ready';
       this.#freeAmqSlots = this.#maxAmqCalling;
-      if (this.#connectResolve) {
-        this.#connectResolve();
-        this.#connectResolve = undefined;
-        this.#connectReject = undefined;
-      }
+      this.#settleConnect();
       this.emit('ready');
       return;
     }

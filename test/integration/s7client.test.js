@@ -2,15 +2,22 @@
 // Integration tests for S7Client (snap7-compatible drop-in)
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { createServer } from 'node:net';
 import { startDemoServer } from '../demo-server.js';
 import { S7Client } from '../../src/compat/s7client.js';
 
 /** @type {import('../demo-server.js').DemoServer} */
 let demo;
 
+function createClient() {
+  const instance = new S7Client();
+  instance.SetParam(S7Client.RemotePort, 11102);
+  return instance;
+}
+
 describe('S7Client (snap7-compatible)', () => {
   beforeAll(async () => {
-    demo = await startDemoServer({ silent: true });
+    demo = await startDemoServer({ silent: true, port: 11102 });
   }, 10000);
 
   afterAll(() => {
@@ -32,7 +39,7 @@ describe('S7Client (snap7-compatible)', () => {
   });
 
   it('should connect via ConnectTo with callback', async () => {
-    const client = new S7Client();
+    const client = createClient();
     const err = await new Promise((resolve) => {
       client.ConnectTo('127.0.0.1', 0, 1, (e) => resolve(e));
     });
@@ -42,7 +49,7 @@ describe('S7Client (snap7-compatible)', () => {
   });
 
   it('should connect via SetConnectionParams + Connect', async () => {
-    const client = new S7Client();
+    const client = createClient();
     const srcTsap = (0x01 << 8) | 0; // PG, rack=0, slot=0
     const dstTsap = (0x01 << 8) | 1; // PG, rack=0, slot=1
     client.SetConnectionParams('127.0.0.1', srcTsap, dstTsap);
@@ -56,16 +63,76 @@ describe('S7Client (snap7-compatible)', () => {
   });
 
   it('should report disconnected after Disconnect', async () => {
-    const client = new S7Client();
+    const client = createClient();
     await new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
     client.Disconnect();
     expect(client.Connected()).toBe(false);
   });
 
+  it('reports refusal through the callback without an error listener and can reconnect', async () => {
+    const server = createServer();
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Missing server address');
+    await new Promise((resolve) => server.close(resolve));
+    const client = createClient();
+    client.SetParam(S7Client.RemotePort, address.port);
+    let calls = 0;
+    const err = await new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, (code) => {
+      calls++;
+      resolve(code);
+    }));
+    expect(err).not.toBe(0);
+    expect(client.LastError()).not.toBe(0);
+    expect(client.Connected()).toBe(false);
+    expect(calls).toBe(1);
+    client.SetParam(S7Client.RemotePort, 11102);
+    try {
+      const recovered = await new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
+      expect(recovered).toBe(0);
+      expect(client.Connected()).toBe(true);
+    } finally {
+      client.Disconnect();
+    }
+  });
+
+  it('does not resurrect a connection when disconnected during initialization', async () => {
+    const client = createClient();
+    const pending = new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
+    client.Disconnect();
+    expect(await pending).not.toBe(0);
+    expect(client.Connected()).toBe(false);
+  });
+
+  it('settles the callback when disconnected during a stalled handshake', async () => {
+    /** @type {(() => void) | undefined} */
+    let accepted;
+    const connected = new Promise((resolve) => { accepted = () => resolve(undefined); });
+    const server = createServer((socket) => {
+      socket.on('data', () => {});
+      accepted?.();
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Missing server address');
+    const client = createClient();
+    client.SetParam(S7Client.RemotePort, address.port);
+    const pending = new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
+    try {
+      await connected;
+      client.Disconnect();
+      expect(await pending).not.toBe(0);
+      expect(client.Connected()).toBe(false);
+    } finally {
+      client.Disconnect();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   // ─── Parameters ───
 
   it('should set and get params', () => {
-    const client = new S7Client();
+    const client = createClient();
     client.SetParam(S7Client.RecvTimeout, 5000);
     expect(client.GetParam(S7Client.RecvTimeout)).toBe(5000);
   });
@@ -73,7 +140,7 @@ describe('S7Client (snap7-compatible)', () => {
   // ─── DB Read/Write ───
 
   it('should read DB1 via DBRead', async () => {
-    const client = new S7Client();
+    const client = createClient();
     await new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
 
     const data = await new Promise((resolve, reject) => {
@@ -90,7 +157,7 @@ describe('S7Client (snap7-compatible)', () => {
   });
 
   it('should read DB1 word via ReadArea', async () => {
-    const client = new S7Client();
+    const client = createClient();
     await new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
 
     const data = await new Promise((resolve, reject) => {
@@ -105,7 +172,7 @@ describe('S7Client (snap7-compatible)', () => {
   });
 
   it('should write and read back DB2', async () => {
-    const client = new S7Client();
+    const client = createClient();
     await new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
 
     const writeBuf = Buffer.from([0xDE, 0xAD, 0xBE, 0xEF]);
@@ -130,7 +197,7 @@ describe('S7Client (snap7-compatible)', () => {
   // ─── MK Read ───
 
   it('should read MK via MBRead', async () => {
-    const client = new S7Client();
+    const client = createClient();
     await new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
 
     const data = await new Promise((resolve, reject) => {
@@ -151,7 +218,7 @@ describe('S7Client (snap7-compatible)', () => {
   // ─── Multi Var ───
 
   it('should read multiple vars via ReadMultiVars', async () => {
-    const client = new S7Client();
+    const client = createClient();
     await new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
 
     /** @type {import('../../src/compat/s7client.js').MultiVarRead[]} */
@@ -178,7 +245,7 @@ describe('S7Client (snap7-compatible)', () => {
   // ─── Info functions ───
 
   it('should return PduLength and ExecTime after read', async () => {
-    const client = new S7Client();
+    const client = createClient();
     await new Promise((resolve) => client.ConnectTo('127.0.0.1', 0, 1, resolve));
 
     await new Promise((resolve) => client.DBRead(1, 0, 1, resolve));
@@ -192,21 +259,21 @@ describe('S7Client (snap7-compatible)', () => {
   });
 
   it('should return ErrorText for known codes', () => {
-    const client = new S7Client();
+    const client = createClient();
     expect(client.ErrorText(0)).toBe('OK');
     expect(client.ErrorText(0x0001)).toContain('TCP');
     expect(client.ErrorText(0x0007)).toContain('not connected');
   });
 
   it('should return GetCpuInfo', () => {
-    const client = new S7Client();
+    const client = createClient();
     const info = client.GetCpuInfo();
     expect(info).toBeTruthy();
     expect(/** @type {any} */ (info).ModuleTypeName).toContain('S7Proxy');
   });
 
   it('should error on read when not connected', () => {
-    const client = new S7Client();
+    const client = createClient();
     const result = client.DBRead(1, 0, 1);
     expect(result).toBe(false);
     expect(client.LastError()).toBe(0x0007);

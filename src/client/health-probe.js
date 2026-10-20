@@ -108,7 +108,7 @@ export class HealthProbe extends EventEmitter {
         reject(new Error('Probe timeout'));
       }, this.#timeoutMs);
 
-      socket.connect(S7_DEFAULT_PORT, this.#endpoint.ip, () => {
+      socket.connect(this.#endpoint.port ?? S7_DEFAULT_PORT, this.#endpoint.ip, () => {
         clearTimeout(timer);
         socket.destroy();
         resolve();

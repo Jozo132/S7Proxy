@@ -13,7 +13,7 @@ let ctx;
 
 describe('WasmBridge', () => {
   beforeAll(async () => {
-    ctx = await setup();
+    ctx = await setup({ port: 11102 });
   });
 
   afterAll(async () => {

@@ -22,13 +22,14 @@ let ctx = null;
 /**
  * Set up the demo PLC server and WASM bridge. Reuses a single instance
  * across all tests in the same vitest worker.
+ * @param {import('./demo-server.js').DemoServerOptions} [options]
  * @returns {Promise<TestContext>}
  */
-export async function setup() {
+export async function setup(options = {}) {
   if (ctx) return ctx;
 
   const logger = createLogger({ level: 'silent' });
-  const demo = await startDemoServer({ silent: true });
+  const demo = await startDemoServer({ ...options, silent: true });
   const imports = createWasmImports(logger);
   const engine = await loadWasmEngine(imports);
   const bridge = new WasmBridge(engine);

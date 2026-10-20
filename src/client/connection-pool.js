@@ -30,6 +30,14 @@ export class ConnectionPool extends EventEmitter {
 
   /** @type {number} */
   #roundRobinIdx = 0;
+  #running = false;
+  #generation = 0;
+  /** @type {Promise<void> | null} */
+  #startPromise = null;
+  /** @type {Map<number, ReturnType<typeof setTimeout>>} */
+  #reconnectTimers = new Map();
+  /** @type {Map<number, number>} */
+  #reconnectAttempts = new Map();
 
   /**
    * @param {PlcTarget} target
@@ -49,8 +57,11 @@ export class ConnectionPool extends EventEmitter {
     this.#requestTimeoutMs = requestTimeoutMs;
 
     this.#failoverManager = new FailoverManager(target, failoverConfig, logger);
-    this.#failoverManager.on('failover', (from, to) => this.#handleFailover(from, to));
-    this.#failoverManager.on('failback', (from, to) => this.#handleFailover(from, to));
+    const handleFailover = (/** @type {PlcEndpoint} */ from, /** @type {PlcEndpoint} */ to) => {
+      this.#handleFailover(from, to).catch((err) => this.#logger.error({ err }, 'Pool failover failed'));
+    };
+    this.#failoverManager.on('failover', handleFailover);
+    this.#failoverManager.on('failback', handleFailover);
   }
 
   get failoverManager() { return this.#failoverManager; }
@@ -58,11 +69,16 @@ export class ConnectionPool extends EventEmitter {
   get connections() { return [...this.#connections]; }
 
   async start() {
+    if (this.#running) return this.#startPromise;
+    this.#running = true;
+    const generation = ++this.#generation;
     this.#failoverManager.start();
-    await this.#createConnections(this.#failoverManager.activeEndpoint);
+    this.#startPromise = this.#createConnections(this.#failoverManager.activeEndpoint, generation);
+    await this.#startPromise;
   }
 
   async stop() {
+    this.#running = false;
     this.#failoverManager.stop();
     await this.#destroyConnections();
   }
@@ -88,68 +104,77 @@ export class ConnectionPool extends EventEmitter {
 
   /**
    * @param {PlcEndpoint} endpoint
+   * @param {number} generation
    * @returns {Promise<void>}
    */
-  async #createConnections(endpoint) {
+  async #createConnections(endpoint, generation) {
     /** @type {Promise<void>[]} */
     const tasks = [];
 
     for (let i = 0; i < this.#poolSize; i++) {
-      const connId = `${this.#targetId}-${i}`;
-      const conn = new PlcConnection(connId, this.#targetId, endpoint, this.#bridge, this.#logger, this.#requestTimeoutMs);
-
-      conn.on('close', () => {
-        this.#logger.warn({ connId }, 'Connection closed - reconnecting');
-        this.#reconnect(conn, endpoint);
-      });
-
-      conn.on('error', (err) => {
-        this.#logger.error({ connId, err }, 'Connection error');
-      });
-
-      this.#connections.push(conn);
-      tasks.push(conn.connect());
+      tasks.push(this.#connectSlot(i, endpoint, generation));
     }
-
-    const results = await Promise.allSettled(tasks);
-    const failed = results.filter((r) => r.status === 'rejected');
-    if (failed.length > 0) {
-      this.#logger.warn(`${failed.length}/${this.#poolSize} connections failed to establish`);
-    }
+    await Promise.all(tasks);
   }
 
   async #destroyConnections() {
-    const tasks = this.#connections.map((c) => c.disconnect());
-    await Promise.allSettled(tasks);
+    this.#generation++;
+    for (const timer of this.#reconnectTimers.values()) clearTimeout(timer);
+    this.#reconnectTimers.clear();
+    this.#reconnectAttempts.clear();
+    const connections = this.#connections;
     this.#connections = [];
     this.#roundRobinIdx = 0;
+    await Promise.all(connections.map((c) => c.disconnect()));
   }
 
   /**
-   * @param {PlcConnection} _old
+   * @param {number} index
    * @param {PlcEndpoint} endpoint
+   * @param {number} generation
    */
-  async #reconnect(_old, endpoint) {
-    const idx = this.#connections.indexOf(_old);
-    if (idx === -1) return;
-
-    const connId = _old.id;
+  async #connectSlot(index, endpoint, generation) {
+    if (!this.#running || generation !== this.#generation) return;
+    const connId = `${this.#targetId}-${index}`;
     const conn = new PlcConnection(connId, this.#targetId, endpoint, this.#bridge, this.#logger, this.#requestTimeoutMs);
 
-    conn.on('close', () => this.#reconnect(conn, endpoint));
+    conn.on('close', () => this.#scheduleReconnect(conn, index, endpoint, generation));
     conn.on('error', (err) => {
       this.#logger.error({ connId, err }, 'Reconnection error');
     });
 
-    this.#connections[idx] = conn;
+    this.#connections[index] = conn;
 
     try {
       await conn.connect();
-      this.#logger.info({ connId }, 'Reconnected successfully');
+      if (generation !== this.#generation || this.#connections[index] !== conn) return;
+      this.#reconnectAttempts.delete(index);
+      this.#logger.info({ connId }, 'Connection ready');
     } catch (err) {
-      this.#logger.error({ connId, err }, 'Reconnection failed - retrying in 5s');
-      setTimeout(() => this.#reconnect(conn, endpoint), 5000);
+      this.#logger.error({ connId, err }, 'Connection attempt failed');
+      this.#scheduleReconnect(conn, index, endpoint, generation);
     }
+  }
+
+  /**
+   * @param {PlcConnection} conn
+   * @param {number} index
+   * @param {PlcEndpoint} endpoint
+   * @param {number} generation
+   */
+  #scheduleReconnect(conn, index, endpoint, generation) {
+    if (!this.#running || generation !== this.#generation || this.#connections[index] !== conn) return;
+    if (this.#reconnectTimers.has(index)) return;
+    const attempt = this.#reconnectAttempts.get(index) ?? 0;
+    const delay = Math.min(250 * 2 ** Math.min(attempt, 5), 5000);
+    this.#reconnectAttempts.set(index, attempt + 1);
+    this.#logger.warn({ connId: conn.id, delay }, 'Scheduling reconnect');
+    this.#reconnectTimers.set(index, setTimeout(() => {
+      this.#reconnectTimers.delete(index);
+      this.#connectSlot(index, endpoint, generation).catch((err) => {
+        this.#logger.error({ connId: conn.id, err }, 'Reconnect failed');
+      });
+    }, delay));
   }
 
   /**
@@ -158,8 +183,11 @@ export class ConnectionPool extends EventEmitter {
    */
   async #handleFailover(_from, to) {
     this.#logger.warn({ to: to.ip }, 'Failing over connections');
-    await this.#destroyConnections();
-    await this.#createConnections(to);
-    this.emit('failover', to);
+    const stopping = this.#destroyConnections();
+    const generation = this.#generation;
+    await stopping;
+    if (!this.#running || generation !== this.#generation) return;
+    await this.#createConnections(to, generation);
+    if (generation === this.#generation) this.emit('failover', to);
   }
 }

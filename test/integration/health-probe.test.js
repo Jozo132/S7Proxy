@@ -10,16 +10,16 @@ let ctx;
 
 describe('HealthProbe', () => {
   beforeAll(async () => {
-    ctx = await setup();
+    ctx = await setup({ port: 11102 });
   });
 
   afterAll(async () => {
     await teardown();
   });
 
-  it('should probe the demo server and report healthy', async () => {
+  it('should probe the configured port and report healthy', async () => {
     const probe = new HealthProbe(
-      { ip: '127.0.0.1', rack: 0, slot: 1 },
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       2000, // intervalMs
       1000, // timeoutMs
       3,    // failThreshold
@@ -47,7 +47,7 @@ describe('HealthProbe', () => {
 
   it('should emit threshold:recovered after enough successes', async () => {
     const probe = new HealthProbe(
-      { ip: '127.0.0.1', rack: 0, slot: 1 },
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       100,   // fast interval
       1000,
       3,

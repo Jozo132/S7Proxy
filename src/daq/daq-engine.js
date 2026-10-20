@@ -42,6 +42,8 @@ export class DaqEngine extends EventEmitter {
   /** @type {Map<string, DaqSubscription>} */
   #subscriptions = new Map();
   #subscriptionCounter = 0;
+  /** @type {Set<string>} */
+  #activeScans = new Set();
 
   /**
    * @param {ConnectionPool} pool
@@ -95,9 +97,14 @@ export class DaqEngine extends EventEmitter {
 
     if (!group) {
       group = new ScanGroup(groupKey, opts.intervalMs, [], this.#coalescer);
+      const scanGroup = group;
 
       group.on('tick', (/** @type {CoalescedRead[]} */ reads) => {
-        this.#executeScan(opts.targetId, groupKey, reads);
+        if (this.#activeScans.has(groupKey)) return;
+        this.#activeScans.add(groupKey);
+        this.#executeScan(opts.targetId, scanGroup, reads)
+          .catch((err) => this.#logger.error({ err, groupId: groupKey }, 'Scan failed'))
+          .finally(() => this.#activeScans.delete(groupKey));
       });
 
       this.#scanGroups.set(groupKey, group);
@@ -188,24 +195,26 @@ export class DaqEngine extends EventEmitter {
 
   /**
    * @param {string} targetId
-   * @param {string} groupId
+   * @param {ScanGroup} group
    * @param {CoalescedRead[]} reads
    */
-  async #executeScan(targetId, groupId, reads) {
+  async #executeScan(targetId, group, reads) {
+    const groupId = group.id;
     const start = Date.now();
 
     for (const read of reads) {
+      if (this.#scanGroups.get(groupId) !== group || !group.running) return;
       try {
         const conn = this.#pool.acquire();
         if (!conn) {
-          this.#logger.warn({ targetId, groupId }, 'No connection available for scan');
-          continue;
+          throw new Error('No connection available for scan');
         }
 
         const frame = this.#bridge.buildReadRequest(read.area, read.dbNum, read.start, read.amount, read.wordLen);
         // Extract pduRef from the built frame: TPKT(4) + COTP DT(3) + S7 header offset 4-5
         const pduRef = frame.readUInt16BE(11);
         const response = await conn.sendRequest(frame, pduRef);
+        if (this.#scanGroups.get(groupId) !== group || !group.running) return;
 
         // Parse S7 read response: TPKT(4) + COTP DT(3) + S7 header(12) + param(2) = 21
         const dataItemStart = 21;
@@ -224,6 +233,7 @@ export class DaqEngine extends EventEmitter {
           this.dataCache.set(tag.name, Buffer.from(value), 192);
         }
       } catch (err) {
+        if (this.#scanGroups.get(groupId) !== group || !group.running) return;
         this.#logger.error({ err, targetId, groupId }, 'Scan read failed');
         for (const tag of read.tags) {
           this.dataCache.set(tag.name, Buffer.alloc(0), 0);

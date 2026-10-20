@@ -98,7 +98,7 @@ function makeMockBridge() {
 }
 
 /**
- * @param {{ sendFollowup: boolean }} options
+ * @param {{ sendFollowup: boolean, sendAck?: boolean }} options
  * @returns {Promise<{ server: import('node:net').Server, port: number }>}
  */
 async function startAckScriptedServer(options) {
@@ -116,6 +116,7 @@ async function startAckScriptedServer(options) {
         return;
       }
       if (phase === 3) {
+        if (options.sendAck === false) return;
         socket.write(makeTpktFrame(0x21));
         if (options.sendFollowup) {
           setTimeout(() => {
@@ -138,7 +139,7 @@ async function startAckScriptedServer(options) {
 
 describe('PlcConnection', () => {
   beforeAll(async () => {
-    ctx = await setup();
+    ctx = await setup({ port: 11102 });
   });
 
   afterAll(async () => {
@@ -148,7 +149,7 @@ describe('PlcConnection', () => {
   it('should connect (COTP + S7 handshake) and reach ready state', async () => {
     const conn = new PlcConnection(
       'test-conn-1', 'plc1',
-      { ip: '127.0.0.1', rack: 0, slot: 1 },
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       ctx.bridge, ctx.logger,
     );
 
@@ -163,7 +164,7 @@ describe('PlcConnection', () => {
   it('should read DB1 bytes 0-1 and get 0xAB 0xCD', async () => {
     const conn = new PlcConnection(
       'test-conn-read', 'plc1',
-      { ip: '127.0.0.1', rack: 0, slot: 1 },
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       ctx.bridge, ctx.logger,
     );
     await conn.connect();
@@ -180,7 +181,7 @@ describe('PlcConnection', () => {
   it('should read DB1 word at offset 2 and get 0x1234', async () => {
     const conn = new PlcConnection(
       'test-conn-word', 'plc1',
-      { ip: '127.0.0.1', rack: 0, slot: 1 },
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       ctx.bridge, ctx.logger,
     );
     await conn.connect();
@@ -196,7 +197,7 @@ describe('PlcConnection', () => {
   it('should read MK area (all 0xFF)', async () => {
     const conn = new PlcConnection(
       'test-conn-mk', 'plc1',
-      { ip: '127.0.0.1', rack: 0, slot: 1 },
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       ctx.bridge, ctx.logger,
     );
     await conn.connect();
@@ -212,7 +213,7 @@ describe('PlcConnection', () => {
   it('should write to DB2 and read back', async () => {
     const conn = new PlcConnection(
       'test-conn-write', 'plc1',
-      { ip: '127.0.0.1', rack: 0, slot: 1 },
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       ctx.bridge, ctx.logger,
     );
     await conn.connect();
@@ -234,7 +235,7 @@ describe('PlcConnection', () => {
   it('should handle multiple concurrent requests within AMQ limits', async () => {
     const conn = new PlcConnection(
       'test-conn-multi', 'plc1',
-      { ip: '127.0.0.1', rack: 0, slot: 1 },
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       ctx.bridge, ctx.logger,
     );
     await conn.connect();
@@ -256,13 +257,123 @@ describe('PlcConnection', () => {
   it('should reject requests when not connected', async () => {
     const conn = new PlcConnection(
       'test-conn-err', 'plc1',
-      { ip: '127.0.0.1', rack: 0, slot: 1 },
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       ctx.bridge, ctx.logger,
     );
 
     await expect(
       conn.sendRequest(Buffer.alloc(10), 1),
     ).rejects.toThrow(/not ready/i);
+  });
+
+  it.each(['cotp', 's7_setup'])('times out a stalled %s handshake', async (phase) => {
+    const server = createServer((socket) => {
+      socket.on('data', () => {
+        if (phase === 's7_setup') socket.write(ctx.bridge.buildCotpCC(1, 1));
+      });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Missing server address');
+    const conn = new PlcConnection(
+      `stalled-${phase}`, 'plc1',
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: address.port },
+      ctx.bridge, ctx.logger, 50,
+    );
+    try {
+      const start = Date.now();
+      await expect(conn.connect()).rejects.toThrow(`state: ${phase}`);
+      expect(Date.now() - start).toBeLessThan(2000);
+      expect(conn.state).not.toBe('ready');
+    } finally {
+      await conn.disconnect();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('rejects setup when the peer closes and allows another attempt', async () => {
+    const server = createServer((socket) => socket.on('data', () => socket.end()));
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Missing server address');
+    const conn = new PlcConnection(
+      'closed-setup', 'plc1',
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: address.port },
+      ctx.bridge, ctx.logger, 100,
+    );
+    try {
+      await expect(conn.connect()).rejects.toThrow('Connection closed');
+      await expect(conn.connect()).rejects.toThrow('Connection closed');
+    } finally {
+      await conn.disconnect();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('shares a pending attempt and rejects it on disconnect', async () => {
+    const server = createServer((socket) => socket.on('data', () => {}));
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(undefined)));
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Missing server address');
+    const conn = new PlcConnection(
+      'cancelled-setup', 'plc1',
+      { ip: '127.0.0.1', rack: 0, slot: 1, port: address.port },
+      ctx.bridge, ctx.logger,
+    );
+    try {
+      const pending = conn.connect();
+      expect(conn.connect()).toBe(pending);
+      const rejected = expect(pending).rejects.toThrow('Connection closed');
+      await conn.disconnect();
+      await rejected;
+      expect(conn.state).toBe('closed');
+    } finally {
+      await conn.disconnect();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('invalidates a timed-out session and rejects all outstanding requests', async () => {
+    const { server, port } = await startAckScriptedServer({ sendFollowup: false, sendAck: false });
+    const conn = new PlcConnection(
+      'stalled-read', 'plc1', { ip: '127.0.0.1', rack: 0, slot: 1, port },
+      makeMockBridge(), makeSilentLogger(), 100,
+    );
+    try {
+      await conn.connect();
+      const request = Buffer.alloc(13);
+      const results = await Promise.allSettled([
+        conn.sendRequest(request, 1),
+        conn.sendRequest(request, 2),
+      ]);
+      for (const result of results) {
+        expect(result.status).toBe('rejected');
+        if (result.status === 'rejected') expect(result.reason.message).toMatch(/Request timeout/);
+      }
+      expect(conn.state).not.toBe('ready');
+      await expect(conn.sendRequest(request, 3)).rejects.toThrow('not ready');
+    } finally {
+      await conn.disconnect();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('rejects duplicate PDU references without replacing the first request', async () => {
+    const { server, port } = await startAckScriptedServer({ sendFollowup: true });
+    const conn = new PlcConnection(
+      'duplicate-ref', 'plc1', { ip: '127.0.0.1', rack: 0, slot: 1, port },
+      makeMockBridge(), makeSilentLogger(), 500,
+    );
+    try {
+      await conn.connect();
+      const request = Buffer.alloc(13);
+      const pending = conn.sendRequest(request, 0x1234);
+      await expect(conn.sendRequest(request, 0x1234)).rejects.toThrow('Duplicate pending PDU');
+      expect((await pending)[4]).toBe(0x22);
+    } finally {
+      await conn.disconnect();
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 
   it('waits for ACK_DATA when a PLC sends ACK before the final response', async () => {

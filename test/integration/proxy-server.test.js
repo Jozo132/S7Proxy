@@ -9,7 +9,7 @@ let demo;
 
 describe('ProxyServer (smoke)', () => {
   beforeAll(async () => {
-    demo = await startDemoServer({ silent: true });
+    demo = await startDemoServer({ silent: true, port: 11102 });
   });
 
   afterAll(() => {

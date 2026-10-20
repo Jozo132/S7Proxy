@@ -14,6 +14,7 @@ const DEFAULT_IP = '127.0.0.1';
  * @typedef {Object} DemoServerOptions
  * @property {string}  [ip='127.0.0.1']
  * @property {boolean} [silent=false]
+ * @property {number} [port=102]
  */
 
 /**
@@ -65,8 +66,10 @@ function fillDb2(buf) {
 export async function startDemoServer(opts = {}) {
   const ip = opts.ip ?? DEFAULT_IP;
   const silent = opts.silent ?? false;
+  const port = opts.port ?? 102;
 
   const server = new snap7Any.S7Server();
+  if (!server.SetParam(server.LocalPort, port)) throw new Error('Failed to set demo server port');
 
   // Memory areas
   const db1 = Buffer.alloc(100);
@@ -102,7 +105,7 @@ export async function startDemoServer(opts = {}) {
       }
 
       if (!silent) {
-        console.log(`[snap7-server] Listening on ${ip}:102`);
+        console.log(`[snap7-server] Listening on ${ip}:${port}`);
       }
 
       resolve({

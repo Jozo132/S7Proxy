@@ -86,12 +86,17 @@ await server.stop();
 ```js
 import {
   PlcConnection, WasmBridge,
-  loadWasmEngine, createWasmImports,
+  loadWasmEngine, createWasmImports, createLogger,
 } from 's7proxy';
 
 const engine = await loadWasmEngine(createWasmImports());
 const bridge = new WasmBridge(engine);
-const conn = new PlcConnection({ ip: '192.168.1.10', rack: 0, slot: 1 }, bridge);
+const logger = createLogger();
+const conn = new PlcConnection(
+  'plc1-0', 'plc1', { ip: '192.168.1.10', rack: 0, slot: 1 },
+  bridge, logger, 3000,
+);
+conn.on('error', (err) => logger.error({ err }, 'PLC socket error'));
 
 await conn.connect();
 
@@ -100,8 +105,29 @@ const frame = bridge.buildReadRequest(0x84, 1, 0, 4, 0x02);
 const pduRef = frame.readUInt16BE(11);
 const response = await conn.sendRequest(frame, pduRef);
 
-conn.disconnect();
+await conn.disconnect();
 ```
+
+### Connection recovery and scan timing
+
+- `PlcConnection.connect()` shares an in-flight attempt and applies a deadline of
+  twice `requestTimeoutMs` across TCP, COTP, and S7 setup. Closing or disconnecting
+  during setup rejects that attempt.
+- Requests use `requestTimeoutMs`. A timeout invalidates the session and rejects
+  all outstanding requests, so a pool can reconnect instead of reusing a stalled
+  socket. Direct connections must be reconnected by their caller.
+- TCP connections enable keepalive (initial delay 1 second) and disable Nagle's
+  algorithm. Keepalive is not a substitute for request deadlines.
+- Pools maintain one reconnect timer per connection slot, with exponential delays
+  of 250 ms up to 5 seconds. Stop and failover cancel old timers and prevent old
+  sessions from scheduling replacements.
+- A scan group skips ticks while its previous scan is outstanding; missed ticks
+  do not accumulate. Results arriving after their scan group is removed or after
+  shutdown are discarded.
+  A scan with no available connection marks its tags bad rather than republishing
+  an old good value.
+- The snap7-compatible client reports connection failures through callback error
+  codes and `LastError()`, without requiring an EventEmitter `error` listener.
 
 ### snap7-compatible client
 
@@ -299,6 +325,10 @@ Options:
 | `S7PROXY_WEB_PORT` | `webApi.port` |
 
 ## Development
+
+Use Node.js 22.12+ (or a compatible newer release) for the current Vite/Vitest
+toolchain. Demo PLC integration fixtures use loopback port 11102 rather than
+privileged port 102.
 
 ```bash
 # Run tests

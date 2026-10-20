@@ -36,12 +36,12 @@ const failoverConfig = {
 
 describe('WebSocket API', () => {
   beforeAll(async () => {
-    ctx = await setup();
+    ctx = await setup({ port: 11102 });
 
     /** @type {import('../../src/protocol/types.js').PlcTarget} */
     const target = {
       id: 'plc-ws',
-      primary: { ip: '127.0.0.1', rack: 0, slot: 1 },
+      primary: { ip: '127.0.0.1', rack: 0, slot: 1, port: 11102 },
       maxConnections: 2,
     };
 

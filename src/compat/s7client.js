@@ -5,6 +5,7 @@ import { EventEmitter } from 'node:events';
 import { PlcConnection } from '../client/plc-connection.js';
 import { WasmBridge } from '../wasm/bridge.js';
 import { loadWasmEngine, resetWasmCache } from '../wasm/loader.js';
+import { createLogger } from '../logging/logger.js';
 import {
   S7AreaPE, S7AreaPA, S7AreaMK, S7AreaDB, S7AreaCT, S7AreaTM,
   S7WLBit, S7WLByte, S7WLWord, S7WLDWord, S7WLReal, S7WLCounter, S7WLTimer,
@@ -210,6 +211,8 @@ export class S7Client extends EventEmitter {
   #requestTimeoutMs = 3000;
   /** @type {boolean} */
   #connected = false;
+  #connectionGeneration = 0;
+  #logger = createLogger({ level: 'error' });
 
   constructor() {
     super();
@@ -234,13 +237,13 @@ export class S7Client extends EventEmitter {
     this.#useTsapOverride = false;
 
     if (callback) {
-      this.#doConnect().then(() => callback(0)).catch(() => callback(this.#lastError));
+      this.#doConnect().then(() => callback(0), () => callback(errTCPConnectionFailed));
       return;
     }
     try {
       // Blocking-style: we can't truly block in Node.js, but we return false synchronously
       // and the user should use the callback form for proper async support.
-      this.#doConnect().catch(() => {});
+      this.#doConnect().catch((err) => this.#logger.error({ err }, 'S7Client connect failed'));
       return this.#connected;
     } catch {
       return false;
@@ -277,11 +280,11 @@ export class S7Client extends EventEmitter {
    */
   Connect(callback) {
     if (callback) {
-      this.#doConnect().then(() => callback(0)).catch(() => callback(this.#lastError));
+      this.#doConnect().then(() => callback(0), () => callback(errTCPConnectionFailed));
       return;
     }
     try {
-      this.#doConnect().catch(() => {});
+      this.#doConnect().catch((err) => this.#logger.error({ err }, 'S7Client connect failed'));
       return this.#connected;
     } catch {
       return false;
@@ -293,8 +296,12 @@ export class S7Client extends EventEmitter {
    * @returns {boolean}
    */
   Disconnect() {
+    this.#connectionGeneration++;
     if (this.#conn) {
-      this.#conn.disconnect().catch(() => {});
+      this.#conn.disconnect().catch((err) => {
+        this.#lastError = errTCPConnectionFailed;
+        this.#logger.error({ err }, 'S7Client disconnect failed');
+      });
       this.#conn = null;
     }
     this.#connected = false;
@@ -704,18 +711,18 @@ export class S7Client extends EventEmitter {
 
   async #doConnect() {
     const startTime = Date.now();
+    const generation = ++this.#connectionGeneration;
+    const previous = this.#conn;
+    this.#conn = null;
+    this.#connected = false;
+    const disconnected = previous?.disconnect();
     try {
+      await disconnected;
       if (!this.#bridge) {
         const engine = await loadWasmEngine();
         this.#bridge = new WasmBridge(engine);
       }
-
-      const srcTsap = this.#useTsapOverride
-        ? this.#localTSAP
-        : calcTsap(this.#connectionType, 0, 0);
-      const dstTsap = this.#useTsapOverride
-        ? this.#remoteTSAP
-        : calcTsap(this.#connectionType, this.#rack, this.#slot);
+      if (generation !== this.#connectionGeneration) throw new Error('Connection attempt cancelled');
 
       // PlcConnection handles COTP CR using its own TSAP computation from the endpoint,
       // but we override by providing the correct rack/slot in the endpoint.
@@ -723,22 +730,33 @@ export class S7Client extends EventEmitter {
       const port = this.#params.get(S7Client.RemotePort) ?? S7_DEFAULT_PORT;
       const endpoint = { ip: this.#ip, rack: this.#rack, slot: this.#slot, port };
 
-      // Create a silent logger
-      const logger = { child: () => logger, debug: () => {}, info: () => {}, warn: () => {}, error: () => {}, fatal: () => {} };
-
-      this.#conn = new PlcConnection(
+      const conn = new PlcConnection(
         connId, 'snap7-compat', endpoint,
-        this.#bridge, /** @type {any} */ (logger), this.#requestTimeoutMs
+        this.#bridge, this.#logger, this.#requestTimeoutMs
       );
-
-      await this.#conn.connect();
+      this.#conn = conn;
+      conn.on('error', () => {
+        if (this.#conn !== conn) return;
+        this.#lastError = errTCPConnectionFailed;
+        this.#connected = false;
+      });
+      conn.on('close', () => {
+        if (this.#conn === conn) this.#connected = false;
+      });
+      await conn.connect();
+      if (generation !== this.#connectionGeneration) {
+        await conn.disconnect();
+        throw new Error('Connection attempt cancelled');
+      }
       this.#connected = true;
       this.#lastError = 0;
       this.#execTime = Date.now() - startTime;
     } catch (err) {
-      this.#lastError = errTCPConnectionFailed;
-      this.#connected = false;
-      this.#execTime = Date.now() - startTime;
+      if (generation === this.#connectionGeneration) {
+        this.#lastError = errTCPConnectionFailed;
+        this.#connected = false;
+        this.#execTime = Date.now() - startTime;
+      }
       throw err;
     }
   }

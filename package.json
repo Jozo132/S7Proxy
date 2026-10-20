@@ -1,6 +1,6 @@
 {
   "name": "s7proxy",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "S7Comm proxy with AssemblyScript WASM protocol engine",
   "type": "module",
   "exports": {
@@ -17,6 +17,7 @@
   },
   "files": [
     "src/",
+    "public/",
     "build/s7engine.wasm",
     "config/default.json",
     "README.md"
