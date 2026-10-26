@@ -1,16 +1,19 @@
 // @ts-check
-import { Socket } from 'node:net';
+import { Socket, isIP } from 'node:net';
+import { constants, createHash, timingSafeEqual } from 'node:crypto';
 import { Duplex } from 'node:stream';
-import { connect as connectTLS } from 'node:tls';
+import { connect as connectTLS, checkServerIdentity } from 'node:tls';
 import { setTimeout as delay } from 'node:timers/promises';
 import { performance } from 'node:perf_hooks';
-import { getProductionHost } from '../protocol/production-policy.js';
+import { getLabHost, getProductionHost } from '../protocol/production-policy.js';
 import {
   PlusError, PLUS_FUNCTION, PlusAssembler, Cursor, decodeValue, decodeObjects,
-  encodeOperation, assertOutgoing, responsePayload, vlq,
+  encodeOperation, assertOutgoing, responsePayload,
 } from '../protocol/s7commplus/codec.js';
+import { buildBlockMembers, validateMemberValue } from '../protocol/s7commplus/type-info.js';
 
 /** @import { PlusOperation, PlusObject, PlusValue } from '../protocol/s7commplus/codec.js' */
+/** @import { BlockMetadata, RuntimeMember } from '../protocol/s7commplus/type-info.js' */
 export { getProductionHost } from '../protocol/production-policy.js';
 const activeHosts = new Set();
 const DEFAULT_LIMITS = Object.freeze({
@@ -21,7 +24,7 @@ const DEFAULT_LIMITS = Object.freeze({
 });
 
 /** @typedef {Partial<Record<keyof typeof DEFAULT_LIMITS,number>>} PlusLimits */
-/** @typedef {{host?:string,port?:number,productionReadOnly?:boolean,securityMode?:'discovery'|'tls',tls?:{ca:string|Buffer,servername?:string},limits?:PlusLimits}} PlusOptions */
+/** @typedef {{host?:string,port?:number,productionReadOnly?:boolean,securityMode?:'discovery'|'legacy'|'tls',tls?:{ca:string|Buffer,servername?:string,certificateSha256?:string},limits?:PlusLimits}} PlusOptions */
 /** @typedef {{resolve:(value:any)=>void,reject:(error:Error)=>void,timer:ReturnType<typeof setTimeout>}} Pending */
 
 export class S7CommPlusClient {
@@ -77,25 +80,42 @@ export class S7CommPlusClient {
   #identity = { deviceString: null, orderNumber: null, firmware: null, model: null };
   /** @type {number|null} */
   #protection = null;
+  /** @type {string|null} */
+  #peerCertificateSha256 = null;
+  #tlsVerified = false;
+  /** @type {Map<number, BlockMetadata>} */
+  #blocks = new Map();
+  /** @type {Map<number, Awaited<ReturnType<S7CommPlusClient['explore']>>>} */
+  #types = new Map();
+  /** @type {WeakMap<RuntimeMember,{block:BlockMetadata,member:RuntimeMember,metadataEvidence:unknown}>} */
+  #memberBindings = new WeakMap();
+  /** @type {{name:string,member:RuntimeMember}[]} */
+  #namedMembers = [];
 
   /** @param {PlusOptions} [options] */
   constructor(options = {}) {
     const productionHost = getProductionHost();
+    const labHost = getLabHost();
     const host = options.host ?? productionHost;
     if (!host) throw new PlusError('TARGET_DENIED', 'An explicit host or local production target configuration is required');
     this.#host = host;
     this.#port = options.port ?? 102;
-    if (![productionHost, '127.0.0.1', '::1'].includes(this.#host)) {
+    if (![productionHost, labHost, '127.0.0.1', '::1'].includes(this.#host)) {
       throw new PlusError('TARGET_DENIED', 'Only the locally authorized production target or an explicit loopback fixture is authorized');
     }
     if (options.productionReadOnly === false) throw new PlusError('READ_ONLY_DENIED', 'This backend cannot disable productionReadOnly');
-    if (!Number.isInteger(this.#port) || this.#port < 1 || this.#port > 65535 || (this.#host === productionHost && this.#port !== 102)) {
+    if (!Number.isInteger(this.#port) || this.#port < 1 || this.#port > 65535 || ([productionHost, labHost].includes(this.#host) && this.#port !== 102)) {
       throw new PlusError('TARGET_DENIED', 'Invalid target port');
     }
-    if (options.securityMode && !['discovery', 'tls'].includes(options.securityMode)) throw new PlusError('ARGUMENT', 'Unknown security mode');
+    if (options.securityMode && !['discovery', 'legacy', 'tls'].includes(options.securityMode)) throw new PlusError('UNSUPPORTED_SECURITY_PROFILE', 'Select an explicit legacy or TLS profile; automatic fallback is not supported');
+    if (this.#host === labHost && !['legacy', 'tls'].includes(options.securityMode ?? '')) throw new PlusError('SECURITY_PROFILE_REQUIRED', 'An independently established lab security profile must be selected explicitly');
+    if ('password' in options || 'username' in options || 'sessionKey' in options) throw new PlusError('AUTHENTICATION_UNSUPPORTED', 'Credential and legacy SessionKey authentication are not implemented; nothing transmitted');
     if (options.tls && options.securityMode !== 'tls') throw new PlusError('SECURITY_REQUIRED', 'TLS configuration cannot be used in plaintext');
     if (options.securityMode === 'tls' && !options.tls?.ca) throw new PlusError('SECURITY_REQUIRED', 'Verified TLS requires an authorized CA certificate');
     if (this.#host === productionHost && options.securityMode === 'tls') throw new PlusError('UNSUPPORTED_SECURITY', 'The tunneled TLS profile is not qualified for live acquisition; nothing transmitted');
+    if (options.securityMode === 'tls' && !/^[a-fA-F0-9]{64}$/.test(options.tls?.certificateSha256 ?? '')) {
+      throw new PlusError('CERTIFICATE_PIN_REQUIRED', 'Verified TLS requires an independently approved SHA-256 certificate pin');
+    }
     this.#limits = Object.freeze({ ...DEFAULT_LIMITS, ...options.limits });
     for (const [name, value] of Object.entries(this.#limits)) {
       if (!Number.isSafeInteger(value) || value <= 0) throw new PlusError('ARGUMENT', `Invalid budget ${name}`);
@@ -113,9 +133,11 @@ export class S7CommPlusClient {
     return structuredClone({
       target: { host: this.#host, port: this.#port }, productionReadOnly: true, phase: this.#phase,
       connected: this.connected, protocol: 'S7CommPlus', protocolVersion: this.#version,
-      sessionEstablished: this.#established, securityMode: this.#tls?.authorized ? 'TLS_VERIFIED' : 'UNAUTHENTICATED_DISCOVERY',
+      sessionEstablished: this.#established, securityMode: this.#tlsVerified ? 'TLS_VERIFIED' : this.#options.securityMode === 'tls' ? 'TLS_UNVERIFIED' : 'UNAUTHENTICATED_DISCOVERY',
+      selectedProfile: this.#options.securityMode === 'tls' ? 'TLS' : 'LEGACY_PLAINTEXT',
+      peerCertificateSha256: this.#peerCertificateSha256,
       identity: this.#identity, cpuState: this.#cpuState, effectiveProtectionLevel: this.#protection,
-      capabilities: { objectExplore: this.#ready, symbolicLidRead: this.#ready, namedSymbolResolution: false,
+      capabilities: { objectExplore: this.#ready, symbolicLidRead: this.#ready, namedSymbolResolution: this.#ready && this.#namedMembers.length > 0,
         blockUpload: 'UNSUPPORTED_UNQUALIFIED', recurringUploads: false },
       limits: this.#limits, statistics: { requests: this.#requests, receivedBytes: this.#rxBytes,
         sentBytes: this.#txBytes, elapsedMs: this.#started ? Math.round(performance.now() - this.#started) : 0 },
@@ -170,7 +192,7 @@ export class S7CommPlusClient {
       this.#phase = 'createSession';
       const created = await this.#exchange({ kind: 'createSession' });
       const count = created.cursor.byte();
-      if (count < 1 || count > 2) throw new PlusError('SESSION_CREATE_REJECTED', `Unexpected session object count ${count}`);
+      if (count < 1 || count > 2) throw new PlusError('SESSION_CREATE_REJECTED', `Unexpected session object count ${count}`, created.statusDetails);
       this.#sessionId = created.cursor.uint();
       if (!this.#sessionId) throw new PlusError('SESSION_CREATE_REJECTED', 'PLC returned null session ID');
       if (count === 2) created.cursor.uint();
@@ -185,8 +207,8 @@ export class S7CommPlusClient {
       this.#serverVersion = versionValue.raw;
       this.#extractIdentity(versionValue);
       const securedRole = attributes.some(attribute => attribute.id === 299 && (Number(attribute.value.value) & 0x20000000));
-      if (securedRole || attributes.some(attribute => attribute.id === 303)) {
-        throw new PlusError('AUTHENTICATION_REQUIRED', 'PLC advertises an authentication challenge or secured role; this profile is not implemented; no key probing or bypass attempted');
+      if (securedRole || (!this.#tlsVerified && attributes.some(attribute => attribute.id === 303))) {
+        throw new PlusError(this.#tlsVerified ? 'AUTHENTICATION_REQUIRED' : 'LEGACY_SESSION_KEY_REQUIRED', 'PLC advertises a challenge or secured role; the selected profile requires unsupported authentication; no key probing or bypass attempted');
       }
       if (created.version === 2 && !this.#tls) throw new PlusError('SECURITY_REQUIRED', 'PLC replied V2; verified TLS required; no plaintext fallback');
       this.#version = this.#tls ? 2 : created.version;
@@ -222,8 +244,14 @@ export class S7CommPlusClient {
   async #explore(objectId, options) {
     try {
       const response = await this.#exchange({ kind: 'explore', objectId, ...options });
+      let returnedExploreId;
+      if (response.expectedIntegrityId !== undefined || response.cursor.bytes[response.cursor.offset] !== 0xA1) {
+        returnedExploreId = response.cursor.uint32();
+        this.#checkIntegrity(response.cursor, response.expectedIntegrityId);
+      }
       const objects = decodeObjects(response.cursor, this.#limits.maxObjects);
-      return { objectId, objects, receivedAt: new Date().toISOString(), completeness: 'BOUNDED_RESPONSE_NOT_FULL_INVENTORY' };
+      return { objectId, returnedExploreId, objects, receivedAt: new Date().toISOString(), completeness: 'BOUNDED_RESPONSE_NOT_FULL_INVENTORY',
+        correlation: response.correlation };
     } catch (error) { this.#stop(this.#asError(error)); throw error; }
   }
 
@@ -246,9 +274,131 @@ export class S7CommPlusClient {
     if (cursor.bytes[cursor.offset] === 0 && cursor.bytes[cursor.offset + 1] === 0 && cursor.bytes[cursor.offset + 2] === 4) cursor.byte();
     const value = decodeValue(response.cursor);
     if (value.flags || value.datatype !== 4) throw new PlusError('UNSUPPORTED_DECODING', 'Expected scalar UDInt protection level');
-    this.#checkScalarTail(cursor);
+    this.#checkScalarTail(cursor, response.expectedIntegrityId);
     this.#protection = value.value;
     if (this.#protection === null || this.#protection > 2) throw new PlusError('ACCESS_RESTRICTED', `Protection level ${this.#protection}; stop before program exploration`);
+  }
+
+  async listDataBlocks() {
+    this.#requireReady();
+    const evidence = await this.#explore(3, { recursive: true, attributes: [233, 2521] });
+    const blocks = evidence.objects.filter(object => object.classId === 2574 && (object.rid >>> 16) === 0x8A0E).map(object => {
+      const names = object.attributes.filter(attribute => attribute.id === 233 && typeof attribute.value.value === 'string');
+      if (names.length > 1) throw new PlusError('AMBIGUOUS_METADATA', 'DB has multiple native names');
+      return { type: /** @type {const} */ ('DB'), number: object.rid & 0xFFFF,
+        name: names[0]?.value.value ?? null, objectRid: object.rid, typeInfoId: null,
+        status: 'TYPE_UNRESOLVED', evidence };
+    });
+    if (new Set(blocks.map(block => block.number)).size !== blocks.length) throw new PlusError('AMBIGUOUS_METADATA', 'Duplicate DB runtime identities');
+    return { blocks, completeness: evidence.completeness, receivedAt: evidence.receivedAt };
+  }
+
+  /** @param {{type:'DB',number:number}} selector */
+  async getBlockMetadata(selector) {
+    this.#requireReady();
+    if (selector?.type !== 'DB' || !Number.isInteger(selector.number) || selector.number < 1 || selector.number > 65535) {
+      throw new PlusError('ARGUMENT', 'Select a DB number in 1..65535');
+    }
+    const cached = this.#blocks.get(selector.number);
+    if (cached) return structuredClone(cached);
+    const inventory = await this.listDataBlocks();
+    const block = inventory.blocks.find(block => block.number === selector.number);
+    if (!block) throw new PlusError('BLOCK_UNAVAILABLE', 'DB was not returned by bounded native discovery');
+    const reference = await this.readSymbolic({ accessArea: block.objectRid, lids: [1] });
+    if (reference.value.flags !== 0 || reference.value.datatype !== 18 || !Number.isInteger(reference.value.value)) {
+      throw new PlusError('DATATYPE_MISMATCH', 'DB type reference must be a scalar native RID');
+    }
+    const metadata = { ...block, typeInfoId: reference.value.value || null,
+      status: reference.value.value ? 'TYPE_REFERENCE_RESOLVED' : 'TYPE_UNAVAILABLE',
+      evidence: { inventory: block.evidence, typeReference: reference } };
+    this.#blocks.set(selector.number, structuredClone(metadata));
+    return metadata;
+  }
+
+  /** @param {number} typeInfoId */
+  async getTypeInfo(typeInfoId) {
+    this.#requireReady();
+    if (!Number.isInteger(typeInfoId) || typeInfoId < 1 || typeInfoId > 0xFFFFFFFF) throw new PlusError('ARGUMENT', 'Expected a native type-info RID');
+    let evidence = this.#types.get(typeInfoId);
+    if (!evidence) {
+      evidence = await this.#explore(typeInfoId, { recursive: true });
+      this.#types.set(typeInfoId, structuredClone(evidence));
+    }
+    const objects = evidence.objects.filter(object => object.rid === typeInfoId && object.classId === 511);
+    if (objects.length > 1) throw new PlusError('AMBIGUOUS_METADATA', 'Multiple native type objects match the requested RID');
+    return { typeInfoId, object: structuredClone(objects[0] ?? null),
+      status: objects.length ? 'AVAILABLE' : 'UNAVAILABLE', evidence: structuredClone(evidence) };
+  }
+
+  /** @param {{type:'DB',number:number}} selector @param {{maxMembers?:number,maxTypes?:number}} [options] */
+  async listBlockMembers(selector, options = {}) {
+    this.#requireReady();
+    const maxTypes = options.maxTypes ?? 8;
+    const maxMembers = options.maxMembers ?? 4096;
+    if (!Number.isSafeInteger(maxTypes) || maxTypes < 1 || maxTypes > 32 || !Number.isSafeInteger(maxMembers) || maxMembers < 1 || maxMembers > 4096) {
+      throw new PlusError('ARGUMENT', 'Discovery budgets require 1..32 types and 1..4096 members');
+    }
+    const block = await this.getBlockMetadata(selector);
+    /** @type {PlusObject[]} */
+    const objects = [];
+    /** @type {unknown[]} */
+    const evidence = [];
+    const pending = block.typeInfoId ? [block.typeInfoId] : [];
+    const visited = new Set();
+    while (pending.length && visited.size < maxTypes) {
+      const id = /** @type {number} */ (pending.shift());
+      if (visited.has(id)) continue;
+      visited.add(id);
+      const info = await this.getTypeInfo(id);
+      evidence.push(info.evidence);
+      for (const object of info.evidence.objects.filter(object => object.classId === 511)) {
+        const previous = objects.find(candidate => candidate.rid === object.rid);
+        if (previous && JSON.stringify(previous) !== JSON.stringify(object)) throw new PlusError('METADATA_CHANGED', 'Conflicting native type definitions in one discovery');
+        if (!previous) objects.push(object);
+        for (const entry of object.typeMembers ?? []) {
+          const relation = entry.offset.relationId;
+          if (relation && !visited.has(relation) && !pending.includes(relation)) pending.push(relation);
+        }
+      }
+    }
+    const result = buildBlockMembers(block, objects, maxMembers);
+    this.#namedMembers = this.#namedMembers.filter(item => this.#memberBindings.get(item.member)?.block.number !== block.number);
+    const nativeBlock = structuredClone(block);
+    const metadataEvidence = structuredClone(evidence);
+    for (const member of result.members.filter(member => member.readable)) {
+      this.#memberBindings.set(member, { block: nativeBlock, member: structuredClone(member), metadataEvidence });
+      if (block.name && member.path) {
+        this.#namedMembers.push({ name: `${block.name}.${member.path}`, member }, { name: `"${block.name}".${member.path}`, member });
+      }
+    }
+    return { ...result, evidence, receivedAt: new Date().toISOString() };
+  }
+
+  /** @param {RuntimeMember} member */
+  async readMember(member) {
+    this.#requireReady();
+    const binding = this.#memberBindings.get(member);
+    if (!binding) throw new PlusError('UNVERIFIED_ADDRESS', 'Use a readable member discovered by this client session');
+    const { block, member: native } = binding;
+    // The browsed per-entry CRC is not the GetMultiVariables address CRC.
+    const observation = await this.readSymbolic({ accessArea: block.objectRid, lids: native.accessPath, symbolCrc: 0 });
+    let decoded;
+    try { decoded = validateMemberValue(native, observation.value); }
+    catch (error) { this.#stop(this.#asError(error)); throw error; }
+    return { block: structuredClone(block), symbol: structuredClone(native),
+      runtime: { protocol: 's7commplus', objectRid: block.objectRid, typeInfoId: block.typeInfoId,
+        memberTypeInfoId: native.typeInfoId, memberId: native.memberId, accessPath: [...native.accessPath],
+        symbolCrc: 0, metadataSymbolCrc: native.symbolCrc },
+      observation: { ...decoded, quality: 'GOOD', source: 'S7COMMPLUS_RESPONSE', receivedAt: observation.receivedAt, nativeTimestamp: null },
+      evidence: { metadata: structuredClone(binding.metadataEvidence), response: observation } };
+  }
+
+  /** @param {string} name */
+  async readSymbol(name) {
+    this.#requireReady();
+    const matches = this.#namedMembers.filter(item => item.name === name);
+    if (matches.length !== 1) throw new PlusError(matches.length ? 'AMBIGUOUS_SYMBOL' : 'SYMBOL_UNAVAILABLE', 'Discover an unambiguous readable block member before a named read');
+    return this.readMember(matches[0].member);
   }
 
   /** @param {{accessArea:number,lids:number[],symbolCrc?:number,name?:string,datatypeIdentity?:unknown}} address */
@@ -263,18 +413,19 @@ export class S7CommPlusClient {
         if (errorItem === 1) {
           const code = response.cursor.integer(64);
           if (response.cursor.uint() !== 0) throw new PlusError('MALFORMED_RESPONSE', 'Unexpected additional item error');
-          this.#checkScalarTail(response.cursor);
+          this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
           throw new PlusError('ITEM_REJECTED', `Symbolic item 1 error 0x${code.toString(16)}; access cause not inferred`);
         }
         if (errorItem !== 0) throw new PlusError('MALFORMED_RESPONSE', 'Unexpected error item number');
-        this.#checkScalarTail(response.cursor);
+        this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
         throw new PlusError('DATA_UNAVAILABLE', 'PLC supplied neither value nor item error; not interpreted as zero');
       }
       if (item !== 1) throw new PlusError('DATA_UNAVAILABLE', 'PLC did not supply symbolic item 1; not interpreted as zero');
       const value = decodeValue(response.cursor);
       if (response.cursor.uint() !== 0 || response.cursor.uint() !== 0) throw new PlusError('MALFORMED_RESPONSE', 'Unexpected item or error list');
-      this.#checkScalarTail(response.cursor);
-      return { address: structuredClone(address), value, status: 'GOOD', receivedAt: new Date().toISOString(), nativeTimestamp: null };
+      this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
+      return { address: structuredClone(address), value, status: 'GOOD', receivedAt: new Date().toISOString(), nativeTimestamp: null,
+        correlation: response.correlation };
     } catch (error) { this.#stop(this.#asError(error)); throw error; }
   }
 
@@ -303,9 +454,18 @@ export class S7CommPlusClient {
     if (!this.connected) throw new PlusError('SESSION_REQUIRED', 'No usable S7CommPlus session');
   }
 
-  /** @param {Cursor} cursor */
-  #checkScalarTail(cursor) {
+  /** @param {Cursor} cursor @param {number|undefined} expected */
+  #checkIntegrity(cursor, expected) {
+    if (expected === undefined) return;
+    const observed = cursor.uint();
+    if (observed !== expected) throw new PlusError('INDETERMINATE_PROTOCOL_ERROR', 'Response integrity counter does not match the outstanding request', { expectedIntegrityId: expected, observedIntegrityId: observed });
+  }
+
+  /** @param {Cursor} cursor @param {number} [expectedIntegrityId] */
+  #checkScalarTail(cursor, expectedIntegrityId) {
+    this.#checkIntegrity(cursor, expectedIntegrityId);
     if (cursor.offset === cursor.bytes.length) return;
+    if (expectedIntegrityId !== undefined && cursor.bytes.length - cursor.offset === 4 && cursor.take(4).every(byte => byte === 0)) return;
     if (this.#version !== 1 || cursor.bytes.length - cursor.offset !== 1 || cursor.byte() !== 0) {
       throw new PlusError('UNSUPPORTED_DECODING', 'Unqualified response suffix or integrity profile');
     }
@@ -352,15 +512,18 @@ export class S7CommPlusClient {
         throw new PlusError('LATENCY_DEGRADATION', `Acquisition stopped at ${latencyMs.toFixed(1)} ms`);
       }
       if (!this.#baseline) this.#baseline = latencyMs;
-      if (operation.kind === 'initSSL' && incoming.version !== 1) throw new PlusError('PROTOCOL_VERSION_UNSUPPORTED', 'InitSSL did not use the qualified V1 envelope');
-      if (this.#ready && incoming.version !== this.#version) throw new PlusError('PROTOCOL_VERSION_UNSUPPORTED', 'Response changed the negotiated data protocol version');
-      let body = incoming.body;
-      if (context.integrityId !== undefined) {
-        const expected = vlq(context.integrityId);
-        if (!body.subarray(-expected.length).equals(expected)) throw new PlusError('INDETERMINATE_PROTOCOL_ERROR', 'Response integrity counter does not match the outstanding request', { expectedIntegrityId: context.integrityId });
-        body = body.subarray(0, -expected.length);
+      if (operation.kind === 'initSSL' && incoming.version !== 1 && !(this.#options.securityMode === 'tls' && incoming.version === 2)) {
+        throw new PlusError('PROTOCOL_VERSION_UNSUPPORTED', 'InitSSL envelope is not qualified for the explicitly selected security profile');
       }
-      return { ...responsePayload(body, PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)], sequence), version: incoming.version };
+      if (this.#ready && incoming.version !== this.#version) throw new PlusError('PROTOCOL_VERSION_UNSUPPORTED', 'Response changed the negotiated data protocol version');
+      const decoded = responsePayload(incoming.body, PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)], sequence, this.#tlsVerified && operation.kind === 'createSession');
+      if (decoded.statusDetails.returnValue !== '0x0000000000000000') {
+        this.#observations.push({ kind: 'createSessionStatus', ...decoded.statusDetails, interpretation: 'Session objects and setup must validate before establishment' });
+      }
+      const expectedIntegrityId = context.integrityId === undefined ? undefined : (sequence + context.integrityId) >>> 0;
+      return { ...decoded, version: incoming.version, expectedIntegrityId,
+        correlation: { sequence, functionCode: PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)],
+          integrityId: expectedIntegrityId ?? null, request: structuredClone(operation), responseBody: Buffer.from(incoming.body) } };
     } catch (error) {
       const failure = this.#asError(error);
       this.#stop(failure);
@@ -441,7 +604,10 @@ export class S7CommPlusClient {
   #onApplication(bytes) {
     const messages = this.#plus.feed(bytes);
     if (messages.length > 1 || (messages.length && !this.#pending)) throw new PlusError('CORRELATION', 'Unexpected unsolicited or duplicate response');
-    if (messages.length) this.#settle(messages[0]);
+    if (messages.length) {
+      if (this.#tlsVerified) this.#transcript.push({ direction: 'in', layer: 'S7CommPlus', version: messages[0].version, hex: messages[0].body.toString('hex') });
+      this.#settle(messages[0]);
+    }
   }
 
   async #activateTLS() {
@@ -452,9 +618,28 @@ export class S7CommPlusClient {
     this.#tunnel = tunnel;
     tunnel.on('error', error => this.#stop(new PlusError('TLS_HANDSHAKE_FAILED', error.message)));
     await this.#wait(() => {
+      const peerName = this.#options.tls?.servername ?? this.#host;
       this.#tls = connectTLS({ socket: tunnel, ca: this.#options.tls?.ca,
-        servername: this.#options.tls?.servername ?? this.#host, rejectUnauthorized: true,
-        minVersion: 'TLSv1.2', ecdhCurve: 'X25519' }, () => this.#settle(true));
+        servername: isIP(peerName) ? undefined : peerName, rejectUnauthorized: true,
+        checkServerIdentity: (_hostname, certificate) => checkServerIdentity(peerName, certificate),
+        minVersion: 'TLSv1.2', ecdhCurve: 'X25519',
+        ciphers: 'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256',
+        secureOptions: constants.SSL_OP_NO_TICKET | 0x00080000 | 0x00000001 }, () => {
+        const certificate = this.#tls?.getPeerCertificate().raw;
+        if (!this.#tls?.authorized || !certificate) {
+          this.#stop(new PlusError('CERTIFICATE_REJECTED', 'TLS peer certificate was not verified'));
+          return;
+        }
+        const observed = createHash('sha256').update(certificate).digest();
+        this.#peerCertificateSha256 = observed.toString('hex');
+        const expected = Buffer.from(this.#options.tls?.certificateSha256 ?? '', 'hex');
+        if (expected.length !== observed.length || !timingSafeEqual(observed, expected)) {
+          this.#stop(new PlusError('CERTIFICATE_PIN_MISMATCH', 'TLS peer does not match the independently approved certificate pin', { observedSha256: this.#peerCertificateSha256 }));
+          return;
+        }
+        this.#tlsVerified = true;
+        this.#settle(true);
+      });
       this.#tls.on('error', error => {
         const code = /** @type {NodeJS.ErrnoException} */ (error).code ?? '';
         const certificate = ['CERT_HAS_EXPIRED', 'DEPTH_ZERO_SELF_SIGNED_CERT', 'SELF_SIGNED_CERT_IN_CHAIN', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'UNABLE_TO_GET_ISSUER_CERT_LOCALLY', 'ERR_TLS_CERT_ALTNAME_INVALID'].includes(code);

@@ -6,14 +6,23 @@ The new Node.js codec and client were developed with reference to the MIT-licens
 Python project https://github.com/gijzelaerr/s7commplus at commit
 `245350ea0ca6327234e5032e781a99782334bc8f`.
 Inspected files: `protocol.py`, `vlq.py`, `codec.py`, `transport.py`,
-`connection.py`, `client.py`, and `server.py`.
+`connection.py`, `client.py`, `typeinfo.py`, and `server.py`.
 
 Protocol constants, framing, variable-length integer layouts, session object
 shapes, session-version echo and request layouts informed the implementation in
 `src/protocol/s7commplus/codec.js` and `src/client/s7commplus-client.js`.
 The reference emulator informed loopback tests. It is not evidence of real PLC
 compatibility. No Python package or reference emulator is a runtime dependency.
+The same pinned MIT reference also informed TLS-over-COTP options and certificate
+pin verification. The independently encoded CreateObject golden in
+`test/s7commplus-fixture.js` and differential runner retain its source/commit and
+distinguish emulator encoding from real-device capture evidence.
 The reference's experimental upload routine was not implemented or transmitted.
+The type-member/name list framing, offset-info variants, nested type references,
+array ordinals and distinction between browsed type CRCs and address CRCs also
+informed the self-contained JavaScript metadata decoder. Public metadata tests
+use independently constructed synthetic objects, not engineering archives or
+controller captures. No Python runtime is required.
 No source from the separately licensed thomas-v2/S7CommPlusDriver was incorporated.
 
 The MIT License (MIT)

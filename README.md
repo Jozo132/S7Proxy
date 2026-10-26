@@ -25,24 +25,98 @@ Requires Node.js >= 20.
 ## Native Read-Only S7CommPlus Foundation
 
 `S7CommPlusClient` is a separate experimental native backend with bounded object
-Explore and typed reads using known LID paths. It does not yet resolve names,
-inventory a controller, authenticate protected session profiles or upload program
-blocks. Existing DAQ, proxy and REST/WebSocket APIs remain classic S7Comm paths.
+Explore, native DB/type-member discovery and typed symbolic reads. It supports
+session-local name resolution after explicit block discovery. Protected
+SessionKey/credential profiles and program uploads remain unsupported.
+Existing DAQ, proxy and REST/WebSocket APIs remain classic S7Comm paths.
 
 For the production target, only the isolated read-only backend
 is permitted; the classic/raw backend rejects this IP. Other classic endpoints
 retain read/write behavior. No acquisition runs on import or normal server startup.
 
-The explicit `npm run explore:s7` command makes one bounded identification
-attempt and writes local content-addressed evidence under `backups/s7/`.
+The explicit `node src/plus-explore.js --live --legacy` command selects the
+plaintext legacy profile and makes one bounded identification attempt, writing
+local content-addressed evidence under `backups/production/`.
 It never retries, dumps blocks, schedules backups or modifies PLC configuration.
 Do not rerun it to investigate a rejection without reviewing the saved evidence.
-Production TLS is refused until its tunneled profile is qualified offline.
+Production TLS remains refused; offline qualification does not authorize a
+production probe. No automatic TLS/plaintext fallback is implemented.
 
-The single 2026-10-26 live attempt reached COTP and InitSSL but CreateObject was
-rejected. No CPU identity, online inventory or program backup was obtained.
+For a separately authorized lab target, configure `S7PROXY_LAB_HOST` separately
+from the production target and select `--lab --legacy` or `--lab --tls` explicitly.
+Establish that PLC's TCP/102 security profile independently before any attempt.
+TLS additionally requires `S7PLUS_TLS_CA`, `S7PLUS_TLS_CERT_SHA256` (64 hex digits
+over the peer certificate's DER), and optionally `S7PLUS_TLS_SERVERNAME` for a
+verified certificate name. The corresponding library field is
+`tls.certificateSha256`. CA, hostname and pin must all verify before CreateObject;
+pinning is not trust-on-first-use. Lab evidence uses `backups/lab/`.
+
+Historical plaintext CreateObject attempts were rejected; the numeric cause is
+not established. Subsequent authorized lab testing established verified
+TLS-over-COTP sessions, genuine RUN/protection replies, native DB/type metadata,
+and BOOL, INT and TIME reads. This does not qualify another controller or security
+profile, and no production retest is implied.
 See [the evidence and implementation report](docs/S7_READ_ONLY_REPORT.md)
 and [reference licensing](THIRD_PARTY_NOTICES.md).
+
+### Native symbol discovery
+
+```js
+import { readFile } from 'node:fs/promises';
+import { S7CommPlusClient } from 's7proxy';
+
+const host = process.env.S7PROXY_LAB_HOST;
+if (!host) throw new Error('Configure an authorized lab target first');
+const plc = new S7CommPlusClient({
+  host,
+  securityMode: 'tls',
+  tls: {
+    ca: await readFile(process.env.S7PLUS_TLS_CA),
+    certificateSha256: process.env.S7PLUS_TLS_CERT_SHA256,
+  },
+});
+try {
+  await plc.connect();
+  const block = await plc.getBlockMetadata({ type: 'DB', number: 7 });
+  const typeInfo = block.typeInfoId ? await plc.getTypeInfo(block.typeInfoId) : null;
+  const discovery = await plc.listBlockMembers({ type: 'DB', number: 7 });
+  const member = discovery.members.find(item => item.path === 'Enabled' && item.readable);
+  if (!member) throw new Error('Member unavailable in native metadata');
+  const result = await plc.readMember(member);
+  // Equivalent after discovery: await plc.readSymbol('SampleDB.Enabled');
+  console.log(block, typeInfo?.status, result.observation);
+} finally {
+  await plc.disconnect();
+}
+```
+
+The example names are synthetic. DB discovery retains the runtime object RID;
+LID 1 retrieves its native type reference, which can refer to a shared definition
+rather than a DB-specific type. `getTypeInfo()` explores that exact RID, not an
+unbounded catalog. Member/name lists retain native IDs, software datatypes, type
+references and CRCs independently of byte offsets.
+
+`listBlockMembers()` returns `{ block, members, completeness, diagnostics,
+evidence }`. Each member retains `memberId`, `typeInfoId`, `accessPath`,
+`datatype`, hierarchy and array dimensions. Structures and arrays include their
+containing context; struct-array access paths include the native element selector.
+Unknown types, references/pointers, recursive or unavailable types, ambiguous
+names, packed BOOL arrays and expansion limits remain explicit and unreadable.
+Defaults permit eight type queries and 4096 expanded members, still subject to
+the client's request/byte/time budgets. Raise session budgets explicitly when
+querying multiple blocks; there are no implicit reconnects or retries.
+
+`readMember()` accepts only readable descriptors discovered by that client.
+It checks the returned wire datatype and retains the raw value, request/response
+correlation, receipt time and metadata evidence. TIME is a signed 32-bit
+millisecond value. Browsed type-entry CRCs are preserved as metadata, not sent
+as address CRCs. Results identify their source as `S7COMMPLUS_RESPONSE`; consumers
+must distinguish real-controller acquisitions from loopback tests.
+
+Discovery is a bounded session snapshot, not a complete program inventory or
+proof of a downloaded project revision. Nested/array reconstruction is covered
+by synthetic tests; it is not blanket hardware qualification for all optimized
+DBs, FB sections or multi-instance layouts.
 
 ## Quick Start
 

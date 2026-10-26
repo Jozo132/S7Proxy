@@ -47,8 +47,11 @@ describe('local acquisition evidence (not a project backup)', () => {
     const report = { target: { host: '127.0.0.1', port: 1 }, protocol: 'fixture', identity: { deviceString: null },
       failure: { code: 'FIXTURE_REJECTED' }, transcript: [{ direction: 'in', layer: 'TPKT', hex: '03000007' }] };
     try {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-10-26T00:00:00.000Z'));
       const first = await saveAcquisitionEvidence(report, directory);
       const second = await saveAcquisitionEvidence(report, directory);
+      expect(first.manifest.createdAt).toBe(second.manifest.createdAt);
       expect(first.manifest.report.sha256).toBe(second.manifest.report.sha256);
       expect(first.manifest).toMatchObject({ status: 'INCOMPLETE', completeness: null, restorableProject: false, blockArtifacts: [] });
       expect(first.manifestPath).not.toBe(second.manifestPath);
@@ -58,7 +61,10 @@ describe('local acquisition evidence (not a project backup)', () => {
       expect((await readFile(join(directory, first.manifest.rawFrames[0].path))).toString('hex')).toBe('03000007');
       await writeFile(join(directory, first.manifest.report.path), 'corruption');
       await expect(saveAcquisitionEvidence(report, directory)).rejects.toThrow(/corrupt/);
-    } finally { await rm(directory, { recursive: true, force: true }); }
+    } finally {
+      vi.useRealTimers();
+      await rm(directory, { recursive: true, force: true });
+    }
   });
   it('does not lose 64-bit values or binary metadata during JSON serialization', () => {
     const result = JSON.parse(portableJSON({ count: 18446744073709551615n, raw: Buffer.from([1, 255]) }));

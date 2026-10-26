@@ -19,6 +19,15 @@ export function getProductionHost() {
   return host;
 }
 
+export function getLabHost() {
+  const host = process.env.S7PROXY_LAB_HOST;
+  if (host === undefined) return undefined;
+  if (!isIP(host) || ['127.0.0.1', '::1', '0.0.0.0', '::'].includes(host) || host === getProductionHost()) {
+    throw new Error('S7PROXY_LAB_HOST must identify a separate explicitly authorized lab PLC');
+  }
+  return host;
+}
+
 /** @param {string} host */
 export function assertClassicTarget(host) {
   if (host === getProductionHost()) {

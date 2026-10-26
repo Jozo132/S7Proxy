@@ -5,11 +5,46 @@ import { Duplex } from 'node:stream';
 import { TLSSocket, createSecureContext } from 'node:tls';
 import { FrameAssembler } from '../src/protocol/frame-assembler.js';
 import { Cursor, decodeObjects, u32, vlq } from '../src/protocol/s7commplus/codec.js';
+import { metadataExplore } from './s7commplus-metadata-fixture.js';
 
-/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},badIntegrity?:boolean,reference?:boolean,capturedReject?:boolean}} FixtureOptions */
+/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,initVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},abortTLS?:boolean,stallTLS?:boolean,badIntegrity?:boolean,reference?:boolean,compositeReject?:boolean,nonzeroCreateStatus?:boolean,metadata?:boolean,memberError?:boolean,memberTypeMismatch?:boolean}} FixtureOptions */
+
+/** @param {bigint} value */
+export function encodeTestUInt64(value) {
+  const groups = [];
+  for (let shift = 57; shift >= 8; shift -= 7) groups.push(0x80 | Number((value >> BigInt(shift)) & 0x7Fn));
+  return Buffer.from([...groups, Number(value & 0xFFn)]);
+}
 
 const stages = [0x05B3, 0x04CA, 0x0542];
+export const REFERENCE_CREATE_OBJECT = Object.freeze({
+  source: 'https://github.com/gijzelaerr/s7commplus',
+  commit: '245350ea0ca6327234e5032e781a99782334bc8f',
+  origin: 'connection.py:_create_session; independently encoded, not a real-PLC request capture',
+  sha256: '1097734503fe14af28a5b3ff6cd9861121f2a414dbb17d57f40bb67926972ed1',
+  hex: '720100b031000004ca0000000100000120360000011d00040000000000a1000000d3821f0000a3816900150a7337636f6d6d706c7573a38221001513313a3a3a362e303a3a7337636f6d6d706c7573a3822800150a7337636f6d6d706c7573a38229001500a3822a00150a7337636f6d6d706c7573a3822b000401a3822c001280c3c901a3822d001500a1000000d3817f0000a38169001515537562736372697074696f6e436f6e7461696e6572a2a20000000072010000',
+});
 const setupGolden = Buffer.from('0000004d010182320100170000013a823b00048400823f0015000000000004e88969001200000000896a001300896b00040000000000000000', 'hex');
+
+/** @param {Buffer} frame */
+export function normalizedReferenceCreate(frame) {
+  let result = Buffer.from(frame);
+  for (const [prefixHex, reference, own] of [
+    ['a381690015', 's7commplus', 'S7Proxy'],
+    ['a382210015', '1:::6.0::s7commplus', '1:::6.0::S7Proxy'],
+    ['a382280015', 's7commplus', 'S7Proxy'],
+    ['a3822a0015', 's7commplus', 'S7Proxy'],
+  ]) {
+    const prefix = Buffer.from(prefixHex, 'hex');
+    const before = Buffer.concat([prefix, Buffer.from([reference.length]), Buffer.from(reference)]);
+    const after = Buffer.concat([prefix, Buffer.from([own.length]), Buffer.from(own)]);
+    const offset = result.indexOf(before);
+    assert.ok(offset >= 0 && result.indexOf(before, offset + 1) < 0, 'Exactly one declared reference identity attribute');
+    result = Buffer.concat([result.subarray(0, offset), after, result.subarray(offset + before.length)]);
+  }
+  result.writeUInt16BE(result.length - 8, 2);
+  return result;
+}
 
 /** @param {Buffer} request @param {number} index @param {boolean} secure @param {boolean} reference */
 export function validateSessionRequest(request, index, secure = false, reference = false) {
@@ -28,6 +63,8 @@ export function validateSessionRequest(request, index, secure = false, reference
   const payload = request.subarray(18, -4);
   if (index === 0) assert.deepEqual(payload, Buffer.alloc(4));
   if (index === 1) {
+    const golden = Buffer.from(REFERENCE_CREATE_OBJECT.hex, 'hex');
+    assert.deepEqual(request, reference ? golden : normalizedReferenceCreate(golden), 'Complete independent reference CreateObject bytes');
     assert.deepEqual(payload.subarray(0, 11), Buffer.from('0000011d00040000000000', 'hex'));
     const objects = decodeObjects(new Cursor(payload.subarray(11)));
     assert.equal(objects.length, 2);
@@ -49,6 +86,8 @@ export async function fixture(options = {}) {
   const secureSockets = [];
   /** @type {{functionCode:number,sequence:number,receivedAt:number,frame:Buffer}[]} */
   const requests = [];
+  /** @type {Buffer[]} */
+  const cotpRequests = [];
   /** @type {string[]} */
   const errors = [];
   let tlsRecords = 0;
@@ -95,6 +134,7 @@ export async function fixture(options = {}) {
         if (options.versionSchema === 'duplicate') attributes.push({ id: 306, raw: version });
         if (options.challenge) attributes.push({ id: 303, raw: Buffer.from([0x10, 2, 1, 42]) });
         payload = Buffer.concat([Buffer.from([0, 1]), vlq(77), object(options.versionSchema === 'foreignOwner' ? 88 : 288, attributes, 287)]);
+        if (options.nonzeroCreateStatus) payload[0] = 18;
       } else if (functionCode === 0x04BB) {
         const objectId = request.readUInt32BE(18);
         payload = Buffer.concat([Buffer.from([0]), object(objectId, objectId === 52 ? [{ id: 0x8BD,
@@ -102,15 +142,36 @@ export async function fixture(options = {}) {
       } else if (functionCode === 0x0586) payload = Buffer.from(options.protectionMarker ? [0, 0, 0, 4, 2, 0] : [0, 0, 4, 2]);
       else if (functionCode === 0x054C) payload = options.itemError ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
         : Buffer.from([0, 1, 0, 8, 42, 0, 0, ...(options.badTail ? [99] : [])]);
+      if (options.metadata && functionCode === 0x04BB && request.readUInt32BE(18) !== 52) {
+        payload = Buffer.concat([Buffer.from([0]), metadataExplore(request.readUInt32BE(18))]);
+      }
+      if (options.metadata && functionCode === 0x054C && !options.itemError) {
+        const cursor = new Cursor(request.subarray(18, -4));
+        cursor.uint32(); cursor.uint(); cursor.uint();
+        assert.equal(cursor.uint(), 0, 'Browsed type-entry CRC must not be used as an address CRC');
+        cursor.uint();
+        const count = cursor.uint() - 1;
+        cursor.uint();
+        const path = Array.from({ length: count }, () => cursor.uint());
+        const value = path[0] === 1 ? Buffer.concat([Buffer.from([0, 18]), u32(0x92000007)])
+          : path.at(-1) === 107 ? Buffer.from([0, 7, 0xFF, 0x85])
+          : path.at(-1) === 112 ? Buffer.from([0, 8, 0x7F]) : Buffer.from([0, 1, 1]);
+        payload = options.memberError && path[0] !== 1 ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
+          : Buffer.concat([Buffer.from([0, 1]), options.memberTypeMismatch && path[0] !== 1 ? Buffer.from([0, 7, 0, 1]) : value, Buffer.from([0, 0])]);
+      }
       if (stages.indexOf(functionCode) === ['initSSL', 'createSession', 'setupSession'].indexOf(options.reject ?? '') && options.reject) payload = Buffer.from([1, 0]);
-      if (options.capturedReject && functionCode === 0x04CA) payload = Buffer.from('d180bae08087f3fdf80000000000', 'hex');
-      if (secureSocket && sequence > 2) payload = Buffer.concat([payload, vlq(options.badIntegrity ? 99 : sequence - 3)]);
+      if (options.compositeReject && functionCode === 0x04CA) payload = Buffer.concat([encodeTestUInt64(0x8000000000008001n), Buffer.alloc(5)]);
+      if (secureSocket && sequence > 2) {
+        const integrity = vlq(options.badIntegrity ? 99 : sequence + sequence - 3);
+        if (functionCode === 0x04BB) payload = Buffer.concat([payload.subarray(0, 1), u32(request.readUInt32BE(18)), integrity, payload.subarray(1), Buffer.alloc(4)]);
+        else payload = Buffer.concat([payload, integrity]);
+      }
       if (options.malformed === 'reserved') header[1] = 1;
       if (options.malformed === 'opcode') header[0] = 0x31;
       if (options.malformed === 'function') header.writeUInt16BE(0x054C, 3);
       if (options.malformed === 'genericError') header.writeUInt16BE(0x04B1, 3);
       const body = Buffer.concat([header, payload]);
-      const version = functionCode === 0x04CA ? options.createVersion ?? 1 : secureSocket && sequence >= 2 ? 2 : 1;
+      const version = functionCode === 0x05B3 ? options.initVersion ?? 1 : functionCode === 0x04CA ? options.createVersion ?? 1 : secureSocket && sequence >= 2 ? 2 : 1;
       const outer = Buffer.from([0x72, version, body.length >> 8, body.length & 255]);
       let plus = options.oversized ? Buffer.from('7201ffff', 'hex') : Buffer.concat([outer, body, Buffer.from([0x72, version, 0, 0])]);
       if (options.malformed === 'empty') plus = Buffer.from('72010000', 'hex');
@@ -120,6 +181,7 @@ export async function fixture(options = {}) {
       if (options.malformed === 'duplicate') plus = Buffer.concat([plus, plus]);
       if (options.malformed === 'cotp') { socket.write(Buffer.from('0300000702e080', 'hex')); return; }
       if (secureSocket) secureSocket.write(plus); else sendDT(plus);
+      if (options.abortTLS && functionCode === 0x05B3) { socket.end(); return; }
       if (options.malformed === 'truncated') socket.end();
       if (options.tls && functionCode === 0x05B3) {
         tunnel = new Duplex({ read() {}, write(chunk, encoding, callback) { sendDT(Buffer.from(chunk)); callback(); } });
@@ -137,8 +199,9 @@ export async function fixture(options = {}) {
       try {
         for (const frame of assembler.feed(bytes)) {
           if (frame[5] === 0xE0) {
+            cotpRequests.push(Buffer.from(frame));
             socket.write(Buffer.from(options.smallTpdu ? '0300000e09d00001000100c00107' : '0300000e09d00001000100c0010a', 'hex'));
-          } else if (tunnel) { tlsRecords++; tunnel.push(frame.subarray(7)); }
+          } else if (tunnel) { tlsRecords++; if (!options.stallTLS) tunnel.push(frame.subarray(7)); }
           else onApplication(frame.subarray(7));
         }
       } catch (error) { errors.push(String(error)); socket.destroy(); }
@@ -147,7 +210,7 @@ export async function fixture(options = {}) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', () => resolve(undefined)));
   const address = server.address();
   if (!address || typeof address === 'string') throw new Error('No fixture address');
-  return { port: address.port, requests, errors, get tlsRecords() { return tlsRecords; }, close: async () => {
+  return { port: address.port, requests, cotpRequests, errors, get tlsRecords() { return tlsRecords; }, close: async () => {
     for (const socket of secureSockets) socket.destroy();
     for (const socket of sockets) socket.destroy();
     await new Promise(resolve => server.close(() => resolve(undefined)));

@@ -275,8 +275,8 @@ export class PlusAssembler {
   }
 }
 
-/** @param {Buffer} body @param {number} expectedFunction @param {number} sequence */
-export function responsePayload(body, expectedFunction, sequence) {
+/** @param {Buffer} body @param {number} expectedFunction @param {number} sequence @param {boolean} [verifiedTlsCreate] */
+export function responsePayload(body, expectedFunction, sequence, verifiedTlsCreate = false) {
   if (body.length < 11 || ![0x32, 0x02].includes(body[0]) || body[1] || body[2] || body[5] || body[6]) {
     throw new PlusError('MALFORMED_RESPONSE', 'Invalid ten-byte response header or missing ReturnValue');
   }
@@ -292,20 +292,95 @@ export function responsePayload(body, expectedFunction, sequence) {
   const payload = body.subarray(10);
   const cursor = new Cursor(payload);
   const status = cursor.integer(64);
-  if (status !== 0n) {
+  const serviceResultCode = status & (1n << 63n) ? Number(BigInt.asIntN(16, status)) : status <= 32767n ? Number(status) : null;
+  const statusDetails = {
+    ...identifiers, returnValue: `0x${status.toString(16).padStart(16, '0')}`,
+    returnValueHex: payload.subarray(0, cursor.offset).toString('hex'), returnValueBodyOffset: 10,
+    returnValueBytes: cursor.offset, remainingPayloadBytes: payload.length - cursor.offset, serviceResultCode,
+  };
+  if (expectedFunction === PLUS_FUNCTION.createSession && serviceResultCode === -134) {
+    throw new PlusError('ENGINEERING_SESSION_IN_USE', 'PLC reports Service Multi-ES Not Supported; release other engineering connections before an explicit new attempt', statusDetails);
+  }
+  if (status !== 0n && !(verifiedTlsCreate && expectedFunction === PLUS_FUNCTION.createSession && serviceResultCode !== null && serviceResultCode >= 0)) {
     const code = expectedFunction === PLUS_FUNCTION.initSSL ? 'INITSSL_REJECTED'
       : expectedFunction === PLUS_FUNCTION.createSession ? 'SESSION_CREATE_REJECTED'
       : expectedFunction === PLUS_FUNCTION.setupSession ? 'SESSION_SETUP_REJECTED' : 'PLC_REJECTED';
-    throw new PlusError(code, `PLC ReturnValue 0x${status.toString(16).padStart(16, '0')}; access cause not inferred`, {
-      ...identifiers, returnValue: `0x${status.toString(16).padStart(16, '0')}`,
-      returnValueHex: payload.subarray(0, cursor.offset).toString('hex'), returnValueBodyOffset: 10,
-      returnValueBytes: cursor.offset, remainingPayloadBytes: payload.length - cursor.offset,
-    });
+    throw new PlusError(code, `PLC ReturnValue ${statusDetails.returnValue}; access cause not inferred`, statusDetails);
   }
-  return { cursor, payload };
+  return { cursor, payload, statusDetails };
 }
 
-/** @typedef {{rid:number,classId:number,classFlags:number,attributeId:number,parentRid:number|null,attributes:{id:number,value:PlusValue}[]}} PlusObject */
+/** @typedef {{code:number,optimizedOffset:number,standardOffset:number,relationId:number|null,dimensions:{lowerBound:number,count:number}[],raw:Buffer}} TypeOffset */
+/** @typedef {{lid:number,symbolCrc:number,softdatatype:number,attributeFlags:number,bitFlags:number,offset:TypeOffset}} TypeMember */
+/** @typedef {{rid:number,classId:number,classFlags:number,attributeId:number,attributeFlags?:number,parentRid:number|null,attributes:{id:number,value:PlusValue}[],typeMembers?:TypeMember[],memberNames?:string[],firstMemberId?:number}} PlusObject */
+
+/** @param {Cursor} cursor @returns {TypeOffset} */
+function decodeTypeOffset(cursor, code = 8) {
+  const lengths = [104, 4, 12, 20, 68, 32, 48, 96, 4, 12, 20, 68, 32, 48, 96, 40];
+  const raw = Buffer.from(cursor.take(lengths[code]));
+  const optimizedOffset = code === 1 ? raw.readUInt16LE(2) : code === 8 ? raw.readUInt16LE(0) : raw.readUInt32LE(4);
+  const standardOffset = code === 1 ? raw.readUInt16LE(0) : code === 8 ? raw.readUInt16LE(2) : raw.readUInt32LE(8);
+  const multidimensional = [4, 7, 11, 14].includes(code);
+  const oneDimensional = [3, 6, 10, 13].includes(code);
+  const relationOffset = [5, 12, 15].includes(code) ? 12 : [6, 13].includes(code) ? 28 : [7, 14].includes(code) ? 76 : code === 0 ? 12 : null;
+  /** @type {{lowerBound:number,count:number}[]} */
+  const dimensions = [];
+  if (oneDimensional) dimensions.push({ lowerBound: raw.readInt32LE(12), count: raw.readUInt32LE(16) });
+  if (multidimensional) {
+    let ended = false;
+    let total = 1;
+    for (let axis = 0; axis < 6; axis++) {
+      const count = raw.readUInt32LE(44 + axis * 4);
+      if (!count) { ended = true; continue; }
+      if (ended) throw new PlusError('MALFORMED_METADATA', 'Non-contiguous array dimensions');
+      dimensions.unshift({ lowerBound: raw.readInt32LE(20 + axis * 4), count });
+      total *= count;
+    }
+    if (!dimensions.length || total !== raw.readUInt32LE(16)) throw new PlusError('MALFORMED_METADATA', 'Array dimension product differs from element count');
+  }
+  return { code, optimizedOffset, standardOffset, relationId: relationOffset === null ? null : raw.readUInt32LE(relationOffset), dimensions, raw };
+}
+
+/** @param {Cursor} cursor */
+function decodeTypeMembers(cursor) {
+  /** @type {TypeMember[]} */
+  const members = [];
+  let firstMemberId;
+  while (true) {
+    const length = cursor.take(2).readUInt16BE();
+    if (!length) return { members, firstMemberId };
+    const block = new Cursor(cursor.take(length));
+    if (firstMemberId === undefined) firstMemberId = block.take(4).readUInt32LE();
+    if (block.offset === block.bytes.length) throw new PlusError('MALFORMED_METADATA', 'Empty type-member block');
+    while (block.offset < block.bytes.length) {
+      if (members.length >= 4096) throw new PlusError('RESPONSE_LIMIT', 'Type-member budget exceeded');
+      const lid = block.take(4).readUInt32LE();
+      const symbolCrc = block.take(4).readUInt32LE();
+      const softdatatype = block.byte();
+      const attributeFlags = block.take(2).readUInt16BE();
+      const bitFlags = block.byte();
+      members.push({ lid, symbolCrc, softdatatype, attributeFlags, bitFlags, offset: decodeTypeOffset(block, attributeFlags >>> 12) });
+    }
+  }
+}
+
+/** @param {Cursor} cursor */
+function decodeMemberNames(cursor) {
+  /** @type {string[]} */
+  const names = [];
+  while (true) {
+    const length = cursor.take(2).readUInt16BE();
+    if (!length) return names;
+    const block = new Cursor(cursor.take(length));
+    while (block.offset < block.bytes.length) {
+      if (names.length >= 4096) throw new PlusError('RESPONSE_LIMIT', 'Member-name budget exceeded');
+      const name = new TextDecoder('utf-8', { fatal: true }).decode(block.take(block.byte()));
+      if (block.byte() !== 0) throw new PlusError('MALFORMED_METADATA', 'Member name is not terminated');
+      names.push(name);
+    }
+  }
+}
+
 /** @param {Cursor} cursor @param {number} [maxObjects] */
 export function decodeObjects(cursor, maxObjects = 32) {
   /** @type {PlusObject[]} */
@@ -320,8 +395,10 @@ export function decodeObjects(cursor, maxObjects = 32) {
     }
     if (tag === 0xA1) {
       if (objects.length >= maxObjects || stack.length >= 16) throw new PlusError('RESPONSE_LIMIT', 'Object/depth budget exceeded');
+      /** @type {PlusObject} */
       const object = { rid: cursor.uint32(), classId: cursor.uint(), classFlags: cursor.uint(), attributeId: cursor.uint(),
         parentRid: stack.at(-1)?.rid ?? null, attributes: /** @type {{id:number,value:PlusValue}[]} */ ([]) };
+      if (object.attributeId) object.attributeFlags = cursor.uint();
       objects.push(object); stack.push(object);
     } else if (tag === 0xA2) {
       if (!stack.pop()) throw new PlusError('MALFORMED_RESPONSE', 'Unbalanced object terminator');
@@ -329,6 +406,16 @@ export function decodeObjects(cursor, maxObjects = 32) {
       const current = /** @type {PlusObject} */ (stack.at(-1));
       if (current.attributes.length >= 128) throw new PlusError('RESPONSE_LIMIT', 'Attribute budget exceeded');
       current.attributes.push({ id: cursor.uint(), value: decodeValue(cursor) });
+    } else if (tag === 0xAB && stack.length) {
+      const current = /** @type {PlusObject} */ (stack.at(-1));
+      if (current.typeMembers) throw new PlusError('MALFORMED_METADATA', 'Duplicate type-member list');
+      const decoded = decodeTypeMembers(cursor);
+      current.typeMembers = decoded.members;
+      current.firstMemberId = decoded.firstMemberId;
+    } else if (tag === 0xAC && stack.length) {
+      const current = /** @type {PlusObject} */ (stack.at(-1));
+      if (current.memberNames) throw new PlusError('MALFORMED_METADATA', 'Duplicate member-name list');
+      current.memberNames = decodeMemberNames(cursor);
     } else throw new PlusError('UNSUPPORTED_DECODING', `Unhandled object element 0x${tag.toString(16)} at ${cursor.offset - 1}; raw bytes retained`);
   }
   if (stack.length) throw new PlusError('MALFORMED_RESPONSE', 'Unclosed object tree');

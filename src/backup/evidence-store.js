@@ -1,5 +1,5 @@
 // @ts-check
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 
@@ -51,7 +51,7 @@ export async function saveAcquisitionEvidence(report, directory = 'backups/produ
     unavailable: ['Qualified program-block upload', 'Full-controller inventory', 'Independently verified restorable backup'],
   };
   const manifestBytes = Buffer.from(portableJSON(manifest));
-  const manifestPath = join(root, `${manifest.createdAt.replace(/[:.]/g, '-')}-${sha256(manifestBytes).slice(0, 12)}.json`);
+  const manifestPath = join(root, `${manifest.createdAt.replace(/[:.]/g, '-')}-${sha256(manifestBytes).slice(0, 12)}-${randomUUID()}.json`);
   await writeFile(manifestPath, manifestBytes, { flag: 'wx', mode: 0o600 });
   return { manifestPath, manifest };
 }

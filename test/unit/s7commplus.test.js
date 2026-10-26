@@ -5,9 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { rootCertificates } from 'node:tls';
+import { X509Certificate } from 'node:crypto';
 import { Cursor, decodeValue, vlq, u32, PlusAssembler, encodeOperation, assertOutgoing, responsePayload, decodeObjects } from '../../src/protocol/s7commplus/codec.js';
 import { S7CommPlusClient } from '../../src/client/s7commplus-client.js';
-import { fixture, validateSessionRequest } from '../s7commplus-fixture.js';
+import { fixture, validateSessionRequest, encodeTestUInt64 } from '../s7commplus-fixture.js';
 
 const context = { version: 1, sessionId: 0x12345678 };
 describe('S7CommPlus read-only codec', () => {
@@ -56,6 +57,18 @@ describe('S7CommPlus read-only codec', () => {
     expect(result[0].attributes[0].value.value[0]).toMatchObject({ id: 0xD9E, value: { value: 8 } });
     expect(() => decodeObjects(new Cursor(bytes.subarray(0, -1)))).toThrow(/Unclosed/);
   });
+  it('decodes an independently constructed rich Explore header and RUN structure', () => {
+    const body = Buffer.concat([Buffer.from('32000004bb0000000334', 'hex'), Buffer.from([0]), u32(48), vlq(3),
+      Buffer.from([0xA1]), u32(52), vlq(2179), vlq(48), vlq(2393), vlq(6),
+      Buffer.from([0xA3]), vlq(0x8BD), Buffer.from([0, 23]), u32(0xD99),
+      vlq(0xD9E), Buffer.from([0, 8, 8, 0, 0xA2]), Buffer.alloc(4)]);
+    const { cursor } = responsePayload(body, 0x04BB, 3);
+    expect(cursor.uint32()).toBe(48);
+    expect(cursor.uint()).toBe(3);
+    const objects = decodeObjects(cursor);
+    expect(objects[0]).toMatchObject({ rid: 52, classId: 2179, classFlags: 48, attributeId: 2393, attributeFlags: 6 });
+    expect(objects[0].attributes[0].value.value).toContainEqual(expect.objectContaining({ id: 0xD9E, value: expect.objectContaining({ datatype: 8, value: 8 }) }));
+  });
   it('reassembles segmented replies only with the explicit end trailer', () => {
     const parser = new PlusAssembler();
     expect(parser.feed(Buffer.from('720100026162', 'hex'))).toEqual([]);
@@ -76,17 +89,20 @@ describe('S7CommPlus read-only codec', () => {
     expect(() => responsePayload(Buffer.concat([header, Buffer.from([0])]), 0x04BB, 3)).toThrow(/sequence/);
     expect(() => responsePayload(Buffer.concat([header, Buffer.from([1])]), 0x04BB, 2)).toThrow(/ReturnValue/);
   });
-  it('decodes the recorded rejection at its real boundary without interpreting its cause', () => {
+  it('decodes an independently constructed composite rejection at the header boundary', () => {
     const parser = new PlusAssembler();
-    const messages = parser.feed(Buffer.from('7201001832000004ca0000000134d180bae08087f3fdf8000000000072010000', 'hex'));
+    const status = encodeTestUInt64(0x8000000000008001n);
+    const body = Buffer.concat([Buffer.from('32000004ca0000000134', 'hex'), status, Buffer.alloc(5)]);
+    const outer = Buffer.from([0x72, 1, 0, body.length]);
+    const messages = parser.feed(Buffer.concat([outer, body, Buffer.from([0x72, 1, 0, 0])]));
     expect(messages).toHaveLength(1);
     const cursor = new Cursor(messages[0].body.subarray(10));
-    expect(cursor.integer(64)).toBe(0xa201d60001f9fdf8n);
+    expect(cursor.integer(64)).toBe(0x8000000000008001n);
     expect(cursor.offset).toBe(9);
     try { responsePayload(messages[0].body, 0x04CA, 1); throw new Error('Expected rejection'); }
     catch (error) {
       expect(error).toMatchObject({ code: 'SESSION_CREATE_REJECTED', details: {
-        returnValue: '0xa201d60001f9fdf8', returnValueHex: 'd180bae08087f3fdf8', returnValueBodyOffset: 10,
+        returnValue: '0x8000000000008001', returnValueHex: status.toString('hex'), returnValueBodyOffset: 10,
         returnValueBytes: 9, remainingPayloadBytes: 5,
       } });
     }
@@ -96,8 +112,31 @@ describe('S7CommPlus read-only codec', () => {
     header[1] = 1;
     expect(() => responsePayload(Buffer.concat([header, Buffer.from([1])]), 0x04CA, 1)).toThrow(/header/);
     header[1] = 0; header.writeUInt16BE(0x04B1, 3);
-    try { responsePayload(Buffer.concat([header, Buffer.from('d180bae08087f3fdf8', 'hex')]), 0x04CA, 1); }
+    try { responsePayload(Buffer.concat([header, encodeTestUInt64(0x8000000000008001n)]), 0x04CA, 1); }
     catch (error) { expect(error).toMatchObject({ code: 'INDETERMINATE_PROTOCOL_ERROR' }); expect(/** @type {any} */ (error).details.returnValue).toBeUndefined(); }
+  });
+  it('permits inspection of a nonzero CreateObject status only for verified TLS, never other services', () => {
+    const body = Buffer.from('32000004ca000000013612014d', 'hex');
+    expect(() => responsePayload(body, 0x04CA, 1)).toThrow(/ReturnValue/);
+    const decoded = responsePayload(body, 0x04CA, 1, true);
+    expect(decoded.statusDetails.returnValue).toBe('0x0000000000000012');
+    expect(decoded.cursor.byte()).toBe(1);
+    expect(decoded.cursor.uint()).toBe(77);
+    body.writeUInt16BE(0x04BB, 3);
+    expect(() => responsePayload(body, 0x04BB, 1, true)).toThrow(/ReturnValue/);
+  });
+  it('classifies a synthetic Multi-ES composite result and never treats a negative status as success', () => {
+    const body = Buffer.concat([Buffer.from('32000004ca0000000136', 'hex'), encodeTestUInt64(0x800000000000FF7An), Buffer.from([0])]);
+    for (const verifiedTls of [false, true]) {
+      try { responsePayload(body, 0x04CA, 1, verifiedTls); throw new Error('Expected rejection'); }
+      catch (error) {
+        expect(error).toMatchObject({ code: 'ENGINEERING_SESSION_IN_USE', details: {
+          returnValue: '0x800000000000ff7a', serviceResultCode: -134,
+        } });
+      }
+    }
+    const rejected = Buffer.concat([Buffer.from('32000004ca0000000134', 'hex'), encodeTestUInt64(0x8000000000008001n), Buffer.alloc(5)]);
+    expect(() => responsePayload(rejected, 0x04CA, 1, true)).toThrow(/ReturnValue/);
   });
 });
 
@@ -132,7 +171,7 @@ describe('S7CommPlus loopback lifecycle (never live)', () => {
   });
   it.each([
     [{ state: 4 }, 'CPU_STATE', 4],
-    [{ challenge: true }, 'AUTHENTICATION_REQUIRED', 2],
+    [{ challenge: true }, 'LEGACY_SESSION_KEY_REQUIRED', 2],
     [{ wrongSequence: true }, 'CORRELATION', 1],
     [{ oversized: true }, 'RESPONSE_LIMIT', 1],
     [{ smallTpdu: true }, 'UNSUPPORTED_TRANSPORT', 0],
@@ -184,6 +223,19 @@ describe('S7CommPlus loopback lifecycle (never live)', () => {
     vi.stubEnv('S7PROXY_PRODUCTION_HOST', '192.0.2.10');
     try {
       expect(() => new S7CommPlusClient({ securityMode: 'tls', tls: { ca: 'fixture-only-not-a-certificate' } })).toThrow(/not qualified/);
+    } finally { vi.unstubAllEnvs(); }
+  });
+  it('requires an explicit lab profile without relaxing the separate production target', () => {
+    vi.stubEnv('S7PROXY_PRODUCTION_HOST', '192.0.2.10');
+    vi.stubEnv('S7PROXY_LAB_HOST', '192.0.2.11');
+    try {
+      expect(() => new S7CommPlusClient({ host: '192.0.2.11' })).toThrow(/profile/);
+      const lab = new S7CommPlusClient({ host: '192.0.2.11', securityMode: 'legacy' });
+      expect(lab.report).toMatchObject({ selectedProfile: 'LEGACY_PLAINTEXT', productionReadOnly: true });
+      expect(() => new S7CommPlusClient({ host: '192.0.2.11', securityMode: /** @type {any} */ ('auto') })).toThrow(/fallback/);
+      expect(() => new S7CommPlusClient({ host: '192.0.2.10', securityMode: 'tls', tls: { ca: 'fixture', certificateSha256: '00'.repeat(32) } })).toThrow(/not qualified/);
+      vi.stubEnv('S7PROXY_LAB_HOST', '192.0.2.10');
+      expect(() => new S7CommPlusClient({ host: '192.0.2.10', securityMode: 'legacy' })).toThrow(/separate/);
     } finally { vi.unstubAllEnvs(); }
   });
   it.each([
@@ -241,37 +293,100 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
   let directory = '';
   /** @type {{key:Buffer,cert:Buffer}} */
   let credentials;
+  let certificateSha256 = '';
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 's7proxy-loopback-tls-'));
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-noenc', '-keyout', join(directory, 'key.pem'),
       '-out', join(directory, 'cert.pem'), '-days', '1', '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1'], { stdio: 'ignore' });
     credentials = { key: await readFile(join(directory, 'key.pem')), cert: await readFile(join(directory, 'cert.pem')) };
+    certificateSha256 = new X509Certificate(credentials.cert).fingerprint256.replaceAll(':', '').toLowerCase();
   });
   afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
-  it('carries TLS inside COTP, creates V1 then sets up V2 and correlates counters', async () => {
+  it('verifies an IP SAN without sending an IP address as TLS SNI', async () => {
     const server = await fixture({ tls: credentials });
-    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls', tls: { ca: credentials.cert, servername: 'localhost' } });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 } });
+    try {
+      await client.connect();
+      expect(client.report.securityMode).toBe('TLS_VERIFIED');
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['valid', 'missing', 'duplicate', 'foreignOwner', 'rejected'])('validates all session objects despite a nonzero TLS CreateObject status: %s', async schema => {
+    const server = await fixture({ tls: credentials, nonzeroCreateStatus: true,
+      versionSchema: schema === 'missing' || schema === 'duplicate' || schema === 'foreignOwner' ? schema : undefined,
+      compositeReject: schema === 'rejected' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, servername: 'localhost', certificateSha256 } });
+    try {
+      if (schema === 'valid') {
+        await client.connect();
+        expect(client.report.sessionEstablished).toBe(true);
+        expect(client.report.observations).toContainEqual(expect.objectContaining({ kind: 'createSessionStatus', returnValue: '0x0000000000000012' }));
+      } else {
+        await expect(client.connect()).rejects.toMatchObject({ code: 'SESSION_CREATE_REJECTED' });
+        expect(client.report.sessionEstablished).toBe(false);
+        expect(server.requests).toHaveLength(2);
+      }
+      expect(client.report.transcript.some(entry => entry.direction === 'in' && entry.layer === 'S7CommPlus')).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each([1, 2])('carries TLS after InitSSL V%s, creates V1 then sets up V2 and correlates counters', async initVersion => {
+    const server = await fixture({ tls: credentials, initVersion });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls', tls: { ca: credentials.cert, servername: 'localhost', certificateSha256 } });
     try {
       await client.connect();
       const result = await client.readSymbolic({ accessArea: 0x8A0E0001, lids: [1] });
       expect(result.value.value).toBe(42);
-      expect(client.report).toMatchObject({ securityMode: 'TLS_VERIFIED', protocolVersion: 2, sessionEstablished: true });
+      expect(client.report).toMatchObject({ securityMode: 'TLS_VERIFIED', peerCertificateSha256: certificateSha256, protocolVersion: 2, sessionEstablished: true });
       expect(server.requests.map(request => request.frame[1])).toEqual([1, 1, 2, 2, 2, 2]);
       expect(server.tlsRecords).toBeGreaterThan(0);
       expect(server.errors).toEqual([]);
     } finally { await client.disconnect(); await server.close(); }
   });
-  it.each(['wrongHost', 'untrustedCA', 'abort', 'badIntegrity'])('stops without downgrade on %s', async mode => {
-    const server = await fixture({ tls: mode === 'abort' ? undefined : credentials, badIntegrity: mode === 'badIntegrity' });
+  it('does not mistake a legacy challenge for a password requirement after verified TLS', async () => {
+    const server = await fixture({ tls: credentials, challenge: true });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
-      tls: { ca: mode === 'untrustedCA' ? rootCertificates[0] : credentials.cert, servername: mode === 'wrongHost' ? 'wrong.invalid' : 'localhost' }, limits: { requestTimeoutMs: 500 } });
+      tls: { ca: credentials.cert, servername: 'localhost', certificateSha256 } });
     try {
-      const code = mode === 'badIntegrity' ? 'INDETERMINATE_PROTOCOL_ERROR' : mode === 'abort' ? 'PEER_CLOSED' : 'CERTIFICATE_REJECTED';
+      await client.connect();
+      expect(client.report).toMatchObject({ securityMode: 'TLS_VERIFIED', sessionEstablished: true, effectiveProtectionLevel: 2, cpuState: 'RUN' });
+      expect(server.requests).toHaveLength(5);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['wrongHost', 'untrustedCA', 'wrongPin', 'abort', 'stallTLS', 'badIntegrity'])('stops without downgrade on %s', async mode => {
+    const server = await fixture({ tls: mode === 'abort' ? undefined : credentials, abortTLS: mode === 'abort', stallTLS: mode === 'stallTLS', badIntegrity: mode === 'badIntegrity' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: mode === 'untrustedCA' ? rootCertificates[0] : credentials.cert, servername: mode === 'wrongHost' ? 'wrong.invalid' : 'localhost', certificateSha256: mode === 'wrongPin' ? '00'.repeat(32) : certificateSha256 }, limits: { requestTimeoutMs: 500 } });
+    try {
+      const code = mode === 'badIntegrity' ? 'INDETERMINATE_PROTOCOL_ERROR' : mode === 'abort' ? 'PEER_CLOSED' : mode === 'stallTLS' ? 'TIMEOUT' : mode === 'wrongPin' ? 'CERTIFICATE_PIN_MISMATCH' : 'CERTIFICATE_REJECTED';
       await expect(client.connect()).rejects.toMatchObject({ code });
       expect(client.report.failure).toMatchObject({ code, phase: mode === 'badIntegrity' ? 'ready' : 'tls' });
       expect(server.requests).toHaveLength(mode === 'badIntegrity' ? 4 : 1);
+      if (mode === 'wrongPin') expect(client.report).toMatchObject({ securityMode: 'TLS_UNVERIFIED', peerCertificateSha256: certificateSha256 });
       expect(client.connected).toBe(false);
       if (mode !== 'abort') expect(server.errors).toEqual([]);
     } finally { await client.disconnect(); await server.close(); }
+  });
+  it('rejects missing and malformed pins before opening a socket', () => {
+    for (const pin of [undefined, '', 'bad']) {
+      expect(() => new S7CommPlusClient({ host: '127.0.0.1', securityMode: 'tls', tls: { ca: credentials.cert, certificateSha256: pin } })).toThrow(/certificate pin/);
+    }
+  });
+  it('does not treat a V2 InitSSL envelope as permission for plaintext CreateObject', async () => {
+    const server = await fixture({ initVersion: 2 });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy' });
+    try {
+      await expect(client.connect()).rejects.toMatchObject({ code: 'PROTOCOL_VERSION_UNSUPPORTED' });
+      expect(server.requests).toHaveLength(1);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('requires an explicit CLI profile and an approved pin before reading CA files or connecting', () => {
+    expect(() => execFileSync(process.execPath, ['src/plus-explore.js', '--live'], { stdio: 'pipe' })).toThrow();
+    expect(() => execFileSync(process.execPath, ['src/plus-explore.js', '--live', '--lab', '--tls'], {
+      stdio: 'pipe', env: { ...process.env, S7PROXY_PRODUCTION_HOST: '192.0.2.10', S7PROXY_LAB_HOST: '192.0.2.11', S7PLUS_TLS_CA: '/nonexistent/ca.pem', S7PLUS_TLS_CERT_SHA256: '' },
+    })).toThrow(/approved certificate pin/);
   });
 });
