@@ -1,6 +1,6 @@
 // @ts-check
 // ─────────────────────────────────────────────────────────────────────────────
-// Sample 1 — Read DB1.INT0 from a real S7-1200 PLC at 192.168.20.236
+// Sample 1 — Read DB1.INT0 from an explicitly supplied S7-1200 PLC
 //
 // Demonstrates five approaches, executed 5 seconds apart:
 //   1. node-snap7 native client
@@ -12,7 +12,7 @@
 // Approaches 4 & 5 share a single S7Proxy child process.
 //
 // PLC config (to be verified):
-//   IP:   192.168.20.236
+//   IP:   supplied as the first command-line argument
 //   Rack: 0   Slot: 1
 //   DB1, INT at byte offset 0  →  readInt16BE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -21,7 +21,7 @@ import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { WebSocket } from 'ws';
-import snap7 from 'node-snap7';
+import { isIP } from 'node:net';
 import { S7Client } from '../../../src/compat/s7client.js';
 import { PlcConnection } from '../../../src/client/plc-connection.js';
 import { WasmBridge } from '../../../src/wasm/bridge.js';
@@ -31,7 +31,9 @@ import { createLogger } from '../../../src/logging/logger.js';
 import { S7AreaDB, S7WLWord } from '../../../src/protocol/constants.js';
 
 // ─── PLC parameters (update as needed) ──────────────────────────────────────
-const PLC_IP   = '192.168.20.236';
+const PLC_IP = process.argv[2];
+if (!PLC_IP || !isIP(PLC_IP)) throw new Error('Usage: node test/samples/sample1_plc/index.js <plc-ip>');
+const snap7 = (await import('node-snap7')).default;
 const PLC_RACK = 0;
 const PLC_SLOT = 1;
 

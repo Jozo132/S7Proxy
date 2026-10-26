@@ -2,7 +2,7 @@
 // Integration test — Full ProxyServer start/stop lifecycle
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { startDemoServer } from '../demo-server.js';
+import { startIntegrationDemoServer as startDemoServer } from '../helpers.js';
 
 /** @type {import('../demo-server.js').DemoServer} */
 let demo;

@@ -10,7 +10,7 @@ S7Comm proxy and client library with an AssemblyScript WASM protocol engine. Con
 - **Structured DB access** — define PLC data block layouts, read/write as plain JS objects with automatic encode/decode
 - **REST + WebSocket API** — lightweight built-in HTTP endpoints and real-time WebSocket push with slow-consumer protection
 - **S7Comm proxy** — transparent TCP proxy with TSAP/IP-based routing and allow/deny filtering
-- **snap7 compatibility** — drop-in `S7Client` and `S7Server` replacements for the `node-snap7` API
+- **snap7 compatibility** — `S7Client` read/write subset and `S7Server`; unimplemented metadata, upload and control methods return explicit errors
 - **Worker thread mode** — run the proxy in an isolated worker
 - **Prometheus metrics** — built-in `/metrics` endpoint
 
@@ -21,6 +21,28 @@ npm install s7proxy
 ```
 
 Requires Node.js >= 20.
+
+## Native Read-Only S7CommPlus Foundation
+
+`S7CommPlusClient` is a separate experimental native backend with bounded object
+Explore and typed reads using known LID paths. It does not yet resolve names,
+inventory a controller, authenticate protected session profiles or upload program
+blocks. Existing DAQ, proxy and REST/WebSocket APIs remain classic S7Comm paths.
+
+For the production target, only the isolated read-only backend
+is permitted; the classic/raw backend rejects this IP. Other classic endpoints
+retain read/write behavior. No acquisition runs on import or normal server startup.
+
+The explicit `npm run explore:s7` command makes one bounded identification
+attempt and writes local content-addressed evidence under `backups/s7/`.
+It never retries, dumps blocks, schedules backups or modifies PLC configuration.
+Do not rerun it to investigate a rejection without reviewing the saved evidence.
+Production TLS is refused until its tunneled profile is qualified offline.
+
+The single 2026-10-26 live attempt reached COTP and InitSSL but CreateObject was
+rejected. No CPU identity, online inventory or program backup was obtained.
+See [the evidence and implementation report](docs/S7_READ_ONLY_REPORT.md)
+and [reference licensing](THIRD_PARTY_NOTICES.md).
 
 ## Quick Start
 

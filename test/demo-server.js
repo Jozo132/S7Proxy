@@ -3,10 +3,7 @@
 // Registers DB1 (100 bytes), DB2 (256 bytes), MK (64 bytes), PE (32 bytes), PA (32 bytes)
 // with pre-filled test patterns so integration tests can read known values.
 
-import snap7 from 'node-snap7';
-
-/** @type {*} */
-const snap7Any = snap7;
+import { S7Server } from '../src/compat/s7server.js';
 
 const DEFAULT_IP = '127.0.0.1';
 
@@ -15,6 +12,7 @@ const DEFAULT_IP = '127.0.0.1';
  * @property {string}  [ip='127.0.0.1']
  * @property {boolean} [silent=false]
  * @property {number} [port=102]
+ * @property {'native'|'compat'} [backend='native']
  */
 
 /**
@@ -68,8 +66,11 @@ export async function startDemoServer(opts = {}) {
   const silent = opts.silent ?? false;
   const port = opts.port ?? 102;
 
-  const server = new snap7Any.S7Server();
-  if (!server.SetParam(server.LocalPort, port)) throw new Error('Failed to set demo server port');
+  const backend = opts.backend ?? 'native';
+  if (!['native', 'compat'].includes(backend)) throw new Error('Unknown demo server backend');
+  const Server = backend === 'compat' ? S7Server : (await import('node-snap7')).default.S7Server;
+  const server = new Server();
+  if (!server.SetParam(1, port)) throw new Error('Failed to set demo server port');
 
   // Memory areas
   const db1 = Buffer.alloc(100);

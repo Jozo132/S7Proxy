@@ -6,6 +6,7 @@ import { Socket } from 'node:net';
 import { EventEmitter } from 'node:events';
 import { FrameAssembler } from '../protocol/frame-assembler.js';
 import { WasmBridge } from '../wasm/bridge.js';
+import { assertClassicTarget } from '../protocol/production-policy.js';
 import { S7_DEFAULT_PORT, CONNTYPE_PG, calcTsap, DEFAULT_PDU_SIZE, DEFAULT_AMQ, COTP_CC, S7_FN_SETUP_COMM, S7_MSG_ACK } from '../protocol/constants.js';
 
 /** @import { PlcEndpoint, PlcConnectionInfo, ParsedPDU } from '../protocol/types.js' */
@@ -64,6 +65,7 @@ export class PlcConnection extends EventEmitter {
    */
   constructor(id, targetId, endpoint, bridge, logger, requestTimeoutMs = 3000) {
     super();
+    assertClassicTarget(endpoint.ip);
     this.id = id;
     this.targetId = targetId;
     this.endpoint = endpoint;
@@ -96,6 +98,7 @@ export class PlcConnection extends EventEmitter {
 
   /** Open TCP connection, perform COTP + S7 handshake. @returns {Promise<void>} */
   connect() {
+    assertClassicTarget(this.endpoint.ip);
     if (this.#disconnectPromise) return this.#disconnectPromise.then(() => this.connect());
     if (this.#state === 'ready') return Promise.resolve();
     if (this.#connectPromise) return this.#connectPromise;

@@ -18,10 +18,10 @@ describe('parseCliArgs', () => {
   });
 
   it('accepts inline values for web api overrides', () => {
-    const parsed = parseCliArgs(['--web-host=192.168.1.20', '--web-port=8081']);
+    const parsed = parseCliArgs(['--web-host=192.0.2.20', '--web-port=8081']);
 
     expect(parsed.overrides).toEqual({
-      webHost: '192.168.1.20',
+      webHost: '192.0.2.20',
       webPort: 8081,
     });
   });

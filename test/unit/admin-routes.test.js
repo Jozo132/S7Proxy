@@ -100,7 +100,7 @@ describe('Admin routes', () => {
       url: '/admin/api/targets',
       payload: {
         id: 'plc-admin',
-        primary: { ip: '192.168.0.10', rack: 0, slot: 1 },
+        primary: { ip: '192.0.2.10', rack: 0, slot: 1 },
         maxConnections: 2,
       },
     });
@@ -182,7 +182,7 @@ describe('Admin routes', () => {
   it('disables a config target when deleting it from the admin API', async () => {
     config.targets.push({
       id: 'plc-config',
-      primary: { ip: '192.168.10.10', rack: 0, slot: 1 },
+      primary: { ip: '198.51.100.10', rack: 0, slot: 1 },
       maxConnections: 2,
     });
 

@@ -1,6 +1,6 @@
 // @ts-check
 // -----------------------------------------------------------------------------
-// Sample 2 - Write and verify DB1.INT0 on a real S7-1200 PLC at 192.168.20.236
+// Sample 2 - Write and verify DB1.INT0 on an explicitly supplied S7-1200 PLC
 //
 // Demonstrates five approaches, executed 5 seconds apart:
 //   1. node-snap7 native client
@@ -23,7 +23,7 @@ import { fork } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { WebSocket } from 'ws';
-import snap7 from 'node-snap7';
+import { isIP } from 'node:net';
 import { S7Client } from '../../../src/compat/s7client.js';
 import { PlcConnection } from '../../../src/client/plc-connection.js';
 import { WasmBridge } from '../../../src/wasm/bridge.js';
@@ -39,7 +39,9 @@ import {
 } from '../../../src/protocol/constants.js';
 
 // ---- PLC parameters ---------------------------------------------------------
-const PLC_IP = '192.168.20.236';
+const PLC_IP = process.argv[2];
+if (!PLC_IP || !isIP(PLC_IP)) throw new Error('Usage: node test/samples/sample2_plc_write/index.js <plc-ip>');
+const snap7 = (await import('node-snap7')).default;
 const PLC_RACK = 0;
 const PLC_SLOT = 1;
 

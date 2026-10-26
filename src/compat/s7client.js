@@ -52,6 +52,7 @@ const errCliNotConnected = 0x0007;
 const errCliSendingPDU = 0x00300000;
 const errCliDataRead = 0x00400000;
 const errCliDataWrite = 0x00500000;
+const errCliFunctionNotImplemented = 0x00F00000;
 
 /** @type {Record<number, string>} */
 const ERROR_TEXTS = {
@@ -68,6 +69,7 @@ const ERROR_TEXTS = {
   0x00300000: 'Error sending PDU',
   0x00400000: 'Error reading data',
   0x00500000: 'Error writing data',
+  0x00F00000: 'Function not implemented; no PLC operation performed',
 };
 
 /**
@@ -546,9 +548,7 @@ export class S7Client extends EventEmitter {
    * @returns {number | false | void}
    */
   PlcStatus(callback) {
-    const status = this.Connected() ? S7Client.S7CpuStatusRun : S7Client.S7CpuStatusUnknown;
-    if (callback) { callback(0, status); return; }
-    return status;
+    return this.#unsupported(callback);
   }
 
   /**
@@ -557,15 +557,7 @@ export class S7Client extends EventEmitter {
    * @returns {object | false | void}
    */
   GetCpuInfo(callback) {
-    const info = {
-      ModuleTypeName: 'S7Proxy Virtual CPU',
-      SerialNumber: '000000000000',
-      ASName: 'S7Proxy',
-      Copyright: 'S7Proxy',
-      ModuleName: 'S7Proxy',
-    };
-    if (callback) { callback(0, info); return; }
-    return info;
+    return this.#unsupported(callback);
   }
 
   /**
@@ -574,14 +566,7 @@ export class S7Client extends EventEmitter {
    * @returns {object | false | void}
    */
   GetCpInfo(callback) {
-    const info = {
-      MaxPduLength: this.#conn?.pduSize ?? DEFAULT_PDU_SIZE,
-      MaxConnections: DEFAULT_AMQ,
-      MaxMpiRate: 0,
-      MaxBusRate: 0,
-    };
-    if (callback) { callback(0, info); return; }
-    return info;
+    return this.#unsupported(callback);
   }
 
   /**
@@ -590,9 +575,7 @@ export class S7Client extends EventEmitter {
    * @returns {object | false | void}
    */
   GetOrderCode(callback) {
-    const info = { Code: 'S7Proxy-WASM', V1: 1, V2: 0, V3: 0 };
-    if (callback) { callback(0, info); return; }
-    return info;
+    return this.#unsupported(callback);
   }
 
   /**
@@ -609,101 +592,95 @@ export class S7Client extends EventEmitter {
   // ═══════════════════════════════════════════════
 
   /** @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  PlcHotStart(callback) { if (callback) { callback(0); return; } return true; }
+  PlcHotStart(callback) { return this.#unsupported(callback); }
   /** @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  PlcColdStart(callback) { if (callback) { callback(0); return; } return true; }
+  PlcColdStart(callback) { return this.#unsupported(callback); }
   /** @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  PlcStop(callback) { if (callback) { callback(0); return; } return true; }
+  PlcStop(callback) { return this.#unsupported(callback); }
 
   /** @param {((err: number, data?: Date) => void)} [callback] @returns {Date | false | void} */
   GetPlcDateTime(callback) {
-    const dt = new Date();
-    if (callback) { callback(0, dt); return; }
-    return dt;
+    return this.#unsupported(callback);
   }
 
   /** @param {Date | object} _dateTime @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  SetPlcDateTime(_dateTime, callback) { if (callback) { callback(0); return; } return true; }
+  SetPlcDateTime(_dateTime, callback) { return this.#unsupported(callback); }
   /** @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  SetPlcSystemDateTime(callback) { if (callback) { callback(0); return; } return true; }
+  SetPlcSystemDateTime(callback) { return this.#unsupported(callback); }
 
   /** @param {number} _id @param {number} _index @param {((err: number, data?: Buffer) => void)} [callback] @returns {Buffer | false | void} */
   ReadSZL(_id, _index, callback) {
-    if (callback) { callback(0, Buffer.alloc(0)); return; }
-    return Buffer.alloc(0);
+    return this.#unsupported(callback);
   }
 
   /** @param {((err: number, data?: number[]) => void)} [callback] @returns {number[] | false | void} */
   ReadSZLList(callback) {
-    if (callback) { callback(0, []); return; }
-    return [];
+    return this.#unsupported(callback);
   }
 
   /** @param {((err: number, data?: object) => void)} [callback] @returns {object | false | void} */
   GetProtection(callback) {
-    const prot = { sch_schal: 0, sch_par: 0, sch_rel: 0, bart_sch: 1, anl_sch: 0 };
-    if (callback) { callback(0, prot); return; }
-    return prot;
+    return this.#unsupported(callback);
   }
 
   /** @param {string} _password @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  SetSessionPassword(_password, callback) { if (callback) { callback(0); return; } return true; }
+  SetSessionPassword(_password, callback) { return this.#unsupported(callback); }
   /** @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  ClearSessionPassword(callback) { if (callback) { callback(0); return; } return true; }
+  ClearSessionPassword(callback) { return this.#unsupported(callback); }
 
   /** @param {((err: number, data?: object) => void)} [callback] @returns {object | false | void} */
   ListBlocks(callback) {
-    const result = { OBCount: 0, FBCount: 0, FCCount: 0, SFBCount: 0, SFCCount: 0, DBCount: 0, SDBCount: 0 };
-    if (callback) { callback(0, result); return; }
-    return result;
+    return this.#unsupported(callback);
   }
 
   /** @param {number} _blockType @param {((err: number, data?: number[]) => void)} [callback] @returns {number[] | false | void} */
   ListBlocksOfType(_blockType, callback) {
-    if (callback) { callback(0, []); return; }
-    return [];
+    return this.#unsupported(callback);
   }
 
   /** @param {number} _blockType @param {number} _blockNum @param {((err: number, data?: object) => void)} [callback] @returns {object | false | void} */
   GetAgBlockInfo(_blockType, _blockNum, callback) {
-    if (callback) { callback(0, {}); return; }
-    return {};
+    return this.#unsupported(callback);
   }
 
   /** @param {Buffer} _buffer @returns {object | false} */
-  GetPgBlockInfo(_buffer) { return {}; }
+  GetPgBlockInfo(_buffer) { this.#unsupported(); return false; }
 
   /** @param {number} _blockType @param {number} _blockNum @param {((err: number, data?: Buffer) => void)} [callback] @returns {Buffer | false | void} */
   Upload(_blockType, _blockNum, callback) {
-    if (callback) { callback(0, Buffer.alloc(0)); return; }
-    return Buffer.alloc(0);
+    return this.#unsupported(callback);
   }
 
   /** @param {number} _blockType @param {number} _blockNum @param {number} _size @param {((err: number, data?: Buffer) => void)} [callback] @returns {Buffer | false | void} */
   FullUpload(_blockType, _blockNum, _size, callback) {
-    if (callback) { callback(0, Buffer.alloc(0)); return; }
-    return Buffer.alloc(0);
+    return this.#unsupported(callback);
   }
 
   /** @param {number} _blockNum @param {Buffer} _buffer @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  Download(_blockNum, _buffer, callback) { if (callback) { callback(0); return; } return true; }
+  Download(_blockNum, _buffer, callback) { return this.#unsupported(callback); }
 
   /** @param {number} _blockType @param {number} _blockNum @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  Delete(_blockType, _blockNum, callback) { if (callback) { callback(0); return; } return true; }
+  Delete(_blockType, _blockNum, callback) { return this.#unsupported(callback); }
 
   /** @param {number} _dbNumber @param {((err: number, data?: Buffer) => void)} [callback] @returns {Buffer | false | void} */
   DBGet(_dbNumber, callback) {
-    if (callback) { callback(0, Buffer.alloc(0)); return; }
-    return Buffer.alloc(0);
+    return this.#unsupported(callback);
   }
 
   /** @param {number} _dbNumber @param {number} _fillChar @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  DBFill(_dbNumber, _fillChar, callback) { if (callback) { callback(0); return; } return true; }
+  DBFill(_dbNumber, _fillChar, callback) { return this.#unsupported(callback); }
 
   /** @param {number} _timeout @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  CopyRamToRom(_timeout, callback) { if (callback) { callback(0); return; } return true; }
+  CopyRamToRom(_timeout, callback) { return this.#unsupported(callback); }
   /** @param {number} _timeout @param {((err: number) => void)} [callback] @returns {boolean | void} */
-  Compress(_timeout, callback) { if (callback) { callback(0); return; } return true; }
+  Compress(_timeout, callback) { return this.#unsupported(callback); }
+
+  /** @param {((err: number) => void)} [callback] @returns {false | void} */
+  #unsupported(callback) {
+    this.#lastError = errCliFunctionNotImplemented;
+    if (callback) { callback(this.#lastError); return; }
+    return false;
+  }
 
   // ═══════════════════════════════════════════════
   //  Internal async operations

@@ -8,6 +8,7 @@ import { createWasmImports } from '../src/wasm/imports.js';
 import { createLogger } from '../src/logging/logger.js';
 
 /** @typedef {import('./demo-server.js').DemoServer} DemoServer */
+/** @typedef {import('./demo-server.js').DemoServerOptions} DemoServerOptions */
 
 /**
  * @typedef {Object} TestContext
@@ -19,6 +20,13 @@ import { createLogger } from '../src/logging/logger.js';
 /** @type {TestContext | null} */
 let ctx = null;
 
+/** @param {DemoServerOptions} [options] */
+export async function startIntegrationDemoServer(options = {}) {
+  const backend = process.env.S7PROXY_TEST_BACKEND ?? 'compat';
+  if (backend !== 'compat' && backend !== 'native') throw new Error('S7PROXY_TEST_BACKEND must be compat or native');
+  return startDemoServer({ backend, ...options, silent: true });
+}
+
 /**
  * Set up the demo PLC server and WASM bridge. Reuses a single instance
  * across all tests in the same vitest worker.
@@ -29,7 +37,7 @@ export async function setup(options = {}) {
   if (ctx) return ctx;
 
   const logger = createLogger({ level: 'silent' });
-  const demo = await startDemoServer({ ...options, silent: true });
+  const demo = await startIntegrationDemoServer(options);
   const imports = createWasmImports(logger);
   const engine = await loadWasmEngine(imports);
   const bridge = new WasmBridge(engine);

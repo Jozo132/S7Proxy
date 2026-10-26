@@ -105,7 +105,7 @@ describe('AdminStore', () => {
   it('saves and loads a target', () => {
     store.saveTarget({
       id: 'plc1',
-      primary: { ip: '192.168.1.10', rack: 0, slot: 1, port: 102 },
+      primary: { ip: '192.0.2.10', rack: 0, slot: 1, port: 102 },
       maxConnections: 4,
       requestTimeoutMs: 3000,
       keepAliveIntervalMs: 30000,
@@ -114,7 +114,7 @@ describe('AdminStore', () => {
     const targets = store.loadTargets();
     expect(targets).toHaveLength(1);
     expect(targets[0].id).toBe('plc1');
-    expect(targets[0].primary.ip).toBe('192.168.1.10');
+    expect(targets[0].primary.ip).toBe('192.0.2.10');
     expect(targets[0].maxConnections).toBe(4);
     expect(targets[0].requestTimeoutMs).toBe(3000);
     expect(targets[0].keepAliveIntervalMs).toBe(30000);

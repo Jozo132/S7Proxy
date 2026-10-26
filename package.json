@@ -1,7 +1,7 @@
 {
   "name": "s7proxy",
-  "version": "0.3.1",
-  "description": "S7Comm proxy with AssemblyScript WASM protocol engine",
+  "version": "0.3.2",
+  "description": "S7Comm/S7CommPlus proxy with AssemblyScript WASM protocol engine",
   "type": "module",
   "exports": {
     ".": {
@@ -20,7 +20,8 @@
     "public/",
     "build/s7engine.wasm",
     "config/default.json",
-    "README.md"
+    "README.md",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "start": "node src/index.js",
@@ -30,7 +31,8 @@
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
     "test:watch": "vitest",
-    "check-types": "tsc --project jsconfig.json --noEmit"
+    "check-types": "tsc --project jsconfig.json --noEmit",
+    "explore:production": "node src/plus-explore.js --live"
   },
   "engines": {
     "node": ">=20.0.0"

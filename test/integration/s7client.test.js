@@ -3,7 +3,7 @@
 
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { createServer } from 'node:net';
-import { startDemoServer } from '../demo-server.js';
+import { startIntegrationDemoServer as startDemoServer } from '../helpers.js';
 import { S7Client } from '../../src/compat/s7client.js';
 
 /** @type {import('../demo-server.js').DemoServer} */
@@ -265,11 +265,11 @@ describe('S7Client (snap7-compatible)', () => {
     expect(client.ErrorText(0x0007)).toContain('not connected');
   });
 
-  it('should return GetCpuInfo', () => {
+  it('should explicitly reject unimplemented GetCpuInfo', () => {
     const client = createClient();
     const info = client.GetCpuInfo();
-    expect(info).toBeTruthy();
-    expect(/** @type {any} */ (info).ModuleTypeName).toContain('S7Proxy');
+    expect(info).toBe(false);
+    expect(client.ErrorText(client.LastError())).toContain('not implemented');
   });
 
   it('should error on read when not connected', () => {
