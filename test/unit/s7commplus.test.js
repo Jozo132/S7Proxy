@@ -9,6 +9,7 @@ import { X509Certificate } from 'node:crypto';
 import { Cursor, decodeValue, vlq, u32, PlusAssembler, encodeOperation, assertOutgoing, responsePayload, decodeObjects } from '../../src/protocol/s7commplus/codec.js';
 import { S7CommPlusClient } from '../../src/client/s7commplus-client.js';
 import { fixture, validateSessionRequest, encodeTestUInt64 } from '../s7commplus-fixture.js';
+import { saveSoftwareSnapshot, verifySoftwareSnapshot } from '../helpers/program-store.js';
 
 const context = { version: 1, sessionId: 0x12345678 };
 describe('S7CommPlus read-only codec', () => {
@@ -302,6 +303,76 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
     certificateSha256 = new X509Certificate(credentials.cert).fingerprint256.replaceAll(':', '').toLowerCase();
   });
   afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
+  it.each(['complete', 'failure', 'limit', 'empty', 'timeout'])('captures native software components without mode-control operations: %s', async mode => {
+    const server = await fixture({ tls: credentials, programContent: true,
+      programFailure: mode === 'failure', programEmpty: mode === 'empty', programStall: mode === 'timeout' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 },
+      limits: { maxRequests: mode === 'limit' ? 9 : 16, requestTimeoutMs: mode === 'timeout' ? 400 : 1500 } });
+    try {
+      await client.connect();
+      const result = await client.uploadProgram();
+      expect(result.restorable).toBe(false);
+      expect(result.cpuState.before).toBe('RUN');
+      if (mode === 'complete') {
+        expect(result.status).toBe('AVAILABLE_COMPONENTS_CAPTURED');
+        expect(result.artifacts).toHaveLength(3);
+        expect(result.totalContentBytes).toBe(12);
+        expect(result.files.map(file => file.name)).toEqual([
+          'DB7-interface-description.bin', 'FC8-code-block.bin', 'OB9-code-block.bin',
+        ]);
+        expect(result.files.map(file => file.bytes)).toEqual(result.artifacts.map(artifact => artifact.rawBytes));
+        expect(result.files.reduce((sum, file) => sum + file.byteCount, 0)).toBe(12);
+        expect(result.artifacts.every(artifact => artifact.transfer.protocolFragmentCount === 2)).toBe(true);
+        expect(result.cpuState.after).toBe('RUN');
+        const saved = await saveSoftwareSnapshot(result, join(directory, 'snapshots'));
+        expect(await verifySoftwareSnapshot(saved.manifestPath)).toMatchObject({ valid: true, protocolBlocksVerified: 3, protocolEvidenceUnavailable: 0 });
+      } else {
+        expect(result.status).toBe('PARTIAL');
+        if (mode === 'failure') expect(result.failure?.code).toBe('PLC_REJECTED');
+        if (mode === 'limit') { expect(result.failure?.code).toBe('REQUEST_LIMIT'); expect(result.cpuState.after).toBe('RUN'); }
+        if (mode === 'timeout') expect(result.failure?.code).toBe('TIMEOUT');
+        if (mode === 'empty') {
+          expect(result.artifacts.every(artifact => artifact.status === 'UNAVAILABLE')).toBe(true);
+          expect(result.files).toEqual([]);
+        } else {
+          expect(result.files.map(file => file.name)).toEqual(mode === 'timeout' ? [] : ['DB7-interface-description.bin']);
+        }
+      }
+      expect(server.requests.every(request => [0x05B3, 0x04CA, 0x0542, 0x04BB, 0x0586].includes(request.functionCode))).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('rejects concurrent acquisitions and cancels an active upload by disconnecting its own session', async () => {
+    const server = await fixture({ tls: credentials, programContent: true, programStall: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 }, limits: { maxRequests: 16, requestTimeoutMs: 2000 } });
+    try {
+      await client.connect();
+      const acquisition = client.uploadProgram();
+      await expect(client.uploadProgram()).rejects.toMatchObject({ code: 'CONCURRENCY_LIMIT' });
+      const deadline = Date.now() + 1800;
+      while (server.requests.length < 8 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+      expect(server.requests).toHaveLength(8);
+      await client.disconnect();
+      expect(await acquisition).toMatchObject({ status: 'PARTIAL', failure: { code: 'DISCONNECTED' }, cpuState: { after: 'UNKNOWN' } });
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['protected', 'no-selected'])('records %s blocks explicitly without sending unqualified content requests', async mode => {
+    const server = await fixture({ tls: credentials, programContent: true, programProtected: mode === 'protected' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 }, limits: { maxRequests: 16 } });
+    try {
+      await client.connect();
+      const result = await client.uploadProgram({ include: mode === 'protected' ? ['DB', 'FC', 'OB'] : ['FB'] });
+      expect(result.status).toBe(mode === 'protected' ? 'PARTIAL' : 'UNAVAILABLE');
+      expect(result.cpuState).toEqual({ before: 'RUN', after: 'RUN' });
+      expect(result.omissions).toContainEqual(expect.objectContaining({ status: mode === 'protected' ? 'PROTECTED_BLOCK' : 'NOT_OBSERVED_IN_BOUNDED_INVENTORY' }));
+      expect(server.requests.some(request => request.functionCode === 0x04BB && request.frame.readUInt32BE(18) === 0x8A130008)).toBe(false);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
   it('verifies an IP SAN without sending an IP address as TLS SNI', async () => {
     const server = await fixture({ tls: credentials });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',

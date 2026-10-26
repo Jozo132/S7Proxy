@@ -1,21 +1,42 @@
 // @ts-check
+// Test-only persistence for synthetic fixtures and acquisition assertions.
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, open, lstat, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 
 /** @param {Buffer} bytes */
 export function sha256(bytes) { return createHash('sha256').update(bytes).digest('hex'); }
 
-/** @param {string} directory @param {Buffer} bytes */
-async function storeContent(directory, bytes) {
+/** @param {string} path @param {number} maximum */
+export async function readBoundedContent(path, maximum) {
+  const entry = await lstat(path);
+  if (!entry.isFile()) throw new Error(`Content-addressed artifact is not a regular file: ${path}`);
+  const handle = await open(path, 'r');
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > maximum) throw new Error(`Content-addressed artifact is corrupt or exceeds its byte budget: ${path}`);
+    const bytes = Buffer.alloc(info.size + 1);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, null);
+      if (!bytesRead) break;
+      offset += bytesRead;
+    }
+    if (offset !== info.size) throw new Error(`Content-addressed artifact changed during verification: ${path}`);
+    return bytes.subarray(0, offset);
+  } finally { await handle.close(); }
+}
+
+/** @param {string} directory @param {Buffer} bytes @param {string} [namespace] */
+export async function storeContent(directory, bytes, namespace = 'content') {
   const hash = sha256(bytes);
   const path = join(directory, `${hash}.bin`);
   try { await writeFile(path, bytes, { flag: 'wx', mode: 0o600 }); }
   catch (error) {
     if (/** @type {NodeJS.ErrnoException} */ (error).code !== 'EEXIST') throw error;
-    if (sha256(await readFile(path)) !== hash) throw new Error(`Content-addressed evidence is corrupt: ${path}`);
+    if (sha256(await readBoundedContent(path, bytes.length)) !== hash) throw new Error(`Content-addressed evidence is corrupt: ${path}`);
   }
-  return { sha256: hash, byteCount: bytes.length, path: `content/${hash}.bin` };
+  return { sha256: hash, byteCount: bytes.length, path: `${namespace}/${hash}.bin` };
 }
 
 /** @param {unknown} value */

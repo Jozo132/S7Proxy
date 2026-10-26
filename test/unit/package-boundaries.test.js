@@ -21,6 +21,7 @@ describe('standalone package boundaries', () => {
           const specifier = match[1] ?? match[2];
           if (specifier.startsWith('.')) {
             expect(fileURLToPath(new URL(specifier, url)).startsWith(fileURLToPath(root)), `${url.pathname}: ${specifier}`).toBe(true);
+            expect(new URL(specifier, url).href.startsWith(new URL('src/', root).href), `Runtime import of test-only storage: ${specifier}`).toBe(true);
           } else {
             const name = specifier.startsWith('@') ? specifier.split('/').slice(0, 2).join('/') : specifier.split('/')[0];
             expect(isBuiltin(specifier) || dependencies.has(name), `${url.pathname}: ${specifier}`).toBe(true);

@@ -1,10 +1,17 @@
 # S7 Native Read-Only Acquisition Report
 
-**Current outcome: verified lab TLS sessions, native DB/type-member discovery
-and typed BOOL/INT/TIME reads succeeded. No program blocks were uploaded.**
+**Current outcome: verified lab TLS sessions, native symbolic reads, genuine
+FC/OB code-content extraction and DB definition extraction succeeded. Two
+software captures produced unchanged component hashes. Full-controller and
+restorable backups remain unsupported; no CPU mode changes were transmitted.**
 
 Sections B-G retain historical investigation evidence; section H records the
-subsequent native-symbol milestone and supersedes earlier capability limits.
+subsequent native-symbol milestone. Section I supersedes earlier program-upload
+limits; historical statements remain scoped to their original investigation.
+
+Storage API update: uploads now return in-memory `files` arrays. Historical
+filesystem snapshot/evidence helpers below are test-only, not library exports.
+Consumers own persistence and backup policy; see the current README.
 
 ## A. Implemented Backend and Data Flow
 
@@ -338,3 +345,82 @@ uploaded bytes: zero.
 Final standalone validation: 332 tests passed in 24 files, JavaScript typecheck
 passed, and all six pinned-reference scenarios passed. Package dry-run inspection
 included the native decoder and excluded captures, certificates and test fixtures.
+
+## I. Native Program-Content Milestone (2026-10-26)
+
+Genuine read-only program-content extraction succeeded through the existing
+verified TLS V2 session. The qualified operation is native Explore of the
+inventoried block RID, not the reference's experimental `upload_block()` payload.
+Public attribute-name evidence identified Code block (2580), Body Description
+(2533), Interface Description (2544), Line Comments (2546), and external/internal
+reference data (2582/2583). Block Language is 2523, not 2522; actual BOOL responses
+at 2522 exposed the pinned reference's incorrect language label.
+
+The bounded native inventory identified two DBs, one FC and one OB. FBs, UDTs and
+tag tables were not observed; this does not prove their absence on other CPUs.
+Original code BLOBs and keyed sparse-BLOB bodies/interfaces/comments/reference
+data were retrieved without interpreting or stripping their internal headers.
+
+| Native artifact | Primary payload bytes | All retrieved component payload bytes |
+| --- | ---: | ---: |
+| First DB interface, definition only | 940 | 1083 |
+| Second DB interface, definition only | 194 | 210 |
+| FC code content | 282 | 2235 |
+| OB code content | 286 | 2620 |
+| Total | 1702 | 6148 |
+
+Both FC and OB code payloads were nonempty. The FC's first two public-API reads
+returned identical SHA-256 hashes. Subsequent complete captures of the four
+observed objects also returned unchanged component hashes. The final pair used
+one 19-request session lasting approximately 6.5 seconds. Genuine CPU state was
+RUN before and after each
+capture. No process writes, downloads, mode controls, credential guesses,
+production connections or automatic retries were issued.
+
+Each snapshot stores immutable original component payloads, typed-attribute
+headers and response bodies in content-addressed objects. Each final manifest
+referenced 37 distinct objects. Independent on-disk verification passed for both:
+all four block responses were redecoded, matched to their inventory/request
+identities, checked for sequence/integrity consistency and compared with saved
+component hashes and declared lengths. Protocol end markers and fragment order
+are checked at acquisition; counts describe Plus frames, not TCP/TLS records.
+Manifest verification does not authenticate arbitrary caller-provided data as
+real hardware. Actual captures and controller identifiers remain private.
+
+The exported APIs are `listProgramBlocks()`, `uploadProgramBlock()` and
+`uploadProgram({ mode: 'run' })`, plus `saveSoftwareSnapshot()`,
+`verifySoftwareSnapshot()`, `diffSoftwareSnapshots()` and
+`getS7CommPlusOperationPolicy()`. Extraction is restricted to the qualified
+verified-TLS/access-level/native-protection profile. Unknown/protected objects,
+empty content, missing components, budget exhaustion and partial failures are
+explicit. Incremental storage deduplicates bytes after reading; unqualified
+version/CRC metadata never suppresses a read.
+
+The result is `BLOCK_CONTENT` / `SOFTWARE_UPLOAD`, **not a full-controller,
+complete load-memory, editable engineering-archive or independently restorable
+backup**. DB interfaces are not mislabeled as executable code. Dependencies are
+retained as opaque native reference artifacts, not falsely decoded relationships.
+Controller-state completeness, initial/retentive data, hardware configuration,
+memory-card content, atomic revision consistency and restoration remain
+unqualified. Siemens' official
+[backup comparison](https://docs.tia.siemens.cloud/r/en-us/v20/creating-a-backup-of-an-s7-cpu/backup-options-for-s7-cpus)
+distinguishes RUN-capable uploads from STOP-only consistent online-device backups;
+it does not establish the corresponding native protocol for this library.
+
+STOP/START remain denied before serialization and immediately before
+transmission. No mode-control encoder, automatic restart, authorization issuer
+or qualified interactive STOP workflow was added. A STOP-required selection
+returns `EXPLICIT_CPU_STOP_CONFIRMATION_REQUIRED`; saved, automated, forced and
+target-mismatched acknowledgements cannot enable control. Further offline
+command qualification and a separately approved operator/equipment procedure
+are prerequisites, not authorization conferred by this milestone.
+
+Final validation: 392 tests passed in 26 files; standalone typecheck passed.
+All six pinned-reference interoperability scenarios were rerun successfully,
+including the deliberate rejection of an invalid reference-emulator object tree.
+Coverage includes framing/fragment completion, sparse BLOB boundaries, identity
+correlation, explicit empty/unsupported results, protected-block omission,
+timeouts/cancellation, concurrency/request limits, malformed and corrupt
+manifests, immutable deduplication, snapshot diffs and eleven fabricated
+mode-authorization attempts. Package inspection found 57 files, all four new
+native/store modules present, and no captures, certificates or test fixtures.

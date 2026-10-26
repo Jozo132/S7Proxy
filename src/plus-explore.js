@@ -1,7 +1,6 @@
 // @ts-check
 import { readFile } from 'node:fs/promises';
 import { S7CommPlusClient } from './client/s7commplus-client.js';
-import { saveAcquisitionEvidence, portableJSON } from './backup/evidence-store.js';
 import { getLabHost } from './protocol/production-policy.js';
 
 const args = process.argv.slice(2);
@@ -32,7 +31,6 @@ if (!args.includes('--live') || args.some(arg => !['--live', '--tls', '--legacy'
       blockUpload: { status: 'NOT_ATTEMPTED_UNQUALIFIED', attempts: [], totalBytes: 0 },
       nextStep: observation.failure ? 'Resolve the recorded failure without escalating traffic or changing PLC settings' : 'Review identity and health evidence before authorizing a small explicit object query',
     };
-    const saved = await saveAcquisitionEvidence(report, labMode ? 'backups/lab' : 'backups/production');
-    console.log(portableJSON({ manifestPath: saved.manifestPath, report }));
+    console.log(JSON.stringify(report, null, 2));
   }
 }

@@ -25,6 +25,18 @@ use independently constructed synthetic objects, not engineering archives or
 controller captures. No Python runtime is required.
 No source from the separately licensed thomas-v2/S7CommPlusDriver was incorporated.
 
+For native program-content extraction, public protocol facts were independently
+cross-checked against the attribute-name table in
+https://github.com/moki-ics/s7commwireshark/blob/master/src/s7comm_plus/packet-s7comm_plus.c
+and sparse-BLOB field descriptions in
+https://github.com/thomas-v2/S7CommPlusDriver/blob/master/src/S7CommPlusDriver/Core/PValue.cs.
+In particular, attribute 2523 is Block Language (2522 is Auto Numbering), 2580
+is Code block, and sparse BLOB values carry keyed root/length/data entries with
+a zero-key terminator. Only protocol facts were used; no source from either
+separately licensed project was copied. JavaScript implementations and public
+fixtures are independently constructed. Real controller binaries and engineering
+captures are not distributed.
+
 The MIT License (MIT)
 
 Copyright (c) 2013 Gijs Molenaar, Stephan Preeker

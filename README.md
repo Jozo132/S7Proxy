@@ -27,7 +27,9 @@ Requires Node.js >= 20.
 `S7CommPlusClient` is a separate experimental native backend with bounded object
 Explore, native DB/type-member discovery and typed symbolic reads. It supports
 session-local name resolution after explicit block discovery. Protected
-SessionKey/credential profiles and program uploads remain unsupported.
+SessionKey/credential profiles remain unsupported. The verified TLS V2 profile
+also supports bounded native program-content attribute extraction, returning
+in-memory files; this is not a full-controller or restorable backup.
 Existing DAQ, proxy and REST/WebSocket APIs remain classic S7Comm paths.
 
 For the production target, only the isolated read-only backend
@@ -35,8 +37,8 @@ is permitted; the classic/raw backend rejects this IP. Other classic endpoints
 retain read/write behavior. No acquisition runs on import or normal server startup.
 
 The explicit `node src/plus-explore.js --live --legacy` command selects the
-plaintext legacy profile and makes one bounded identification attempt, writing
-local content-addressed evidence under `backups/production/`.
+plaintext legacy profile and makes one bounded identification attempt, printing
+the result to stdout without writing evidence or backup files.
 It never retries, dumps blocks, schedules backups or modifies PLC configuration.
 Do not rerun it to investigate a rejection without reviewing the saved evidence.
 Production TLS remains refused; offline qualification does not authorize a
@@ -49,7 +51,7 @@ TLS additionally requires `S7PLUS_TLS_CA`, `S7PLUS_TLS_CERT_SHA256` (64 hex digi
 over the peer certificate's DER), and optionally `S7PLUS_TLS_SERVERNAME` for a
 verified certificate name. The corresponding library field is
 `tls.certificateSha256`. CA, hostname and pin must all verify before CreateObject;
-pinning is not trust-on-first-use. Lab evidence uses `backups/lab/`.
+pinning is not trust-on-first-use. Consumers decide whether to save the results.
 
 Historical plaintext CreateObject attempts were rejected; the numeric cause is
 not established. Subsequent authorized lab testing established verified
@@ -117,6 +119,85 @@ Discovery is a bounded session snapshot, not a complete program inventory or
 proof of a downloaded project revision. Nested/array reconstruction is covered
 by synthetic tests; it is not blanket hardware qualification for all optimized
 DBs, FB sections or multi-instance layouts.
+
+### Native program content as in-memory files
+
+`listProgramBlocks()` inventories observed DB, FC and OB objects, preserving
+their native classes, RIDs, numbers, names, language codes and returned attributes.
+Unknown classes and missing metadata are explicit; the inventory is not claimed
+to be exhaustive. `uploadProgramBlock({ type, number })` freshly inventories the
+requested block, checks RUN before/after retrieval, and reads that exact object's
+native code/body/interface/comment/reference attributes using read-only Explore.
+It does **not** transmit the reference implementation's experimental
+`GET_VAR_SUBSTREAMED` upload request.
+
+The qualified profile requires verified TLS V2, effective access level 1, and
+the observed zero-valued native block-protection mode. Production extraction,
+unknown protection states and nonzero protection modes are denied. No credential
+guessing or plaintext fallback is attempted.
+
+In a fresh, connected client session with sufficient request/byte budgets:
+
+```js
+const acquisition = await plc.uploadProgram({
+  mode: 'run',
+  include: ['OB', 'FC', 'DB'],
+});
+for (const file of acquisition.files) {
+  // file.bytes is a Buffer. Nothing has been written to disk.
+  console.log(file.name, file.byteCount, file.sha256, file.block);
+  // The application decides whether to save, send, compare or discard it.
+}
+// Single-block uploads also return a .files array:
+// const { files } = await plc.uploadProgramBlock({ type: 'FC', number: 8 });
+```
+
+Single-block results distinguish `CODE_CONTENT_RETRIEVED`, `DEFINITION_ONLY`
+and `UNAVAILABLE`. `rawBytes`, `byteCount` and `sha256` identify the primary
+component, not the controller's entire load memory. `primaryComponent` and
+`rawFormat` distinguish a BLOB payload from a complete sparse PValue container.
+All returned component bytes, sparse keys/root IDs, original typed attribute
+headers and the correlated response body are preserved. Lengths, response
+sequence, integrity counter, fragment ordering and the explicit end trailer are
+checked; fragment counts refer to Plus frames, not TCP/TLS records.
+
+Software acquisition is sequential, bounded and non-retrying. It reserves a
+request for the final CPU-state check; exhausted budgets, unavailable content,
+protected blocks and failures remain explicit. Increase the default 12-request
+budget deliberately for larger inventories. FB/UDT/tag enumeration and other
+CPU/security profiles remain unqualified, not silently reported as complete.
+
+Each file contains `name`, `bytes`, `byteCount`, `sha256`, native block identity,
+component kind, attribute ID and status. Names are logical labels, not storage
+paths. `format: 'BLOB_PAYLOAD'` preserves a single BLOB's original payload;
+multipart sparse or unsupported content uses `format: 'NATIVE_PVALUE'` to retain
+the original container unchanged. `nativeAttribute` always retains the original
+typed attribute bytes. Absent/empty components remain explicit in `components`
+but do not fabricate files. Partial uploads return only the files obtained.
+
+The library does not write uploaded content, create backup directories, retain
+snapshots or choose a storage policy. Disk persistence/evidence helpers exist
+only in tests and are not exported or packaged. Existing configuration, WASM
+loading, certificate loading and proxy behavior are unchanged.
+
+These artifacts are `BLOCK_CONTENT` and `SOFTWARE_UPLOAD`, not editable TIA
+archives, `HARDWARE_SOFTWARE_UPLOAD`, `CONTROLLER_BACKUP`, or
+`RESTORABLE_BACKUP_VERIFIED`. Full load-memory reconstruction, initial/retentive
+data, memory-card contents, hardware configuration and restore consistency are
+not implemented. RUN observations before/after do not establish an atomic snapshot.
+
+**CPU mode control is unavailable.** There is no STOP/START encoder, authorization
+token issuer or automatic restart in this backend. Selecting
+`stop-required-backup` fails with `EXPLICIT_CPU_STOP_CONFIRMATION_REQUIRED`
+without transmission; flags, stored confirmations and automated acknowledgements
+cannot enable it. A qualified interactive STOP/START workflow remains future
+work, requiring independent protocol qualification and separately authorized
+equipment shutdown/readiness procedures.
+
+Siemens distinguishes RUN-capable software/hardware uploads from the STOP-only
+consistent online-device backup in its
+[backup options documentation](https://docs.tia.siemens.cloud/r/en-us/v20/creating-a-backup-of-an-s7-cpu/backup-options-for-s7-cpus).
+That product documentation does not qualify S7Proxy's missing backup operations.
 
 ## Quick Start
 

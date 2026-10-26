@@ -8,7 +8,7 @@ export { loadWasmEngine, resetWasmCache } from './wasm/loader.js';
 export { createWasmImports } from './wasm/imports.js';
 export { PlcConnection } from './client/plc-connection.js';
 export { S7CommPlusClient } from './client/s7commplus-client.js';
-export { saveAcquisitionEvidence } from './backup/evidence-store.js';
+export { getOperationPolicy as getS7CommPlusOperationPolicy } from './protocol/s7commplus/operation-policy.js';
 export { ConnectionPool } from './client/connection-pool.js';
 export { FailoverManager } from './client/failover-manager.js';
 export { HealthProbe } from './client/health-probe.js';

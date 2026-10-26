@@ -7,7 +7,7 @@ import { FrameAssembler } from '../src/protocol/frame-assembler.js';
 import { Cursor, decodeObjects, u32, vlq } from '../src/protocol/s7commplus/codec.js';
 import { metadataExplore } from './s7commplus-metadata-fixture.js';
 
-/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,initVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},abortTLS?:boolean,stallTLS?:boolean,badIntegrity?:boolean,reference?:boolean,compositeReject?:boolean,nonzeroCreateStatus?:boolean,metadata?:boolean,memberError?:boolean,memberTypeMismatch?:boolean}} FixtureOptions */
+/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,initVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},abortTLS?:boolean,stallTLS?:boolean,badIntegrity?:boolean,reference?:boolean,compositeReject?:boolean,nonzeroCreateStatus?:boolean,metadata?:boolean,memberError?:boolean,memberTypeMismatch?:boolean,programContent?:boolean,programFailure?:boolean,programStall?:boolean,programEmpty?:boolean}} FixtureOptions */
 
 /** @param {bigint} value */
 export function encodeTestUInt64(value) {
@@ -78,7 +78,7 @@ export function validateSessionRequest(request, index, secure = false, reference
   return functionCode;
 }
 
-/** @param {FixtureOptions} [options] */
+/** @param {FixtureOptions & {programProtected?:boolean}} [options] */
 export async function fixture(options = {}) {
   /** @type {import('node:net').Socket[]} */
   const sockets = [];
@@ -139,11 +139,17 @@ export async function fixture(options = {}) {
         const objectId = request.readUInt32BE(18);
         payload = Buffer.concat([Buffer.from([0]), object(objectId, objectId === 52 ? [{ id: 0x8BD,
           raw: Buffer.concat([Buffer.from([0, 23]), u32(0xD99), vlq(0xD9E), Buffer.from([0, 8, options.state ?? 8, 0])]) }] : [])]);
-      } else if (functionCode === 0x0586) payload = Buffer.from(options.protectionMarker ? [0, 0, 0, 4, 2, 0] : [0, 0, 4, 2]);
+      } else if (functionCode === 0x0586) payload = Buffer.from(options.programContent ? [0, 0, 4, 1] : options.protectionMarker ? [0, 0, 0, 4, 2, 0] : [0, 0, 4, 2]);
       else if (functionCode === 0x054C) payload = options.itemError ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
         : Buffer.from([0, 1, 0, 8, 42, 0, 0, ...(options.badTail ? [99] : [])]);
       if (options.metadata && functionCode === 0x04BB && request.readUInt32BE(18) !== 52) {
         payload = Buffer.concat([Buffer.from([0]), metadataExplore(request.readUInt32BE(18))]);
+      }
+      if (options.programContent && functionCode === 0x04BB && request.readUInt32BE(18) !== 52) {
+        const rid = request.readUInt32BE(18);
+        if (options.programStall && rid !== 3) return;
+        payload = options.programFailure && rid === 0x8A130008 ? Buffer.from([1])
+          : Buffer.concat([Buffer.from([0]), programExplore(rid, options.programEmpty ?? false, options.programProtected ? 1 : 0)]);
       }
       if (options.metadata && functionCode === 0x054C && !options.itemError) {
         const cursor = new Cursor(request.subarray(18, -4));
@@ -174,6 +180,12 @@ export async function fixture(options = {}) {
       const version = functionCode === 0x05B3 ? options.initVersion ?? 1 : functionCode === 0x04CA ? options.createVersion ?? 1 : secureSocket && sequence >= 2 ? 2 : 1;
       const outer = Buffer.from([0x72, version, body.length >> 8, body.length & 255]);
       let plus = options.oversized ? Buffer.from('7201ffff', 'hex') : Buffer.concat([outer, body, Buffer.from([0x72, version, 0, 0])]);
+      if (options.programContent && functionCode === 0x04BB && ![3, 52].includes(request.readUInt32BE(18))) {
+        const split = Math.floor(body.length / 2);
+        plus = Buffer.concat([Buffer.from([0x72, version, split >> 8, split & 255]), body.subarray(0, split),
+          Buffer.from([0x72, version, (body.length - split) >> 8, (body.length - split) & 255]), body.subarray(split),
+          Buffer.from([0x72, version, 0, 0])]);
+      }
       if (options.malformed === 'empty') plus = Buffer.from('72010000', 'hex');
       if (options.malformed === 'length') plus.writeUInt16BE(body.length + 1, 2);
       if (options.malformed === 'trailer') plus = plus.subarray(0, -4);
@@ -221,4 +233,22 @@ export async function fixture(options = {}) {
 function object(rid, attributes, classId = 1) {
   return Buffer.concat([Buffer.from([0xA1]), u32(rid), vlq(classId), Buffer.from([0, 0]),
     ...attributes.map(attribute => Buffer.concat([Buffer.from([0xA3]), vlq(attribute.id), attribute.raw])), Buffer.from([0xA2])]);
+}
+
+/** @param {number} rid @param {boolean} empty @param {number} [protectionMode] */
+export function programExplore(rid, empty, protectionMode = 0) {
+  const blocks = [[0x8A0E0007, 2574, 7, 'Storage'], [0x8A130008, 2579, 8, 'Routine'], [0x8A320009, 2647, 9, 'Cycle']];
+  const objects = blocks.filter(block => rid === 3 || block[0] === rid).map(block => {
+    const [id, classId, number, name] = block;
+    const text = Buffer.from(String(name));
+    const attributes = [{ id: 233, raw: Buffer.concat([Buffer.from([0, 21]), vlq(text.length), text]) },
+      { id: 2521, raw: Buffer.from([0, 3, Number(number) >>> 8, Number(number) & 255]) },
+      { id: 2524, raw: Buffer.concat([Buffer.from([0, 23]), u32(3447), vlq(3448), Buffer.from([0, 11, 0, id === 0x8A130008 ? protectionMode : 0, 0])]) }];
+    if (rid !== 3) {
+      const bytes = empty ? Buffer.alloc(0) : Buffer.from([0x10, Number(number), 0, 0xFF]);
+      attributes.push({ id: id === 0x8A0E0007 ? 2544 : 2580, raw: Buffer.concat([Buffer.from([0, 20, 0]), vlq(bytes.length), bytes]) });
+    }
+    return object(Number(id), attributes, Number(classId));
+  });
+  return rid === 3 ? Buffer.concat([object(3, [], 2520).subarray(0, -1), ...objects, Buffer.from([0xA2])]) : Buffer.concat(objects);
 }

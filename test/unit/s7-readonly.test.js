@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { S7Client } from '../../src/compat/s7client.js';
 import { PlcConnection } from '../../src/client/plc-connection.js';
 import { S7CommPlusClient } from '../../src/client/s7commplus-client.js';
-import { saveAcquisitionEvidence, sha256, portableJSON } from '../../src/backup/evidence-store.js';
+import { saveAcquisitionEvidence, sha256, portableJSON } from '../helpers/evidence-store.js';
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';

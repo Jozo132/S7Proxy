@@ -1,11 +1,12 @@
 // @ts-check
+import { getOperationPolicy, BLOCK_CONTENT_ATTRIBUTES } from './operation-policy.js';
 export class PlusError extends Error {
   /** @param {string} code @param {string} message @param {Record<string,unknown>} [details] */
   constructor(code, message, details = {}) { super(message); this.name = 'PlusError'; this.code = code; this.details = details; }
 }
 
 export const PLUS_FUNCTION = Object.freeze({
-  explore: 0x04BB, createSession: 0x04CA, setupSession: 0x0542,
+  explore: 0x04BB, readBlockContent: 0x04BB, createSession: 0x04CA, setupSession: 0x0542,
   read: 0x054C, readAttribute: 0x0586, initSSL: 0x05B3,
 });
 
@@ -62,7 +63,7 @@ export class Cursor {
   uint() { return Number(this.integer()); }
 }
 
-/** @typedef {{flags:number, datatype:number, value:any, raw:Buffer, structId?:number, blobRootId?:number}} PlusValue */
+/** @typedef {{flags:number, datatype:number, value:any, raw:Buffer, structId?:number, blobRootId?:number,blobLength?:number}} PlusValue */
 
 /** @param {Cursor} cursor @param {number} [depth] @returns {PlusValue} */
 export function decodeValue(cursor, depth = 0) {
@@ -70,10 +71,23 @@ export function decodeValue(cursor, depth = 0) {
   const start = cursor.offset;
   const flags = cursor.byte();
   const datatype = cursor.byte();
-  if (flags !== 0 && flags !== 0x10 && flags !== 0x20) throw new PlusError('UNSUPPORTED_DECODING', `PValue flags 0x${flags.toString(16)}`);
+  if (![0, 0x10, 0x20, 0x40].includes(flags)) throw new PlusError('UNSUPPORTED_DECODING', `PValue flags 0x${flags.toString(16)}`);
   /** @type {PlusValue} */
   const result = { flags, datatype, value: null, raw: Buffer.alloc(0) };
-  if (flags) {
+  if (flags === 0x40) {
+    if (datatype !== 20) throw new PlusError('UNSUPPORTED_DECODING', 'Only sparse BLOB values are qualified');
+    const entries = [];
+    const keys = new Set();
+    for (let key = cursor.uint(); key !== 0; key = cursor.uint()) {
+      if (entries.length >= 4096) throw new PlusError('RESPONSE_LIMIT', 'Sparse BLOB entry budget exceeded');
+      if (keys.has(key)) throw new PlusError('MALFORMED_RESPONSE', 'Repeated sparse BLOB key');
+      keys.add(key);
+      const blobRootId = cursor.uint();
+      const byteCount = cursor.uint();
+      entries.push({ key, blobRootId, byteCount, bytes: Buffer.from(cursor.take(byteCount)) });
+    }
+    result.value = entries;
+  } else if (flags) {
     const count = cursor.uint();
     if (count > 4096) throw new PlusError('RESPONSE_LIMIT', 'Array exceeds 4096 elements');
     result.value = Array.from({ length: count }, () => scalar(datatype));
@@ -104,7 +118,9 @@ export function decodeValue(cursor, depth = 0) {
       case 15: return cursor.take(8).readDoubleBE();
       case 20:
         result.blobRootId = cursor.uint();
-        return Buffer.from(cursor.take(cursor.uint()));
+        if (result.blobRootId > 1) throw new PlusError('UNSUPPORTED_DECODING', 'Extended BLOB headers are not qualified');
+        result.blobLength = cursor.uint();
+        return Buffer.from(cursor.take(result.blobLength));
       case 21: return new TextDecoder('utf-8', { fatal: true }).decode(cursor.take(cursor.uint()));
       case 25: return cursor.take(cursor.uint()).toString('latin1');
       case 23: {
@@ -181,8 +197,16 @@ function operationPayload(operation, context) {
       return Buffer.concat([u32(sessionId), Buffer.from([1, 1]), vlq(306), Buffer.from([1]), value.raw,
         Buffer.from([0]), qualifier(version), u32(0)]);
     }
+    case 'readBlockContent':
     case 'explore': {
       const attributes = operation.attributes ?? [];
+      if (operation.kind === 'readBlockContent' && (operation.recursive
+        || ![0x8A0E, 0x8A13, 0x8A32].includes((operation.objectId ?? 0) >>> 16)
+        || !((operation.objectId ?? 0) & 0xFFFF)
+        || attributes.length !== BLOCK_CONTENT_ATTRIBUTES.length
+        || attributes.some((id, index) => id !== BLOCK_CONTENT_ATTRIBUTES[index]))) {
+        throw new PlusError('READ_ONLY_DENIED', 'Program content requires the qualified native object and exact attribute set');
+      }
       if (attributes.length > 8) throw new PlusError('REQUEST_LIMIT', 'At most eight metadata attributes');
       return Buffer.concat([u32(operation.objectId ?? 3), Buffer.from([0, operation.recursive ? 1 : 0, 1, 0, 0]),
         vlq(attributes.length), ...attributes.map(vlq), Buffer.alloc(5)]);
@@ -204,14 +228,15 @@ function operationPayload(operation, context) {
 
 /** @param {PlusOperation} operation @param {PlusContext} context @param {number} sequence */
 export function encodeOperation(operation, context, sequence) {
+  if (!getOperationPolicy(operation.kind).allowed) throw new PlusError('READ_ONLY_DENIED', `Operation ${operation.kind} is not allowlisted`);
   let payload = operationPayload(operation, context);
   const functionCode = PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)];
   if (functionCode === undefined) throw new PlusError('READ_ONLY_DENIED', 'Unknown function');
-  if (['read', 'explore', 'readAttribute'].includes(operation.kind) && !context.sessionId) {
+  if (['read', 'explore', 'readBlockContent', 'readAttribute'].includes(operation.kind) && !context.sessionId) {
     throw new PlusError('SESSION_REQUIRED', 'Read requires an established session');
   }
-  if (context.integrityId !== undefined && ['read', 'explore', 'readAttribute'].includes(operation.kind)) {
-    const tail = operation.kind === 'explore' ? 5 : 4;
+  if (context.integrityId !== undefined && ['read', 'explore', 'readBlockContent', 'readAttribute'].includes(operation.kind)) {
+    const tail = ['explore', 'readBlockContent'].includes(operation.kind) ? 5 : 4;
     payload = Buffer.concat([payload.subarray(0, -tail), vlq(context.integrityId), payload.subarray(-tail)]);
   }
   const header = Buffer.alloc(14);
@@ -231,6 +256,7 @@ export function encodeOperation(operation, context, sequence) {
 
 /** @param {Buffer} frame @param {PlusOperation} operation @param {PlusContext} context @param {number} sequence */
 export function assertOutgoing(frame, operation, context, sequence) {
+  if (!getOperationPolicy(operation.kind).allowed) throw new PlusError('READ_ONLY_DENIED', `Operation ${operation.kind} is not allowlisted`);
   if (!frame.equals(encodeOperation(operation, context, sequence))) {
     throw new PlusError('READ_ONLY_DENIED', 'Outgoing bytes do not match an allowlisted canonical request');
   }
@@ -243,6 +269,8 @@ export class PlusAssembler {
   #parts = [];
   #bytes = 0;
   #version = 0;
+  #lastFragmentCount = 0;
+  get lastMessageFragmentCount() { return this.#lastFragmentCount; }
   /** @param {number} [maxBytes] @param {number} [maxFragments] */
   constructor(maxBytes = 65536, maxFragments = 64) { this.maxBytes = maxBytes; this.maxFragments = maxFragments; }
   /** @param {Buffer} bytes @returns {{version:number,body:Buffer}[]} */
@@ -264,6 +292,7 @@ export class PlusAssembler {
       this.#pending = this.#pending.subarray(4 + length);
       if (!length) {
         if (!this.#parts.length) throw new PlusError('MALFORMED_RESPONSE', 'Empty response is not success');
+        this.#lastFragmentCount = this.#parts.length;
         messages.push({ version, body: Buffer.concat(this.#parts) });
         this.#parts = []; this.#bytes = 0; this.#version = 0;
       } else {

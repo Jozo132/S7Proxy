@@ -11,6 +11,8 @@ import {
   encodeOperation, assertOutgoing, responsePayload,
 } from '../protocol/s7commplus/codec.js';
 import { buildBlockMembers, validateMemberValue } from '../protocol/s7commplus/type-info.js';
+import { decodeProgramInventory, PROGRAM_INVENTORY_ATTRIBUTES } from '../protocol/s7commplus/block-inventory.js';
+import { BLOCK_CONTENT_ATTRIBUTES, decodeBlockContent } from '../protocol/s7commplus/block-upload.js';
 
 /** @import { PlusOperation, PlusObject, PlusValue } from '../protocol/s7commplus/codec.js' */
 /** @import { BlockMetadata, RuntimeMember } from '../protocol/s7commplus/type-info.js' */
@@ -91,6 +93,7 @@ export class S7CommPlusClient {
   #memberBindings = new WeakMap();
   /** @type {{name:string,member:RuntimeMember}[]} */
   #namedMembers = [];
+  #uploadBusy = false;
 
   /** @param {PlusOptions} [options] */
   constructor(options = {}) {
@@ -138,7 +141,8 @@ export class S7CommPlusClient {
       peerCertificateSha256: this.#peerCertificateSha256,
       identity: this.#identity, cpuState: this.#cpuState, effectiveProtectionLevel: this.#protection,
       capabilities: { objectExplore: this.#ready, symbolicLidRead: this.#ready, namedSymbolResolution: this.#ready && this.#namedMembers.length > 0,
-        blockUpload: 'UNSUPPORTED_UNQUALIFIED', recurringUploads: false },
+        blockUpload: this.#tlsVerified && this.#protection === 1 ? 'BOUNDED_NATIVE_ATTRIBUTE_CONTENT' : 'UNSUPPORTED_PROFILE',
+        controllerBackup: 'UNSUPPORTED_UNQUALIFIED', cpuModeControl: 'DENIED', recurringUploads: false },
       limits: this.#limits, statistics: { requests: this.#requests, receivedBytes: this.#rxBytes,
         sentBytes: this.#txBytes, elapsedMs: this.#started ? Math.round(performance.now() - this.#started) : 0 },
       observations: this.#observations, transcript: this.#transcript,
@@ -240,10 +244,10 @@ export class S7CommPlusClient {
     return this.#explore(objectId, options);
   }
 
-  /** @param {number} objectId @param {{attributes?:number[],recursive?:boolean}} options */
-  async #explore(objectId, options) {
+  /** @param {number} objectId @param {{attributes?:number[],recursive?:boolean}} options @param {'explore'|'readBlockContent'} [kind] */
+  async #explore(objectId, options, kind = 'explore') {
     try {
-      const response = await this.#exchange({ kind: 'explore', objectId, ...options });
+      const response = await this.#exchange({ kind, objectId, ...options });
       let returnedExploreId;
       if (response.expectedIntegrityId !== undefined || response.cursor.bytes[response.cursor.offset] !== 0xA1) {
         returnedExploreId = response.cursor.uint32();
@@ -291,6 +295,137 @@ export class S7CommPlusClient {
     });
     if (new Set(blocks.map(block => block.number)).size !== blocks.length) throw new PlusError('AMBIGUOUS_METADATA', 'Duplicate DB runtime identities');
     return { blocks, completeness: evidence.completeness, receivedAt: evidence.receivedAt };
+  }
+
+  async listProgramBlocks() {
+    this.#requireReady();
+    if (this.#cpuState !== 'RUN') throw new PlusError('CPU_STATE', 'Program inventory requires a genuine RUN reply');
+    const evidence = await this.#explore(3, { recursive: true, attributes: [...PROGRAM_INVENTORY_ATTRIBUTES] });
+    try {
+      return { ...decodeProgramInventory(evidence), controller: structuredClone(this.#identity),
+        cpuState: this.#cpuState, artifactClass: 'PROGRAM_INVENTORY', blockContentRetrieved: false };
+    } catch (error) { this.#stop(this.#asError(error)); throw error; }
+  }
+
+  /** @param {{type:string,number:number}} selector */
+  async uploadProgramBlock(selector) {
+    if (!selector || !['DB', 'FC', 'OB'].includes(selector.type) || !Number.isInteger(selector.number) || selector.number < 1 || selector.number > 65535) {
+      throw new PlusError('ARGUMENT', 'Select an inventoried DB, FC or OB number in 1..65535');
+    }
+    this.#requireProgramUpload();
+    const requested = { type: selector.type, number: selector.number };
+    if (this.#uploadBusy) throw new PlusError('CONCURRENCY_LIMIT', 'Only one software acquisition may run per session');
+    this.#uploadBusy = true;
+    try {
+      const before = await this.readCpuState();
+      const inventory = await this.listProgramBlocks();
+      const matches = inventory.blocks.filter(block => block.type === requested.type && block.number === requested.number);
+      if (matches.length !== 1 || matches[0].status !== 'IDENTIFIED') throw new PlusError('BLOCK_UNAVAILABLE', 'Block was not uniquely identified by native inventory');
+      const content = await this.#readProgramBlock(matches[0]);
+      const after = await this.readCpuState();
+      return { ...content, controller: structuredClone(this.#identity), cpuState: { before, after }, inventory };
+    } finally { this.#uploadBusy = false; }
+  }
+
+  /** @param {{mode?:string,include?:string[]}} [options] */
+  async uploadProgram(options = {}) {
+    if (!options || typeof options !== 'object') throw new PlusError('ARGUMENT', 'Expected software upload options');
+    if (options.mode === 'stop-required-backup') {
+      throw new PlusError('EXPLICIT_CPU_STOP_CONFIRMATION_REQUIRED', 'STOP-dependent backup is not implemented or authorized; no mode-control operation can be serialized');
+    }
+    if (Object.keys(options).some(key => !['mode', 'include'].includes(key))) throw new PlusError('READ_ONLY_DENIED', 'Software upload accepts no mode-control or confirmation flags');
+    if (options.mode !== undefined && options.mode !== 'run') throw new PlusError('ARGUMENT', 'Only run-mode software acquisition is supported');
+    if (options.include !== undefined && !Array.isArray(options.include)) throw new PlusError('ARGUMENT', 'Expected an artifact type list');
+    const include = [...(options.include ?? ['OB', 'FB', 'FC', 'DB', 'UDT', 'TAGS'])];
+    if (!include.length || new Set(include).size !== include.length || include.some(type => !['OB', 'FB', 'FC', 'DB', 'UDT', 'TAGS'].includes(type))) {
+      throw new PlusError('ARGUMENT', 'Select distinct OB, FB, FC, DB, UDT or TAGS artifact types');
+    }
+    this.#requireProgramUpload();
+    if (this.#uploadBusy) throw new PlusError('CONCURRENCY_LIMIT', 'Only one software acquisition may run per session');
+    this.#uploadBusy = true;
+    try {
+      const before = await this.readCpuState();
+      const inventory = await this.listProgramBlocks();
+      const selected = inventory.blocks.filter(block => include.includes(block.type));
+      const artifacts = [];
+      /** @type {{block?:import('../protocol/s7commplus/block-upload.js').ProgramBlock,type?:string,status:string,cause?:string}[]} */
+      const omissions = inventory.blocks.filter(block => block.type === 'UNKNOWN').map(block => ({ block, status: 'UNSUPPORTED_BLOCK_CLASS' }));
+      for (const type of include.filter(type => !selected.some(block => block.type === type))) omissions.push({ type, status: 'NOT_OBSERVED_IN_BOUNDED_INVENTORY' });
+      /** @type {{code:string,message:string}|null} */
+      let failure = null;
+      let totalContentBytes = 0;
+      for (const [index, block] of selected.entries()) {
+        if (this.#requests + 2 > this.#limits.maxRequests) {
+          failure = { code: 'REQUEST_LIMIT', message: 'No upload request issued without a remaining final-state-check budget' };
+        } else {
+          try {
+            const artifact = await this.#readProgramBlock(block);
+            if (totalContentBytes + artifact.totalComponentBytes > this.#limits.maxUploadBytes) {
+              throw new PlusError('RESPONSE_LIMIT', 'Software content exceeds the session upload-byte budget');
+            }
+            artifacts.push(artifact);
+            totalContentBytes += artifact.totalComponentBytes;
+            if (artifact.status === 'UNAVAILABLE') omissions.push({ block, status: 'BLOCK_CONTENT_UNAVAILABLE' });
+          } catch (error) {
+            const cause = this.#asError(error);
+            if (['PROTECTED_BLOCK', 'PROTECTION_STATE_UNQUALIFIED'].includes(cause.code)) {
+              omissions.push({ block, status: cause.code, cause: cause.message });
+              continue;
+            }
+            failure = { code: cause.code, message: cause.message };
+          }
+        }
+        if (failure) {
+          for (const unattempted of selected.slice(index)) omissions.push({ block: unattempted, status: 'NOT_CAPTURED', cause: failure.code });
+          break;
+        }
+      }
+      let after = 'UNKNOWN';
+      if (this.connected) {
+        try { after = await this.readCpuState(); }
+        catch (error) {
+          const cause = this.#asError(error);
+          failure ??= { code: cause.code, message: cause.message };
+        }
+      }
+      if (after !== 'RUN') failure ??= { code: 'CPU_STATE', message: 'Final CPU RUN state was not verified' };
+      return {
+        artifactClass: 'SOFTWARE_UPLOAD', source: 'S7COMMPLUS_RESPONSE',
+        status: failure ? 'PARTIAL' : !artifacts.length ? 'UNAVAILABLE' : artifacts.length !== selected.length
+          || artifacts.some(artifact => artifact.status === 'UNAVAILABLE') ? 'PARTIAL' : 'AVAILABLE_COMPONENTS_CAPTURED',
+        controller: { target: { host: this.#host, port: this.#port }, identity: structuredClone(this.#identity),
+          peerCertificateSha256: this.#peerCertificateSha256 },
+        cpuState: { before, after }, inventory, artifacts, files: artifacts.flatMap(artifact => artifact.files), omissions, failure, totalContentBytes,
+        receivedAt: new Date().toISOString(),
+        completeness: { program: 'AVAILABLE_NATIVE_COMPONENTS_ONLY', inventory: inventory.completeness,
+          controllerState: 'NOT_CAPTURED', restore: 'UNVERIFIED' }, restorable: false,
+      };
+    } finally { this.#uploadBusy = false; }
+  }
+
+  #requireProgramUpload() {
+    this.#requireReady();
+    if (this.#host === getProductionHost()) throw new PlusError('TARGET_DENIED', 'Program extraction is not qualified for the production target');
+    if (!this.#tlsVerified || this.#version !== 2) throw new PlusError('SECURITY_REQUIRED', 'Program extraction requires the verified TLS V2 profile; no plaintext fallback');
+    if (this.#protection !== 1) throw new PlusError('ACCESS_RIGHTS_UNQUALIFIED', 'Program extraction requires the qualified effective access level');
+  }
+
+  /** @param {import('../protocol/s7commplus/block-upload.js').ProgramBlock} block */
+  async #readProgramBlock(block) {
+    this.#requireProgramUpload();
+    const protection = block.nativeAttributes.find(attribute => attribute.id === 2524)?.value;
+    const modes = protection?.flags === 0 && protection.structId === 3447 && Array.isArray(protection.value)
+      ? protection.value.filter((/** @type {{id:number,value:PlusValue}} */ member) => member.id === 3448) : [];
+    if (modes.length !== 1 || modes[0].value.flags !== 0 || modes[0].value.datatype !== 11) {
+      throw new PlusError('PROTECTION_STATE_UNQUALIFIED', 'No qualified native block-protection mode; no content request transmitted');
+    }
+    if (modes[0].value.value !== 0) throw new PlusError('PROTECTED_BLOCK', 'Nonzero native block-protection mode; no credentials guessed or content request transmitted');
+    const evidence = await this.#explore(block.objectRid, { attributes: [...BLOCK_CONTENT_ATTRIBUTES] }, 'readBlockContent');
+    try {
+      const content = decodeBlockContent(block, evidence);
+      if (content.totalComponentBytes > this.#limits.maxUploadBytes) throw new PlusError('RESPONSE_LIMIT', 'Block content exceeds the upload byte budget');
+      return content;
+    } catch (error) { this.#stop(this.#asError(error)); throw error; }
   }
 
   /** @param {{type:'DB',number:number}} selector */
@@ -431,7 +566,7 @@ export class S7CommPlusClient {
 
   /** @param {unknown} [_block] @returns {Promise<never>} */
   async uploadBlock(_block) {
-    throw new PlusError('UNSUPPORTED_UPLOAD', 'No qualified S7CommPlus program-block transfer or completeness contract; nothing transmitted');
+    throw new PlusError('UNSUPPORTED_UPLOAD', 'This legacy entry point remains disabled; use uploadProgramBlock() for qualified native-attribute extraction; nothing transmitted');
   }
 
   async disconnect() {
@@ -523,7 +658,8 @@ export class S7CommPlusClient {
       const expectedIntegrityId = context.integrityId === undefined ? undefined : (sequence + context.integrityId) >>> 0;
       return { ...decoded, version: incoming.version, expectedIntegrityId,
         correlation: { sequence, functionCode: PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)],
-          integrityId: expectedIntegrityId ?? null, request: structuredClone(operation), responseBody: Buffer.from(incoming.body) } };
+          integrityId: expectedIntegrityId ?? null, request: structuredClone(operation), responseBody: Buffer.from(incoming.body),
+          fragmentCount: this.#plus.lastMessageFragmentCount } };
     } catch (error) {
       const failure = this.#asError(error);
       this.#stop(failure);
