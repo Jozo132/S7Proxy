@@ -140,7 +140,8 @@ export class S7CommPlusClient {
       selectedProfile: this.#options.securityMode === 'tls' ? 'TLS' : 'LEGACY_PLAINTEXT',
       peerCertificateSha256: this.#peerCertificateSha256,
       identity: this.#identity, cpuState: this.#cpuState, effectiveProtectionLevel: this.#protection,
-      capabilities: { objectExplore: this.#ready, symbolicLidRead: this.#ready, namedSymbolResolution: this.#ready && this.#namedMembers.length > 0,
+      capabilities: { objectExplore: this.#ready, symbolicLidRead: this.#ready && this.#cpuState === 'RUN',
+        namedSymbolResolution: this.#ready && this.#cpuState === 'RUN' && this.#namedMembers.length > 0,
         blockUpload: this.#tlsVerified && this.#protection === 1 ? 'BOUNDED_NATIVE_ATTRIBUTE_CONTENT' : 'UNSUPPORTED_PROFILE',
         controllerBackup: 'UNSUPPORTED_UNQUALIFIED', cpuModeControl: 'DENIED', recurringUploads: false },
       limits: this.#limits, statistics: { requests: this.#requests, receivedBytes: this.#rxBytes,
@@ -226,7 +227,6 @@ export class S7CommPlusClient {
       this.#ready = true;
       this.#phase = 'ready';
       await this.readCpuState();
-      if (this.#cpuState !== 'RUN') throw new PlusError('CPU_STATE', `Acquisition stopped: observed CPU state ${this.#cpuState}`);
       await this.#readProtection();
       return this.report;
     } catch (error) {
@@ -240,7 +240,7 @@ export class S7CommPlusClient {
   /** @param {number} objectId @param {{attributes?:number[],recursive?:boolean}} [options] */
   async explore(objectId, options = {}) {
     this.#requireReady();
-    if (this.#cpuState !== 'RUN') throw new PlusError('CPU_STATE', 'Exploration requires a genuine RUN reply');
+    this.#requireMetadataState();
     return this.#explore(objectId, options);
   }
 
@@ -268,7 +268,11 @@ export class S7CommPlusClient {
       .filter(member => member.id === 0xD9E && member.value.datatype === 8).map(member => member.value.value);
     this.#cpuState = codes.length && codes.every(code => code === 8) ? 'RUN' : codes.length && codes.every(code => code === 4) ? 'STOP' : 'UNKNOWN';
     this.#observations.push({ kind: 'cpuState', value: this.#cpuState, evidence: result });
-    if (this.#cpuState !== 'RUN') this.#stop(new PlusError('CPU_STATE', `Acquisition stopped: CPU ${this.#cpuState}`));
+    if (this.#cpuState === 'UNKNOWN') {
+      const error = new PlusError('CPU_STATE', 'CPU operating state is unknown; acquisition stopped');
+      this.#stop(error);
+      throw error;
+    }
     return this.#cpuState;
   }
 
@@ -299,7 +303,7 @@ export class S7CommPlusClient {
 
   async listProgramBlocks() {
     this.#requireReady();
-    if (this.#cpuState !== 'RUN') throw new PlusError('CPU_STATE', 'Program inventory requires a genuine RUN reply');
+    this.#requireMetadataState();
     const evidence = await this.#explore(3, { recursive: true, attributes: [...PROGRAM_INVENTORY_ATTRIBUTES] });
     try {
       return { ...decodeProgramInventory(evidence), controller: structuredClone(this.#identity),
@@ -307,10 +311,13 @@ export class S7CommPlusClient {
     } catch (error) { this.#stop(this.#asError(error)); throw error; }
   }
 
-  /** @param {{type:string,number:number}} selector */
-  async uploadProgramBlock(selector) {
+  /** @param {{type:string,number:number}} selector @param {{mode?:'run'|'stop'}} [options] */
+  async uploadProgramBlock(selector, options = {}) {
     if (!selector || !['DB', 'FC', 'OB'].includes(selector.type) || !Number.isInteger(selector.number) || selector.number < 1 || selector.number > 65535) {
       throw new PlusError('ARGUMENT', 'Select an inventoried DB, FC or OB number in 1..65535');
+    }
+    if (!options || Object.keys(options).some(key => key !== 'mode') || (options.mode !== undefined && !['run', 'stop'].includes(options.mode))) {
+      throw new PlusError('ARGUMENT', 'Select run or stop acquisition mode; no mode-control flags are accepted');
     }
     this.#requireProgramUpload();
     const requested = { type: selector.type, number: selector.number };
@@ -318,11 +325,13 @@ export class S7CommPlusClient {
     this.#uploadBusy = true;
     try {
       const before = await this.readCpuState();
+      this.#requireAcquisitionMode(options.mode ?? 'run');
       const inventory = await this.listProgramBlocks();
       const matches = inventory.blocks.filter(block => block.type === requested.type && block.number === requested.number);
       if (matches.length !== 1 || matches[0].status !== 'IDENTIFIED') throw new PlusError('BLOCK_UNAVAILABLE', 'Block was not uniquely identified by native inventory');
       const content = await this.#readProgramBlock(matches[0]);
       const after = await this.readCpuState();
+      if (after !== before) throw new PlusError('CPU_STATE', 'CPU operating mode changed during block acquisition');
       return { ...content, controller: structuredClone(this.#identity), cpuState: { before, after }, inventory };
     } finally { this.#uploadBusy = false; }
   }
@@ -334,7 +343,7 @@ export class S7CommPlusClient {
       throw new PlusError('EXPLICIT_CPU_STOP_CONFIRMATION_REQUIRED', 'STOP-dependent backup is not implemented or authorized; no mode-control operation can be serialized');
     }
     if (Object.keys(options).some(key => !['mode', 'include'].includes(key))) throw new PlusError('READ_ONLY_DENIED', 'Software upload accepts no mode-control or confirmation flags');
-    if (options.mode !== undefined && options.mode !== 'run') throw new PlusError('ARGUMENT', 'Only run-mode software acquisition is supported');
+    if (options.mode !== undefined && !['run', 'stop'].includes(options.mode)) throw new PlusError('ARGUMENT', 'Select run or stop acquisition mode');
     if (options.include !== undefined && !Array.isArray(options.include)) throw new PlusError('ARGUMENT', 'Expected an artifact type list');
     const include = [...(options.include ?? ['OB', 'FB', 'FC', 'DB', 'UDT', 'TAGS'])];
     if (!include.length || new Set(include).size !== include.length || include.some(type => !['OB', 'FB', 'FC', 'DB', 'UDT', 'TAGS'].includes(type))) {
@@ -345,6 +354,7 @@ export class S7CommPlusClient {
     this.#uploadBusy = true;
     try {
       const before = await this.readCpuState();
+      this.#requireAcquisitionMode(options.mode ?? 'run');
       const inventory = await this.listProgramBlocks();
       const selected = inventory.blocks.filter(block => include.includes(block.type));
       const artifacts = [];
@@ -388,7 +398,7 @@ export class S7CommPlusClient {
           failure ??= { code: cause.code, message: cause.message };
         }
       }
-      if (after !== 'RUN') failure ??= { code: 'CPU_STATE', message: 'Final CPU RUN state was not verified' };
+      if (after !== before) failure ??= { code: 'CPU_STATE', message: 'Final CPU operating mode did not match the initial mode' };
       return {
         artifactClass: 'SOFTWARE_UPLOAD', source: 'S7COMMPLUS_RESPONSE',
         status: failure ? 'PARTIAL' : !artifacts.length ? 'UNAVAILABLE' : artifacts.length !== selected.length
@@ -403,8 +413,18 @@ export class S7CommPlusClient {
     } finally { this.#uploadBusy = false; }
   }
 
+  #requireMetadataState() {
+    if (!['RUN', 'STOP'].includes(this.#cpuState)) throw new PlusError('CPU_STATE', 'Metadata access requires a genuine RUN or STOP reply');
+  }
+
+  /** @param {string} mode */
+  #requireAcquisitionMode(mode) {
+    if (this.#cpuState !== mode.toUpperCase()) throw new PlusError('CPU_STATE', `Acquisition requires CPU ${mode.toUpperCase()}; no mode change was requested`);
+  }
+
   #requireProgramUpload() {
     this.#requireReady();
+    this.#requireMetadataState();
     if (this.#host === getProductionHost()) throw new PlusError('TARGET_DENIED', 'Program extraction is not qualified for the production target');
     if (!this.#tlsVerified || this.#version !== 2) throw new PlusError('SECURITY_REQUIRED', 'Program extraction requires the verified TLS V2 profile; no plaintext fallback');
     if (this.#protection !== 1) throw new PlusError('ACCESS_RIGHTS_UNQUALIFIED', 'Program extraction requires the qualified effective access level');
@@ -431,6 +451,7 @@ export class S7CommPlusClient {
   /** @param {{type:'DB',number:number}} selector */
   async getBlockMetadata(selector) {
     this.#requireReady();
+    this.#requireMetadataState();
     if (selector?.type !== 'DB' || !Number.isInteger(selector.number) || selector.number < 1 || selector.number > 65535) {
       throw new PlusError('ARGUMENT', 'Select a DB number in 1..65535');
     }
@@ -439,7 +460,7 @@ export class S7CommPlusClient {
     const inventory = await this.listDataBlocks();
     const block = inventory.blocks.find(block => block.number === selector.number);
     if (!block) throw new PlusError('BLOCK_UNAVAILABLE', 'DB was not returned by bounded native discovery');
-    const reference = await this.readSymbolic({ accessArea: block.objectRid, lids: [1] });
+    const reference = await this.#readSymbolicValue({ accessArea: block.objectRid, lids: [1] });
     if (reference.value.flags !== 0 || reference.value.datatype !== 18 || !Number.isInteger(reference.value.value)) {
       throw new PlusError('DATATYPE_MISMATCH', 'DB type reference must be a scalar native RID');
     }
@@ -540,6 +561,11 @@ export class S7CommPlusClient {
   async readSymbolic(address) {
     this.#requireReady();
     if (this.#cpuState !== 'RUN') throw new PlusError('CPU_STATE', 'Symbolic read requires a genuine RUN reply');
+    return this.#readSymbolicValue(address);
+  }
+
+  /** @param {{accessArea:number,lids:number[],symbolCrc?:number,name?:string,datatypeIdentity?:unknown}} address */
+  async #readSymbolicValue(address) {
     try {
       const response = await this.#exchange({ kind: 'read', accessArea: address.accessArea, lids: address.lids, symbolCrc: address.symbolCrc });
       const item = response.cursor.uint();

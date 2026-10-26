@@ -78,7 +78,7 @@ export function validateSessionRequest(request, index, secure = false, reference
   return functionCode;
 }
 
-/** @param {FixtureOptions & {programProtected?:boolean}} [options] */
+/** @param {FixtureOptions & {programProtected?:boolean,states?:number[]}} [options] */
 export async function fixture(options = {}) {
   /** @type {import('node:net').Socket[]} */
   const sockets = [];
@@ -99,6 +99,7 @@ export async function fixture(options = {}) {
     /** @type {TLSSocket|undefined} */
     let secureSocket;
     let application = Buffer.alloc(0);
+    let stateReads = 0;
     /** @param {Buffer} data */
     function sendDT(data) {
       for (let offset = 0; offset < data.length; offset += 1000) {
@@ -138,7 +139,7 @@ export async function fixture(options = {}) {
       } else if (functionCode === 0x04BB) {
         const objectId = request.readUInt32BE(18);
         payload = Buffer.concat([Buffer.from([0]), object(objectId, objectId === 52 ? [{ id: 0x8BD,
-          raw: Buffer.concat([Buffer.from([0, 23]), u32(0xD99), vlq(0xD9E), Buffer.from([0, 8, options.state ?? 8, 0])]) }] : [])]);
+          raw: Buffer.concat([Buffer.from([0, 23]), u32(0xD99), vlq(0xD9E), Buffer.from([0, 8, options.states?.[stateReads++] ?? options.state ?? 8, 0])]) }] : [])]);
       } else if (functionCode === 0x0586) payload = Buffer.from(options.programContent ? [0, 0, 4, 1] : options.protectionMarker ? [0, 0, 0, 4, 2, 0] : [0, 0, 4, 2]);
       else if (functionCode === 0x054C) payload = options.itemError ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
         : Buffer.from([0, 1, 0, 8, 42, 0, 0, ...(options.badTail ? [99] : [])]);

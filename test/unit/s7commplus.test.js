@@ -171,7 +171,7 @@ describe('S7CommPlus loopback lifecycle (never live)', () => {
     expect(client.report.sessionEstablished).toBe(true);
   });
   it.each([
-    [{ state: 4 }, 'CPU_STATE', 4],
+    [{ state: 6 }, 'CPU_STATE', 4],
     [{ challenge: true }, 'LEGACY_SESSION_KEY_REQUIRED', 2],
     [{ wrongSequence: true }, 'CORRELATION', 1],
     [{ oversized: true }, 'RESPONSE_LIMIT', 1],
@@ -303,6 +303,66 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
     certificateSha256 = new X509Certificate(credentials.cert).fingerprint256.replaceAll(':', '').toLowerCase();
   });
   afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
+  it.each([['run', 8], ['stop', 4]])('connects in %s and retrieves unchanged native files without CPU control', async (mode, state) => {
+    const server = await fixture({ tls: credentials, programContent: true, state: Number(state) });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 }, limits: { maxRequests: 22 } });
+    try {
+      await client.connect();
+      expect(client.connected).toBe(true);
+      expect(client.report.failure).toBeNull();
+      expect(await client.readCpuState()).toBe(String(mode).toUpperCase());
+      await client.explore(3, { attributes: [233] });
+      if (mode === 'stop') {
+        const requestCount = server.requests.length;
+        await expect(client.readSymbolic({ accessArea: 0x8A0E0007, lids: [1] })).rejects.toMatchObject({ code: 'CPU_STATE' });
+        expect(server.requests).toHaveLength(requestCount);
+        await expect(client.uploadProgram()).rejects.toMatchObject({ code: 'CPU_STATE' });
+        expect(client.connected).toBe(true);
+      }
+      const result = await client.uploadProgram({ mode: String(mode) });
+      expect(result).toMatchObject({ status: 'AVAILABLE_COMPONENTS_CAPTURED', failure: null,
+        cpuState: { before: String(mode).toUpperCase(), after: String(mode).toUpperCase() } });
+      expect(result.files.map(file => file.bytes.toString('hex'))).toEqual(['100700ff', '100800ff', '100900ff']);
+      const block = await client.uploadProgramBlock({ type: 'FC', number: 8 }, { mode: state === 4 ? 'stop' : 'run' });
+      expect(block.cpuState).toEqual(result.cpuState);
+      expect(block.files[0].bytes.toString('hex')).toBe('100800ff');
+      expect(client.connected).toBe(true);
+      expect(server.requests.every(request => [0x05B3, 0x04CA, 0x0542, 0x04BB, 0x0586].includes(request.functionCode))).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['changed', 'unknown', 'wrong-mode', 'resume'])('handles %s CPU mode without treating normal STOP as a broken session', async scenario => {
+    const states = scenario === 'changed' ? [8, 8, 4] : scenario === 'unknown' ? [8, 6]
+      : scenario === 'resume' ? [4, 8] : [8, 8];
+    const server = await fixture({ tls: credentials, programContent: true, states });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 }, limits: { maxRequests: 16 } });
+    try {
+      await client.connect();
+      if (scenario === 'changed') {
+        const result = await client.uploadProgram();
+        expect(result).toMatchObject({ status: 'PARTIAL', failure: { code: 'CPU_STATE' }, cpuState: { before: 'RUN', after: 'STOP' } });
+        expect(result.files).toHaveLength(3);
+        expect(client.connected).toBe(true);
+      } else if (scenario === 'unknown') {
+        await expect(client.readCpuState()).rejects.toMatchObject({ code: 'CPU_STATE' });
+        expect(client.report.cpuState).toBe('UNKNOWN');
+        expect(client.connected).toBe(false);
+      } else if (scenario === 'wrong-mode') {
+        await expect(client.uploadProgram({ mode: 'stop' })).rejects.toMatchObject({ code: 'CPU_STATE' });
+        expect(server.requests).toHaveLength(6);
+        expect(client.connected).toBe(true);
+      } else {
+        expect(client.report.cpuState).toBe('STOP');
+        expect(await client.readCpuState()).toBe('RUN');
+        expect((await client.readSymbolic({ accessArea: 0x8A0E0007, lids: [1] })).value.value).toBe(42);
+        expect(client.connected).toBe(true);
+      }
+      expect(server.requests.every(request => [0x05B3, 0x04CA, 0x0542, 0x04BB, 0x0586, 0x054C].includes(request.functionCode))).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
   it.each(['complete', 'failure', 'limit', 'empty', 'timeout'])('captures native software components without mode-control operations: %s', async mode => {
     const server = await fixture({ tls: credentials, programContent: true,
       programFailure: mode === 'failure', programEmpty: mode === 'empty', programStall: mode === 'timeout' });

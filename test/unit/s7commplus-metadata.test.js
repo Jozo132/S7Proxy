@@ -137,6 +137,22 @@ describe('public native discovery and qualified reads', () => {
       expect(server.requests.every(request => [0x5B3, 0x4CA, 0x542, 0x4BB, 0x586, 0x54C].includes(request.functionCode))).toBe(true);
     } finally { await client.disconnect(); await server.close(); }
   });
+  it('discovers DB types and members in STOP while denying process-value reads without closing the session', async () => {
+    const server = await fixture({ metadata: true, state: 4 });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const discovery = await client.listBlockMembers({ type: 'DB', number: 7 });
+      expect(discovery.members.some(member => member.path === 'Details.Ready')).toBe(true);
+      expect(client.report).toMatchObject({ cpuState: 'STOP', connected: true,
+        capabilities: { objectExplore: true, symbolicLidRead: false, namedSymbolResolution: false } });
+      const count = server.requests.length;
+      await expect(client.readSymbol('SampleDB.Enabled')).rejects.toMatchObject({ code: 'CPU_STATE' });
+      expect(server.requests).toHaveLength(count);
+      expect(client.connected).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
   it('fails before transmission for invalid selectors or unqualified members', async () => {
     const server = await fixture({ metadata: true });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
