@@ -22,7 +22,7 @@ const activeHosts = new Set();
 const DEFAULT_LIMITS = Object.freeze({
   requestTimeoutMs: 5000, tlsHandshakeTimeoutMs: 10000, sessionDurationMs: 60000, maxRequests: 12,
   maxRequestBytes: 900, maxResponseBytes: 65536, maxSessionBytes: 262144,
-  maxUploadBytes: 1048576, pacingMs: 250, maxObjects: 32,
+  maxUploadBytes: 1048576, pacingMs: 250, maxObjects: 65536, maxDepth: 256, maxDiagnosticEntries: 128,
   maxLatencyMs: 4000, latencyFactor: 5,
 });
 
@@ -96,6 +96,8 @@ export class S7CommPlusClient {
   #tlsEstablished = false;
   /** @type {Map<number, BlockMetadata>} */
   #blocks = new Map();
+  /** @type {Awaited<ReturnType<S7CommPlusClient['listDataBlocks']>>|undefined} */
+  #inventory;
   /** @type {Map<number, Awaited<ReturnType<S7CommPlusClient['explore']>>>} */
   #types = new Map();
   /** @type {WeakMap<RuntimeMember,{block:BlockMetadata,member:RuntimeMember,metadataEvidence:unknown}>} */
@@ -130,7 +132,7 @@ export class S7CommPlusClient {
     for (const [name, value] of Object.entries(this.#limits)) {
       if (!Number.isSafeInteger(value) || value <= 0) throw new PlusError('ARGUMENT', `Invalid budget ${name}`);
     }
-    if (this.#limits.pacingMs < 250 || this.#limits.maxRequestBytes > 900 || this.#limits.maxResponseBytes > 1048576 || this.#limits.maxObjects > 4096 || this.#limits.maxRequests > 65535) {
+    if (this.#limits.pacingMs < 250 || this.#limits.maxRequestBytes > 900 || this.#limits.maxResponseBytes > 16777216 || this.#limits.maxObjects > 262144 || this.#limits.maxDepth > 1024 || this.#limits.maxDiagnosticEntries > 4096 || this.#limits.maxRequests > 10000000) {
       throw new PlusError('ARGUMENT', 'Pacing or allocation exceeds the qualified envelope');
     }
     this.#options = { ...options, tls: options.tls ? { ...options.tls } : undefined };
@@ -209,7 +211,7 @@ export class S7CommPlusClient {
       this.#sessionId = created.cursor.uint();
       if (!this.#sessionId) throw new PlusError('SESSION_CREATE_REJECTED', 'PLC returned null session ID');
       if (count === 2) created.cursor.uint();
-      const objects = decodeObjects(created.cursor, this.#limits.maxObjects);
+      const objects = decodeObjects(created.cursor, this.#limits.maxObjects, this.#limits.maxDepth);
       const attributes = objects.flatMap(object => object.attributes);
       const versions = attributes.filter(attribute => attribute.id === 306);
       const sessionObjects = objects.filter(object => object.rid === 288 && object.classId === 287 && object.parentRid === null);
@@ -249,7 +251,7 @@ export class S7CommPlusClient {
         this.#integrityId++;
         this.#writeIntegrityId++;
         this.#legacyAuthenticated = true;
-        this.#observations.push({ kind: 'legacySessionKey', fingerprint: legacyMaterial.fingerprint, authenticatedPackets: true, encryptedTransport: false });
+        this.#record(this.#observations, { kind: 'legacySessionKey', fingerprint: legacyMaterial.fingerprint, authenticatedPackets: true, encryptedTransport: false });
       }
       this.#established = true;
       this.#ready = true;
@@ -281,7 +283,7 @@ export class S7CommPlusClient {
         returnedExploreId = response.cursor.uint32();
         this.#checkIntegrity(response.cursor, response.expectedIntegrityId);
       }
-      const objects = decodeObjects(response.cursor, this.#limits.maxObjects);
+      const objects = decodeObjects(response.cursor, this.#limits.maxObjects, this.#limits.maxDepth);
       return { objectId, returnedExploreId, objects, receivedAt: new Date().toISOString(), completeness: 'BOUNDED_RESPONSE_NOT_FULL_INVENTORY',
         correlation: response.correlation };
     } catch (error) { this.#stop(this.#asError(error)); throw error; }
@@ -295,7 +297,7 @@ export class S7CommPlusClient {
       .flatMap(attribute => /** @type {{id:number,value:PlusValue}[]} */ (attribute.value.value))
       .filter(member => member.id === 0xD9E && member.value.datatype === 8).map(member => member.value.value);
     this.#cpuState = codes.length && codes.every(code => code === 8) ? 'RUN' : codes.length && codes.every(code => code === 4) ? 'STOP' : 'UNKNOWN';
-    this.#observations.push({ kind: 'cpuState', value: this.#cpuState, evidence: result });
+    this.#record(this.#observations, { kind: 'cpuState', value: this.#cpuState, evidence: result });
     if (this.#cpuState === 'UNKNOWN') {
       const error = new PlusError('CPU_STATE', 'CPU operating state is unknown; acquisition stopped');
       this.#stop(error);
@@ -317,16 +319,19 @@ export class S7CommPlusClient {
 
   async listDataBlocks() {
     this.#requireReady();
+    if (this.#inventory) return this.#inventory;
     const evidence = await this.#explore(3, { recursive: true, attributes: [233, 2521] });
     const blocks = evidence.objects.filter(object => object.classId === 2574 && (object.rid >>> 16) === 0x8A0E).map(object => {
       const names = object.attributes.filter(attribute => attribute.id === 233 && typeof attribute.value.value === 'string');
       if (names.length > 1) throw new PlusError('AMBIGUOUS_METADATA', 'DB has multiple native names');
       return { type: /** @type {const} */ ('DB'), number: object.rid & 0xFFFF,
         name: names[0]?.value.value ?? null, objectRid: object.rid, typeInfoId: null,
-        status: 'TYPE_UNRESOLVED', evidence };
+        status: 'TYPE_UNRESOLVED', evidence: { objectRid: object.rid, attributes: object.attributes,
+          correlation: evidence.correlation, receivedAt: evidence.receivedAt } };
     });
     if (new Set(blocks.map(block => block.number)).size !== blocks.length) throw new PlusError('AMBIGUOUS_METADATA', 'Duplicate DB runtime identities');
-    return { blocks, completeness: evidence.completeness, receivedAt: evidence.receivedAt };
+    this.#inventory = { blocks, completeness: evidence.completeness, receivedAt: evidence.receivedAt };
+    return this.#inventory;
   }
 
   async listProgramBlocks() {
@@ -519,8 +524,8 @@ export class S7CommPlusClient {
     this.#requireReady();
     const maxTypes = options.maxTypes ?? 8;
     const maxMembers = options.maxMembers ?? 4096;
-    if (!Number.isSafeInteger(maxTypes) || maxTypes < 1 || maxTypes > 32 || !Number.isSafeInteger(maxMembers) || maxMembers < 1 || maxMembers > 4096) {
-      throw new PlusError('ARGUMENT', 'Discovery budgets require 1..32 types and 1..4096 members');
+    if (!Number.isSafeInteger(maxTypes) || maxTypes < 1 || maxTypes > 65536 || !Number.isSafeInteger(maxMembers) || maxMembers < 1 || maxMembers > 1048576) {
+      throw new PlusError('ARGUMENT', 'Discovery budgets require 1..65536 types and 1..1048576 members');
     }
     const block = await this.getBlockMetadata(selector);
     /** @type {PlusObject[]} */
@@ -528,20 +533,22 @@ export class S7CommPlusClient {
     /** @type {unknown[]} */
     const evidence = [];
     const pending = block.typeInfoId ? [block.typeInfoId] : [];
+    const queued = new Set(pending);
+    const byId = new Map();
     const visited = new Set();
-    while (pending.length && visited.size < maxTypes) {
-      const id = /** @type {number} */ (pending.shift());
+    for (let offset = 0; offset < pending.length && visited.size < maxTypes; offset++) {
+      const id = pending[offset];
       if (visited.has(id)) continue;
       visited.add(id);
       const info = await this.getTypeInfo(id);
       evidence.push(info.evidence);
       for (const object of info.evidence.objects.filter(object => object.classId === 511)) {
-        const previous = objects.find(candidate => candidate.rid === object.rid);
+        const previous = byId.get(object.rid);
         if (previous && JSON.stringify(previous) !== JSON.stringify(object)) throw new PlusError('METADATA_CHANGED', 'Conflicting native type definitions in one discovery');
-        if (!previous) objects.push(object);
+        if (!previous) { objects.push(object); byId.set(object.rid, object); }
         for (const entry of object.typeMembers ?? []) {
           const relation = entry.offset.relationId;
-          if (relation && !visited.has(relation) && !pending.includes(relation)) pending.push(relation);
+          if (relation && !queued.has(relation)) { pending.push(relation); queued.add(relation); }
         }
       }
     }
@@ -644,6 +651,12 @@ export class S7CommPlusClient {
     if (!this.connected) throw new PlusError('SESSION_REQUIRED', 'No usable S7CommPlus session');
   }
 
+  /** @param {any[]} entries @param {any} entry */
+  #record(entries, entry) {
+    entries.push(entry);
+    if (entries.length > this.#limits.maxDiagnosticEntries) entries.splice(0, entries.length - this.#limits.maxDiagnosticEntries);
+  }
+
   /** @param {Cursor} cursor @param {number|undefined} expected */
   #checkIntegrity(cursor, expected) {
     if (expected === undefined) return;
@@ -694,12 +707,12 @@ export class S7CommPlusClient {
         assertOutgoing(frame, operation, context, sequence);
         this.#requests++;
         this.#lastRequest = performance.now();
-        this.#transcript.push({ direction: 'out', kind: operation.kind, sequence, hex: frame.toString('hex') });
+        this.#record(this.#transcript, { direction: 'out', kind: operation.kind, sequence, hex: frame.toString('hex').slice(0, 2048) });
         if (this.#tls) this.#tls.write(frame);
         else this.#sendDT(frame);
       });
       const latencyMs = performance.now() - started;
-      this.#observations.push({ kind: operation.kind, sequence, latencyMs: Number(latencyMs.toFixed(3)), responseBytes: incoming.body.length });
+      this.#record(this.#observations, { kind: operation.kind, sequence, latencyMs: Number(latencyMs.toFixed(3)), responseBytes: incoming.body.length });
       const latencyKey = JSON.stringify(operation);
       const baseline = this.#baselines.get(latencyKey);
       if (latencyMs > this.#limits.maxLatencyMs || (baseline && latencyMs > Math.max(1000, baseline * this.#limits.latencyFactor))) {
@@ -722,7 +735,7 @@ export class S7CommPlusClient {
         this.#tlsEstablished && operation.kind === 'createSession', this.#options.securityMode === 'legacy' && operation.kind === 'initSSL',
         !!this.#sessionKey && operation.kind === 'activateSession');
       if (decoded.statusDetails.returnValue !== '0x0000000000000000') {
-        this.#observations.push({ kind: operation.kind === 'initSSL' ? 'legacyInitSSLStatus' : `${operation.kind}Status`, ...decoded.statusDetails,
+        this.#record(this.#observations, { kind: operation.kind === 'initSSL' ? 'legacyInitSSLStatus' : `${operation.kind}Status`, ...decoded.statusDetails,
           interpretation: operation.kind === 'initSSL' ? 'Explicit legacy profile continues after a recognized InitSSL rejection; no TLS downgrade performed' : 'Session objects and setup must validate before establishment' });
       }
       return { ...decoded, version: incoming.version, expectedIntegrityId: this.#sessionKey && operation.kind === 'activateSession' ? undefined : expectedIntegrityId,
@@ -787,7 +800,7 @@ export class S7CommPlusClient {
       if (this.#tcp.length < length) break;
       const cotp = this.#tcp.subarray(4, length);
       this.#tcp = this.#tcp.subarray(length);
-      this.#transcript.push({ direction: 'in', layer: 'TPKT', hex: Buffer.concat([Buffer.from([3, 0, length >> 8, length & 255]), cotp]).toString('hex') });
+      this.#record(this.#transcript, { direction: 'in', layer: 'TPKT', hex: Buffer.concat([Buffer.from([3, 0, length >> 8, length & 255]), cotp]).toString('hex').slice(0, 2048) });
       if (this.#phase === 'cotp') {
         if (cotp[0] !== cotp.length - 1) throw new PlusError('MALFORMED_RESPONSE', 'COTP confirm length mismatch');
         this.#settle(Buffer.from(cotp));
@@ -810,10 +823,10 @@ export class S7CommPlusClient {
   #onApplication(bytes) {
     const confirmations = this.#plus.sessionConfirmations;
     const messages = this.#plus.feed(bytes);
-    if (this.#plus.sessionConfirmations !== confirmations) this.#observations.push({ kind: 'sessionConfirmation', count: this.#plus.sessionConfirmations });
+    if (this.#plus.sessionConfirmations !== confirmations) this.#record(this.#observations, { kind: 'sessionConfirmation', count: this.#plus.sessionConfirmations });
     if (messages.length > 1 || (messages.length && !this.#pending)) throw new PlusError('CORRELATION', 'Unexpected unsolicited or duplicate response');
     if (messages.length) {
-      if (this.#tlsEstablished) this.#transcript.push({ direction: 'in', layer: 'S7CommPlus', version: messages[0].version, hex: messages[0].body.toString('hex') });
+      if (this.#tlsEstablished) this.#record(this.#transcript, { direction: 'in', layer: 'S7CommPlus', version: messages[0].version, hex: messages[0].body.toString('hex').slice(0, 2048) });
       this.#settle(messages[0]);
     }
   }
@@ -848,7 +861,7 @@ export class S7CommPlusClient {
         }
         this.#tlsVerified = !allowAnyCertificate;
         this.#tlsEstablished = true;
-        this.#observations.push({ kind: 'tls', protocol: this.#tls?.getProtocol(), cipher: this.#tls?.getCipher().name, certificateVerified: this.#tlsVerified });
+        this.#record(this.#observations, { kind: 'tls', protocol: this.#tls?.getProtocol(), cipher: this.#tls?.getCipher().name, certificateVerified: this.#tlsVerified });
         this.#settle(true);
       });
       this.#tls.on('error', error => {

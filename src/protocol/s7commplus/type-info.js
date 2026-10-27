@@ -19,7 +19,7 @@ const WIRE_TYPES = new Map([[1, 1], [2, 10], [4, 11], [5, 7], [6, 12], [7, 8],
 
 /** @param {BlockMetadata} block @param {PlusObject[]} objects @param {number} [maxMembers] */
 export function buildBlockMembers(block, objects, maxMembers = 4096) {
-  if (!Number.isSafeInteger(maxMembers) || maxMembers < 1 || maxMembers > 4096) throw new PlusError('ARGUMENT', 'Member budget must be 1..4096');
+  if (!Number.isSafeInteger(maxMembers) || maxMembers < 1 || maxMembers > 1048576) throw new PlusError('ARGUMENT', 'Member budget must be 1..1048576');
   /** @type {Map<number, PlusObject[]>} */
   const types = new Map();
   for (const object of objects.filter(object => object.classId === 511)) types.set(object.rid, [...(types.get(object.rid) ?? []), object]);

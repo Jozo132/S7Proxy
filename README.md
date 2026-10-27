@@ -1,6 +1,6 @@
 # S7Proxy
 
-S7Comm proxy and client library with an AssemblyScript WASM protocol engine. Connects to Siemens S7 PLCs (S7-300/400/1200/1500) over TCP with automatic failover, data acquisition, structured DB access, and a REST/WebSocket API.
+S7Comm/S7CommPlus proxy and client library with an AssemblyScript WASM protocol engine for classic S7Comm and a separate experimental native read-only S7CommPlus client. Classic S7Comm connects to Siemens S7 PLCs (S7-300/400/1200/1500) over TCP with automatic failover, data acquisition, structured DB access, and a REST/WebSocket API.
 
 ## Features
 
@@ -11,6 +11,7 @@ S7Comm proxy and client library with an AssemblyScript WASM protocol engine. Con
 - **REST + WebSocket API** — lightweight built-in HTTP endpoints and real-time WebSocket push with slow-consumer protection
 - **S7Comm proxy** — transparent TCP proxy with TSAP/IP-based routing and allow/deny filtering
 - **snap7 compatibility** — `S7Client` read/write subset and `S7Server`; unimplemented metadata, upload and control methods return explicit errors
+- **Native S7CommPlus** - experimental read-only TLS and legacy S7-1200 sessions, DB/type discovery, typed symbolic reads, and restricted in-memory program-content extraction
 - **Worker thread mode** — run the proxy in an isolated worker
 - **Prometheus metrics** — built-in `/metrics` endpoint
 
@@ -21,6 +22,24 @@ npm install s7proxy
 ```
 
 Requires Node.js >= 20.
+
+## Recent Updates
+
+### 0.4.2 (current source)
+
+- Cached DB inventories within a client session, avoiding repeated inventory requests. Per-block evidence retains the relevant object's attributes and response correlation instead of the entire inventory.
+- More efficient nested-type discovery using indexed lookups and a deduplicated traversal queue, with higher configurable object, depth, response, request and member limits. These are allocation ceilings, not hardware qualification or guarantees of complete discovery.
+- Bounded diagnostic history through `limits.maxDiagnosticEntries` (default `128`, maximum `4096`) for each observation/transcript collection. Transcript hex fields retain at most 1024 bytes per entry; reports are diagnostic samples, not guaranteed complete wire captures.
+
+### 0.4.1
+
+- Separate object-count and nesting-depth limits in the native object decoder, with specific errors identifying which limit was exceeded.
+
+### 0.4.0
+
+- Explicit legacy S7-1200 SessionKey setup and activation, with HMAC-SHA256 verification of requests and response fragments. Legacy traffic is not encrypted and there is no automatic TLS downgrade.
+- Explicitly configured PLC hostnames/IPs and ports, optional certificate-validation bypass, TLS 1.2/1.3 negotiation, and a separate TLS handshake deadline. Strict certificate verification remains the default.
+- Improved compatibility with composite service-status replies and operation-specific latency checks. Authorized testing obtained one genuine process-value read from each of twelve responding S7-1200 CPUs; other families and security profiles remain unqualified.
 
 ## Native Read-Only S7CommPlus Foundation
 
@@ -99,9 +118,22 @@ deadline is 10 seconds (`limits.tlsHandshakeTimeoutMs`), separate from the
 5-second request deadline. The identification CLI retains 3-second ordinary
 request deadlines and a 20-second session ceiling.
 
-Discovery defaults to 32 decoded objects per reply. For larger programs, explicitly
-set `limits.maxObjects`, for example `256`; values up to `4096` are accepted.
-Response-byte, depth, session, pacing and request-count limits still apply.
+The current source uses the following client limits. All budgets remain active
+independently; increasing the object limit does not increase response bytes,
+session duration or the request budget.
+
+| Limit | Default | Maximum accepted |
+| --- | ---: | ---: |
+| `limits.maxObjects` | 65,536 | 262,144 |
+| `limits.maxDepth` | 256 | 1,024 |
+| `limits.maxResponseBytes` | 65,536 bytes | 16,777,216 bytes |
+| `limits.maxRequests` | 12 | 10,000,000 |
+
+The default session ceiling remains 60 seconds, total received-byte budget
+262,144 bytes, and minimum pacing 250 ms. Configure larger budgets deliberately
+for an authorized acquisition; accepted maxima do not establish safe PLC load
+or support for every program size. The earlier live-test budgets below describe
+those specific runs, not the current defaults.
 
 Historical plaintext CreateObject attempts were rejected; the numeric cause is
 not established. Subsequent authorized lab testing established verified
@@ -169,8 +201,13 @@ containing context; struct-array access paths include the native element selecto
 Unknown types, references/pointers, recursive or unavailable types, ambiguous
 names, packed BOOL arrays and expansion limits remain explicit and unreadable.
 Defaults permit eight type queries and 4096 expanded members, still subject to
-the client's request/byte/time budgets. Raise session budgets explicitly when
-querying multiple blocks; there are no implicit reconnects or retries.
+the client's request/byte/time budgets. The current source accepts explicit
+`listBlockMembers(selector, { maxTypes, maxMembers })` budgets up to 65,536 type
+queries and 1,048,576 expanded members. Raising these ceilings does not make
+recursive, ambiguous or unsupported layouts readable. DB inventories and type
+queries are cached within the client session; use a new client session for a
+fresh snapshot. Raise session budgets explicitly when querying multiple blocks;
+there are no implicit reconnects or retries.
 
 `readMember()` accepts only readable descriptors discovered by that client.
 It checks the returned wire datatype and retains the raw value, request/response
