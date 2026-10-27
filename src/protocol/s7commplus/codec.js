@@ -454,8 +454,8 @@ function decodeMemberNames(cursor) {
   }
 }
 
-/** @param {Cursor} cursor @param {number} [maxObjects] */
-export function decodeObjects(cursor, maxObjects = 32) {
+/** @param {Cursor} cursor @param {number} [maxObjects] @param {number} [maxDepth] */
+export function decodeObjects(cursor, maxObjects = 65536, maxDepth = 256) {
   /** @type {PlusObject[]} */
   const objects = [];
   /** @type {PlusObject[]} */
@@ -467,7 +467,8 @@ export function decodeObjects(cursor, maxObjects = 32) {
       break;
     }
     if (tag === 0xA1) {
-      if (objects.length >= maxObjects || stack.length >= 16) throw new PlusError('RESPONSE_LIMIT', 'Object/depth budget exceeded');
+      if (objects.length >= maxObjects) throw new PlusError('RESPONSE_LIMIT', `Object count exceeds configured limit ${maxObjects}`);
+      if (stack.length >= maxDepth) throw new PlusError('RESPONSE_LIMIT', `Object depth exceeds configured limit ${maxDepth}`);
       /** @type {PlusObject} */
       const object = { rid: cursor.uint32(), classId: cursor.uint(), classFlags: cursor.uint(), attributeId: cursor.uint(),
         parentRid: stack.at(-1)?.rid ?? null, attributes: /** @type {{id:number,value:PlusValue}[]} */ ([]) };
