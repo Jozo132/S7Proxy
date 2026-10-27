@@ -17,6 +17,8 @@ describe('S7CommPlus read-only codec', () => {
     expect(() => new S7CommPlusClient({ host: 'invalid/host' })).toThrow(/IP address or hostname/);
     expect(() => new S7CommPlusClient({ host: '127.0.0.1', productionReadOnly: false })).toThrow(/cannot disable/);
     expect(() => new S7CommPlusClient({ host: '127.0.0.1', limits: { pacingMs: 1 } })).toThrow(/Pacing/);
+    expect(() => new S7CommPlusClient({ host: '127.0.0.1', limits: { maxConnectionsPerTarget: 17 } })).toThrow(/allocation/);
+    expect(() => new S7CommPlusClient({ host: '127.0.0.1', limits: { maxQueuedRequests: 4097 } })).toThrow(/allocation/);
     expect(() => new S7CommPlusClient({ host: '127.0.0.1', securityMode: 'tls' })).toThrow(/CA certificate/);
     const client = new S7CommPlusClient({ host: '127.0.0.1' });
     await expect(client.uploadBlock({ number: 1 })).rejects.toThrow(/nothing transmitted/);
@@ -204,8 +206,6 @@ describe('S7CommPlus loopback lifecycle (never live)', () => {
       expect(client.report.identity).toMatchObject({ orderNumber: 'TEST-ORDER', firmware: 'V0.0', model: null });
       expect(client.report.cpuState).toBe('RUN');
       expect(client.report.effectiveProtectionLevel).toBe(2);
-      const second = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
-      await expect(second.connect()).rejects.toThrow(/One active/);
       const result = await client.explore(3, { attributes: [233] });
       expect(result.objects[0].rid).toBe(3);
       const value = await client.readSymbolic({ accessArea: 0x8A0E0001, lids: [1], name: 'fixtureOnly' });
@@ -223,6 +223,100 @@ describe('S7CommPlus loopback lifecycle (never live)', () => {
     } finally { await client.disconnect(); await server.close(); }
     expect(client.connected).toBe(false);
     expect(client.report.sessionEstablished).toBe(true);
+  });
+  it('bounds parallel endpoint sessions and releases only the disconnected connection', async () => {
+    const server = await fixture();
+    const clients = Array.from({ length: 3 }, (_, index) => new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxConnectionsPerTarget: index === 2 ? 16 : 2 } }));
+    try {
+      await Promise.all(clients.slice(0, 2).map(client => client.connect()));
+      await expect(clients[2].connect()).rejects.toMatchObject({ code: 'SESSION_LIMIT' });
+      const values = await Promise.all(clients.slice(0, 2).map(client => client.readSymbolic({ accessArea: 0x8A0E0001, lids: [9] })));
+      expect(values.map(value => value.value.value)).toEqual([42, 42]);
+      expect(clients.slice(0, 2).map(client => client.report.statistics.requests)).toEqual([6, 6]);
+      await clients[0].disconnect();
+      await clients[0].disconnect();
+      await clients[2].connect();
+      expect(await clients[1].readCpuState()).toBe('RUN');
+      expect(clients[2].connected).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await Promise.all(clients.map(client => client.disconnect())); await server.close(); }
+  });
+  it('accounts for host and port separately and releases slots after failed handshakes', async () => {
+    const options = { wrongSequence: true };
+    const server = await fixture(options);
+    const otherServer = await fixture();
+    const failed = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxConnectionsPerTarget: 1 } });
+    const clients = [server, otherServer].map(endpoint => new S7CommPlusClient({ host: '127.0.0.1', port: endpoint.port, limits: { maxConnectionsPerTarget: 1 } }));
+    try {
+      await expect(failed.connect()).rejects.toMatchObject({ code: 'CORRELATION' });
+      expect(failed.report.concurrency.activeConnectionsPerTarget).toBe(0);
+      options.wrongSequence = false;
+      await Promise.all(clients.map(client => client.connect()));
+      expect(clients.every(client => client.connected)).toBe(true);
+      expect(clients.map(client => client.report.concurrency.activeConnectionsPerTarget)).toEqual([1, 1]);
+    } finally { await Promise.all([failed, ...clients].map(client => client.disconnect())); await Promise.all([server.close(), otherServer.close()]); }
+  });
+  it('queues concurrent calls FIFO with independent address snapshots and response correlation', async () => {
+    const server = await fixture();
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const addresses = [9, 10, 11].map(lid => ({ accessArea: 0x8A0E0001, lids: [lid] }));
+      const reads = addresses.map(address => client.readSymbolic(address));
+      addresses[1].lids[0] = 999;
+      expect(client.report.concurrency).toMatchObject({ inFlightRequests: 1, queuedRequests: 2 });
+      const results = await Promise.all(reads);
+      expect(results.map(result => result.correlation.sequence)).toEqual([5, 6, 7]);
+      expect(results.map(result => result.correlation.request.lids)).toEqual([[9], [10], [11]]);
+      expect(results.map(result => result.address.lids)).toEqual([[9], [10], [11]]);
+      expect(results.every(result => result.timing.sentAtMonotonicMs > 0 && result.timing.receivedAtMonotonicMs >= result.timing.sentAtMonotonicMs && result.timing.latencyMs >= 0)).toBe(true);
+      expect(client.report.concurrency).toMatchObject({ inFlightRequests: 0, queuedRequests: 0 });
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('rejects queue overflow without closing the healthy session or sending the rejected call', async () => {
+    const server = await fixture();
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxQueuedRequests: 1 } });
+    try {
+      await client.connect();
+      const first = client.readSymbolic({ accessArea: 0x8A0E0001, lids: [9] });
+      const second = client.readSymbolic({ accessArea: 0x8A0E0001, lids: [10] });
+      await expect(client.readSymbolic({ accessArea: 0x8A0E0001, lids: [11] })).rejects.toMatchObject({ code: 'REQUEST_QUEUE_FULL' });
+      await Promise.all([first, second]);
+      expect(client.connected).toBe(true);
+      expect(client.report.failure).toBeNull();
+      expect(server.requests).toHaveLength(7);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('does not exceed the request budget when concurrent calls are queued', async () => {
+    const server = await fixture();
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 6 } });
+    try {
+      await client.connect();
+      const results = await Promise.allSettled([9, 10, 11].map(lid => client.readSymbolic({ accessArea: 0x8A0E0001, lids: [lid] })));
+      expect(results[0].status).toBe('fulfilled');
+      expect(results.slice(1).every(result => result.status === 'rejected' && result.reason.code === 'REQUEST_LIMIT')).toBe(true);
+      expect(client.report.statistics.requests).toBe(6);
+      expect(client.report.concurrency.queuedRequests).toBe(0);
+      expect(server.requests).toHaveLength(6);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['disconnect', 'disconnect-pending', 'timeout'])('settles active and queued requests on %s without affecting another session', async mode => {
+    const server = await fixture({ readStall: true });
+    const clients = Array.from({ length: 2 }, () => new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { requestTimeoutMs: 400 } }));
+    try {
+      await Promise.all(clients.map(client => client.connect()));
+      const results = Promise.allSettled([9, 10, 11].map(lid => clients[0].readSymbolic({ accessArea: 0x8A0E0001, lids: [lid] })));
+      if (mode === 'disconnect-pending') await vi.waitFor(() => expect(server.requests.some(request => request.functionCode === 0x054C)).toBe(true));
+      if (mode !== 'timeout') await clients[0].disconnect();
+      const settled = await results;
+      expect(settled.every(result => result.status === 'rejected' && result.reason.code === (mode === 'timeout' ? 'TIMEOUT' : 'DISCONNECTED'))).toBe(true);
+      expect(clients[0].report.concurrency.queuedRequests).toBe(0);
+      expect(await clients[1].readCpuState()).toBe('RUN');
+      expect(server.requests.filter(request => request.functionCode === 0x054C)).toHaveLength(mode === 'disconnect' ? 0 : 1);
+      expect(server.errors).toEqual([]);
+    } finally { await Promise.all(clients.map(client => client.disconnect())); await server.close(); }
   });
   it.each([
     [{ state: 6 }, 'CPU_STATE', 4],
@@ -362,6 +456,40 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
     certificateSha256 = new X509Certificate(credentials.cert).fingerprint256.replaceAll(':', '').toLowerCase();
   });
   afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
+  it('keeps TLS integrity, native member ownership and queued reads isolated across parallel sessions', async () => {
+    const server = await fixture({ tls: credentials, metadata: true });
+    const clients = Array.from({ length: 2 }, () => new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 }, limits: { maxRequests: 24 } }));
+    try {
+      await Promise.all(clients.map(client => client.connect()));
+      const discoveries = await Promise.all(clients.map(client => client.listBlockMembers({ type: 'DB', number: 7 })));
+      const members = discoveries.map(discovery => discovery.members.find(member => member.path === 'Enabled' && member.readable));
+      if (!members[0] || !members[1]) throw new Error('Missing fixture members');
+      await expect(clients[0].readMember(members[1])).rejects.toMatchObject({ code: 'UNVERIFIED_ADDRESS' });
+      const results = await Promise.all(clients.flatMap((client, index) => [client.readMember(/** @type {NonNullable<typeof members[0]>} */ (members[index])), client.readMember(/** @type {NonNullable<typeof members[0]>} */ (members[index]))]));
+      expect(results.every(result => result.observation.value === true && result.observation.quality === 'GOOD')).toBe(true);
+      expect(clients.every(client => client.report.securityMode === 'TLS_VERIFIED')).toBe(true);
+      await clients[0].disconnect();
+      expect(await clients[1].readCpuState()).toBe('RUN');
+      expect(server.errors).toEqual([]);
+    } finally { await Promise.all(clients.map(client => client.disconnect())); await server.close(); }
+  });
+  it('requires exclusive endpoint ownership for CPU start and blocks new sessions during control', async () => {
+    const server = await fixture({ tls: credentials, programContent: true, state: 4, cpuStart: 'success' });
+    const clients = Array.from({ length: 3 }, () => new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 }, limits: { maxRequests: 16 } }));
+    const confirmation = { confirmRun: true, confirmTarget: `127.0.0.1:${server.port}` };
+    try {
+      await Promise.all(clients.slice(0, 2).map(client => client.connect()));
+      await expect(clients[0].cpuStart(confirmation)).rejects.toMatchObject({ code: 'CONCURRENCY_LIMIT' });
+      expect(server.requests.some(request => request.functionCode === 0x04F2)).toBe(false);
+      await clients[1].disconnect();
+      const start = clients[0].cpuStart(confirmation);
+      await expect(clients[2].connect()).rejects.toMatchObject({ code: 'CONCURRENCY_LIMIT' });
+      await expect(start).resolves.toMatchObject({ after: 'RUN', commandSent: true, verified: true });
+      expect(server.errors).toEqual([]);
+    } finally { await Promise.all(clients.map(client => client.disconnect())); await server.close(); }
+  });
   it.each(['good', 'item-error', 'wrong-type'])('validates verified TLS read batches: %s', async mode => {
     const server = await fixture({ tls: credentials, metadata: true, memberError: mode === 'item-error', memberTypeMismatch: mode === 'wrong-type' });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
@@ -377,6 +505,8 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
           const results = await client.readMembers(members);
           expect(results).toHaveLength(65);
           expect(results.every(result => result.observation.value === true && result.observation.quality === 'GOOD')).toBe(true);
+          expect(results.every(result => result.request.sentAtMonotonicMs > 0 && result.request.receivedAtMonotonicMs >= result.request.sentAtMonotonicMs)).toBe(true);
+          expect(new Set(results.map(result => result.request.sequence)).size).toBe(3);
         }
         expect(client.report.securityMode).toBe('TLS_VERIFIED');
       } else {

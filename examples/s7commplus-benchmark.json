@@ -1,0 +1,42 @@
+{
+  "dbNumbers": [1, 2],
+  "maxConnectionsPerTarget": 4,
+  "maxLatencyMs": 1000,
+  "maxRequestsPerLane": 20000,
+  "maxSweepsPerLane": 10000,
+  "stages": [
+    {
+      "name": "boolean-50ms",
+      "durationMs": 5000,
+      "lanes": [
+        { "id": "booleans", "type": "boolean", "periodMs": 0, "readPacingMs": 50, "maxItems": 32 },
+        { "id": "numeric", "type": "numeric", "periodMs": 500, "readPacingMs": 50, "maxItems": 32 }
+      ]
+    },
+    {
+      "name": "boolean-20ms",
+      "durationMs": 5000,
+      "lanes": [
+        { "id": "booleans", "type": "boolean", "periodMs": 0, "readPacingMs": 20, "maxItems": 32 },
+        { "id": "numeric", "type": "numeric", "periodMs": 500, "readPacingMs": 20, "maxItems": 32 }
+      ]
+    },
+    {
+      "name": "boolean-10ms",
+      "durationMs": 5000,
+      "lanes": [
+        { "id": "booleans", "type": "boolean", "periodMs": 0, "readPacingMs": 10, "maxItems": 32 },
+        { "id": "numeric", "type": "numeric", "periodMs": 500, "readPacingMs": 10, "maxItems": 32 }
+      ]
+    },
+    {
+      "name": "replicated-boolean-load",
+      "durationMs": 5000,
+      "lanes": [
+        { "id": "booleans-a", "type": "boolean", "periodMs": 0, "readPacingMs": 10, "maxItems": 32 },
+        { "id": "booleans-b", "type": "boolean", "periodMs": 0, "readPacingMs": 10, "maxItems": 32 },
+        { "id": "numeric", "type": "numeric", "periodMs": 500, "readPacingMs": 10, "maxItems": 32 }
+      ]
+    }
+  ]
+}

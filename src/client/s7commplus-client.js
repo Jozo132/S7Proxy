@@ -18,18 +18,22 @@ import { createLegacySessionKey, encodeLegacySecurityKey } from '../protocol/s7c
 /** @import { PlusOperation, PlusObject, PlusValue } from '../protocol/s7commplus/codec.js' */
 /** @import { BlockMetadata, RuntimeMember } from '../protocol/s7commplus/type-info.js' */
 export { getProductionHost } from '../protocol/production-policy.js';
-const activeHosts = new Set();
+/** @type {Map<string, Set<S7CommPlusClient>>} */
+const activeConnections = new Map();
 const DEFAULT_LIMITS = Object.freeze({
   requestTimeoutMs: 5000, tlsHandshakeTimeoutMs: 10000, sessionDurationMs: 60000, maxRequests: 12,
   maxRequestBytes: 900, maxResponseBytes: 65536, maxSessionBytes: 262144,
   maxUploadBytes: 1048576, pacingMs: 250, readPacingMs: 250, maxObjects: 65536, maxDepth: 256, maxDiagnosticEntries: 128,
-  maxLatencyMs: 4000, latencyFactor: 5,
+  maxLatencyMs: 4000, latencyFactor: 5, maxConnectionsPerTarget: 4, maxQueuedRequests: 32,
 });
 
 /** @typedef {Partial<Record<keyof typeof DEFAULT_LIMITS,number>>} PlusLimits */
 /** @typedef {ReturnType<typeof buildBlockMembers> & {evidence:unknown[],receivedAt:string}} BlockDiscovery */
 /** @typedef {{host?:string,port?:number,productionReadOnly?:boolean,securityMode?:'discovery'|'legacy'|'tls',tls?:{ca?:string|Buffer,servername?:string,certificateSha256?:string,allowAnyCertificate?:boolean,minVersion?:'TLSv1.2'|'TLSv1.3'},limits?:PlusLimits}} PlusOptions */
 /** @typedef {{resolve:(value:any)=>void,reject:(error:Error)=>void,timer:ReturnType<typeof setTimeout>}} Pending */
+/** @typedef {{sentAtMonotonicMs:number,receivedAtMonotonicMs:number,latencyMs:number,requestBytes:number,responseBytes:number}} RequestTiming */
+/** @typedef {ReturnType<typeof responsePayload> & {version:number,expectedIntegrityId:number|undefined,timing:RequestTiming,correlation:{sequence:number,functionCode:number,integrityId:number|null,request:PlusOperation,responseBody:Buffer,fragmentCount:number}}} ExchangeResult */
+/** @typedef {{operation:PlusOperation,resolve:(value:ExchangeResult)=>void,reject:(error:Error)=>void}} QueuedRequest */
 
 export class S7CommPlusClient {
   /** @type {Socket|null} */
@@ -60,6 +64,9 @@ export class S7CommPlusClient {
   /** @type {Buffer|undefined} */
   #serverVersion;
   #busy = false;
+  /** @type {QueuedRequest[]} */
+  #requestQueue = [];
+  #pacingAbort = new AbortController();
   #started = 0;
   #lastRequest = 0;
   /** @type {Map<string,number>} */
@@ -112,6 +119,8 @@ export class S7CommPlusClient {
   #uploadBusy = false;
   #cpuStartBusy = false;
   #modeChangeAttempted = false;
+  /** @type {string|undefined} */
+  #connectionKey;
 
   /** @param {PlusOptions} [options] */
   constructor(options = {}) {
@@ -139,7 +148,7 @@ export class S7CommPlusClient {
     for (const [name, value] of Object.entries(this.#limits)) {
       if (!Number.isSafeInteger(value) || value <= 0) throw new PlusError('ARGUMENT', `Invalid budget ${name}`);
     }
-    if (this.#limits.pacingMs < 250 || this.#limits.readPacingMs < 10 || this.#limits.maxRequestBytes > 900 || this.#limits.maxResponseBytes > 16777216 || this.#limits.maxObjects > 262144 || this.#limits.maxDepth > 1024 || this.#limits.maxDiagnosticEntries > 4096 || this.#limits.maxRequests > 10000000) {
+    if (this.#limits.pacingMs < 250 || this.#limits.readPacingMs < 10 || this.#limits.maxRequestBytes > 900 || this.#limits.maxResponseBytes > 16777216 || this.#limits.maxObjects > 262144 || this.#limits.maxDepth > 1024 || this.#limits.maxDiagnosticEntries > 4096 || this.#limits.maxRequests > 10000000 || this.#limits.maxConnectionsPerTarget > 16 || this.#limits.maxQueuedRequests > 4096) {
       throw new PlusError('ARGUMENT', 'Pacing or allocation exceeds the qualified envelope');
     }
     this.#options = { ...options, tls: options.tls ? { ...options.tls } : undefined };
@@ -156,6 +165,10 @@ export class S7CommPlusClient {
       selectedProfile: this.#options.securityMode === 'tls' ? 'TLS' : 'LEGACY_PLAINTEXT',
       allowAnyCertificate: this.#options.tls?.allowAnyCertificate === true,
       peerCertificateSha256: this.#peerCertificateSha256,
+      concurrency: { connectionType: 'HMI', maxConnectionsPerTarget: this.#limits.maxConnectionsPerTarget,
+        activeConnectionsPerTarget: activeConnections.get(JSON.stringify([this.#host.toLowerCase(), this.#port]))?.size ?? 0,
+        maxInFlightRequests: 1, maxQueuedRequests: this.#limits.maxQueuedRequests,
+        queuedRequests: this.#requestQueue.length, inFlightRequests: this.#busy ? 1 : 0 },
       identity: this.#identity, cpuState: this.#cpuState, effectiveProtectionLevel: this.#protection,
       capabilities: { objectExplore: this.#ready, symbolicLidRead: this.#ready && this.#cpuState === 'RUN',
         namedSymbolResolution: this.#ready && this.#cpuState === 'RUN' && this.#namedMembers.length > 0,
@@ -171,22 +184,27 @@ export class S7CommPlusClient {
 
   async connect() {
     if (this.#phase !== 'idle') throw new PlusError('SESSION_STATE', 'Create a new client for an explicit new attempt');
-    if (activeHosts.has(this.#host)) throw new PlusError('SESSION_LIMIT', 'One active connection per target is permitted');
-    activeHosts.add(this.#host);
+    const key = JSON.stringify([this.#host.toLowerCase(), this.#port]);
+    const connections = activeConnections.get(key) ?? new Set();
+    if ([...connections].some(client => client.#cpuStartBusy)) throw new PlusError('CONCURRENCY_LIMIT', 'CPU start owns this endpoint');
+    const limit = Math.min(this.#limits.maxConnectionsPerTarget, ...[...connections].map(client => client.#limits.maxConnectionsPerTarget));
+    if (connections.size >= limit) throw new PlusError('SESSION_LIMIT', 'Concurrent connection budget for this endpoint is exhausted');
+    connections.add(this);
+    activeConnections.set(key, connections);
+    this.#connectionKey = key;
     this.#started = performance.now();
     this.#durationTimer = setTimeout(() => this.#stop(new PlusError('SESSION_LIMIT', 'Session duration budget exhausted')), this.#limits.sessionDurationMs);
     try {
       this.#phase = 'tcp';
       const socket = new Socket();
       this.#socket = socket;
-      this.#closed = new Promise(resolve => socket.once('close', () => { activeHosts.delete(this.#host); resolve(); }));
+      this.#closed = new Promise(resolve => socket.once('close', () => { this.#releaseConnection(); resolve(); }));
       socket.setNoDelay(true);
       socket.on('data', (/** @type {Buffer} */ bytes) => {
         try { this.#onTCP(bytes); } catch (error) { this.#stop(this.#asError(error)); }
       });
       socket.on('error', error => this.#stop(new PlusError('TRANSPORT_REJECTED', `${this.#phase}: ${error.message}`, { transportCode: /** @type {NodeJS.ErrnoException} */ (error).code })));
       socket.on('close', () => {
-        activeHosts.delete(this.#host);
         if (this.#phase !== 'closed' && !this.#failure) this.#stop(new PlusError('PEER_CLOSED', `Peer closed during ${this.#phase}`));
       });
       await this.#wait(() => socket.connect(this.#port, this.#host, () => this.#settle(true)));
@@ -340,7 +358,7 @@ export class S7CommPlusClient {
       throw new PlusError('SECURITY_REQUIRED', 'CPU start requires TLS and verified identity, or explicit allowUnverifiedIdentity for an isolated lab');
     }
     if (this.#protection !== 1) throw new PlusError('ACCESS_RESTRICTED', 'CPU start requires effective full access');
-    if (this.#cpuStartBusy || this.#uploadBusy || this.#busy) throw new PlusError('CONCURRENCY_LIMIT', 'CPU start cannot overlap another operation');
+    if (this.#cpuStartBusy || this.#uploadBusy || this.#busy || this.#requestQueue.length || (activeConnections.get(this.#connectionKey ?? '')?.size ?? 0) > 1) throw new PlusError('CONCURRENCY_LIMIT', 'CPU start requires an exclusive idle connection');
     if (this.#limits.maxRequests - this.#requests < 5) throw new PlusError('REQUEST_LIMIT', 'CPU start requires a state read, one command and up to three verification reads');
     this.#cpuStartBusy = true;
     try {
@@ -683,7 +701,7 @@ export class S7CommPlusClient {
         if (errors.size) throw new PlusError('ITEM_REJECTED', 'Native batch contains rejected items', { items: [...errors].map(([number, code]) => ({ number, code: code.toString(16) })) });
         if (values.size !== count) throw new PlusError('DATA_UNAVAILABLE', 'PLC omitted one or more requested items');
         const receivedAt = new Date().toISOString();
-        for (let ordinal = 0; ordinal < count; ordinal++) results.push({ observation: {
+        for (let ordinal = 0; ordinal < count; ordinal++) results.push({ request: { sequence: response.correlation.sequence, integrityId: response.correlation.integrityId, ...response.timing }, observation: {
           ...validateMemberValue(plan.bindings[offset + ordinal].member, values.get(ordinal + 1)), quality: 'GOOD', source: 'S7COMMPLUS_RESPONSE', receivedAt, nativeTimestamp: null,
         } });
         offset += count;
@@ -704,7 +722,7 @@ export class S7CommPlusClient {
   async readSymbolic(address) {
     this.#requireReady();
     if (this.#cpuState !== 'RUN') throw new PlusError('CPU_STATE', 'Symbolic read requires a genuine RUN reply');
-    return this.#readSymbolicValue(address);
+    return this.#readSymbolicValue(structuredClone(address));
   }
 
   /** @param {{accessArea:number,lids:number[],symbolCrc?:number,name?:string,datatypeIdentity?:unknown}} address */
@@ -729,7 +747,7 @@ export class S7CommPlusClient {
       if (response.cursor.uint() !== 0 || response.cursor.uint() !== 0) throw new PlusError('MALFORMED_RESPONSE', 'Unexpected item or error list');
       this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
       return { address: structuredClone(address), value, status: 'GOOD', receivedAt: new Date().toISOString(), nativeTimestamp: null,
-        correlation: response.correlation };
+        correlation: response.correlation, timing: response.timing };
     } catch (error) { this.#stop(this.#asError(error)); throw error; }
   }
 
@@ -740,18 +758,29 @@ export class S7CommPlusClient {
 
   async disconnect() {
     clearTimeout(this.#durationTimer);
+    this.#pacingAbort.abort();
     this.#sessionKey?.fill(0);
     const socket = this.#socket;
     this.#ready = false;
     this.#phase = 'closed';
-    this.#settle(undefined, new PlusError('DISCONNECTED', 'Own session disconnected'));
-    if (!socket || socket.destroyed) { await this.#closed; return; }
+    const error = new PlusError('DISCONNECTED', 'Own session disconnected');
+    this.#settle(undefined, error);
+    this.#rejectQueue(error);
+    if (!socket || socket.destroyed) { await this.#closed; this.#releaseConnection(); return; }
     await new Promise(resolve => {
       const timer = setTimeout(() => socket.destroy(), 1000);
       socket.once('close', () => { clearTimeout(timer); resolve(undefined); });
       this.#tls?.end();
       socket.end();
     });
+  }
+
+  #releaseConnection() {
+    if (this.#connectionKey === undefined) return;
+    const connections = activeConnections.get(this.#connectionKey);
+    connections?.delete(this);
+    if (!connections?.size) activeConnections.delete(this.#connectionKey);
+    this.#connectionKey = undefined;
   }
 
   /** @param {boolean} [allowCpuStart] */
@@ -795,8 +824,38 @@ export class S7CommPlusClient {
     if (fields.length >= 3) { this.#identity.orderNumber = fields[1].trim() || null; this.#identity.firmware = fields[2].trim() || null; }
   }
 
-  /** @param {PlusOperation} operation */
+  /** @param {PlusOperation} operation @returns {Promise<ExchangeResult>} */
   async #exchange(operation) {
+    if (this.#failure) throw this.#failure;
+    if (this.#phase === 'closed') throw new PlusError('DISCONNECTED', 'Own session disconnected');
+    const snapshot = structuredClone(operation);
+    if (this.#busy || this.#requestQueue.length) {
+      if (!this.#ready || operation.kind === 'cpuStart') throw new PlusError('CONCURRENCY_LIMIT', 'Session setup and control cannot be queued');
+      if (this.#requestQueue.length >= this.#limits.maxQueuedRequests) throw new PlusError('REQUEST_QUEUE_FULL', 'Bounded session request queue is full');
+      return new Promise((resolve, reject) => this.#requestQueue.push({ operation: snapshot, resolve, reject }));
+    }
+    return this.#runExchange(snapshot);
+  }
+
+  /** @param {PlusOperation} operation @returns {Promise<ExchangeResult>} */
+  async #runExchange(operation) {
+    try { return await this.#exchangeNow(operation); }
+    finally {
+      queueMicrotask(() => {
+        if (this.#busy || this.#failure || this.#phase === 'closed') return;
+        const request = this.#requestQueue.shift();
+        if (request) this.#runExchange(request.operation).then(request.resolve, request.reject);
+      });
+    }
+  }
+
+  /** @param {Error} error */
+  #rejectQueue(error) {
+    for (const request of this.#requestQueue.splice(0)) request.reject(error);
+  }
+
+  /** @param {PlusOperation} operation */
+  async #exchangeNow(operation) {
     if (this.#busy) throw new PlusError('CONCURRENCY_LIMIT', 'Only one outstanding request');
     if (this.#failure) throw this.#failure;
     if (this.#requests >= this.#limits.maxRequests) throw new PlusError('REQUEST_LIMIT', 'Request count exhausted');
@@ -813,19 +872,25 @@ export class S7CommPlusClient {
       if (frame.length > this.#limits.maxRequestBytes) throw new PlusError('REQUEST_LIMIT', 'Configured request-byte budget exceeded');
       const pacing = operation.kind === 'read' && operation.items ? this.#limits.readPacingMs : this.#limits.pacingMs;
       const wait = pacing - (performance.now() - this.#lastRequest);
-      if (wait > 0) await delay(wait);
+      if (wait > 0) await delay(wait, undefined, { signal: this.#pacingAbort.signal }).catch(() => {
+        throw this.#failure ?? new PlusError('DISCONNECTED', 'Own session disconnected');
+      });
       if (this.#failure) throw this.#failure;
-      const started = performance.now();
+      if (this.#phase === 'closed') throw new PlusError('DISCONNECTED', 'Own session disconnected');
+      let sentAtMonotonicMs = 0;
       const incoming = await this.#wait(() => {
         assertOutgoing(frame, operation, context, sequence);
         if (operation.kind === 'cpuStart') this.#modeChangeAttempted = true;
         this.#requests++;
-        this.#lastRequest = performance.now();
         this.#record(this.#transcript, { direction: 'out', kind: operation.kind, sequence, hex: frame.toString('hex').slice(0, 2048) });
+        sentAtMonotonicMs = performance.now();
+        this.#lastRequest = sentAtMonotonicMs;
         if (this.#tls) this.#tls.write(frame);
         else this.#sendDT(frame);
       });
-      const latencyMs = performance.now() - started;
+      const receivedAtMonotonicMs = incoming.receivedAtMonotonicMs;
+      const latencyMs = receivedAtMonotonicMs - sentAtMonotonicMs;
+      const timing = { sentAtMonotonicMs, receivedAtMonotonicMs, latencyMs, requestBytes: frame.length, responseBytes: incoming.body.length };
       this.#record(this.#observations, { kind: operation.kind, sequence, latencyMs: Number(latencyMs.toFixed(3)), responseBytes: incoming.body.length });
       const latencyKey = JSON.stringify(operation);
       const baseline = this.#baselines.get(latencyKey);
@@ -852,7 +917,7 @@ export class S7CommPlusClient {
         this.#record(this.#observations, { kind: operation.kind === 'initSSL' ? 'legacyInitSSLStatus' : `${operation.kind}Status`, ...decoded.statusDetails,
           interpretation: operation.kind === 'initSSL' ? 'Explicit legacy profile continues after a recognized InitSSL rejection; no TLS downgrade performed' : 'Session objects and setup must validate before establishment' });
       }
-      return { ...decoded, version: incoming.version, expectedIntegrityId: this.#sessionKey && operation.kind === 'activateSession' ? undefined : expectedIntegrityId,
+      return { ...decoded, timing, version: incoming.version, expectedIntegrityId: this.#sessionKey && operation.kind === 'activateSession' ? undefined : expectedIntegrityId,
         correlation: { sequence, functionCode: PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)],
           integrityId: expectedIntegrityId ?? null, request: structuredClone(operation), responseBody: Buffer.from(incoming.body),
           fragmentCount: this.#plus.lastMessageFragmentCount } };
@@ -941,7 +1006,7 @@ export class S7CommPlusClient {
     if (messages.length > 1 || (messages.length && !this.#pending)) throw new PlusError('CORRELATION', 'Unexpected unsolicited or duplicate response');
     if (messages.length) {
       if (this.#tlsEstablished) this.#record(this.#transcript, { direction: 'in', layer: 'S7CommPlus', version: messages[0].version, hex: messages[0].body.toString('hex').slice(0, 2048) });
-      this.#settle(messages[0]);
+      this.#settle({ ...messages[0], receivedAtMonotonicMs: performance.now() });
     }
   }
 
@@ -993,11 +1058,14 @@ export class S7CommPlusClient {
   #asError(error) { return error instanceof PlusError ? error : new PlusError('PROTOCOL', error instanceof Error ? error.message : String(error)); }
   /** @param {PlusError} error */
   #stop(error) {
+    if (error.code === 'REQUEST_QUEUE_FULL') return;
     if (!this.#failure) this.#failurePhase = this.#phase;
     this.#failure ??= error;
     this.#ready = false;
     clearTimeout(this.#durationTimer);
+    this.#pacingAbort.abort();
     this.#settle(undefined, this.#failure);
+    this.#rejectQueue(this.#failure);
     this.#tls?.destroy();
     this.#tunnel?.destroy();
     this.#socket?.destroy();

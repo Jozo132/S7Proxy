@@ -79,7 +79,7 @@ export function validateSessionRequest(request, index, secure = false, reference
   return functionCode;
 }
 
-/** @param {FixtureOptions & {cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number}} [options] */
+/** @param {FixtureOptions & {cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number,readStall?:boolean}} [options] */
 export async function fixture(options = {}) {
   /** @type {import('node:net').Socket[]} */
   const sockets = [];
@@ -104,6 +104,7 @@ export async function fixture(options = {}) {
     let cpuStarted = false;
     let readIntegrity = 0;
     let writeIntegrity = 0;
+    let requestCount = 0;
     /** @param {Buffer} data */
     function sendDT(data) {
       for (let offset = 0; offset < data.length; offset += 1000) {
@@ -122,7 +123,7 @@ export async function fixture(options = {}) {
       const wireRequest = application.subarray(0, length);
       application = application.subarray(length);
       let request = wireRequest;
-      if (options.legacyKey && requests.length >= 3) {
+      if (options.legacyKey && requestCount >= 3) {
         assert.equal(wireRequest[1], 3, 'Authenticated client never downgrades');
         const applicationBody = wireRequest.subarray(37, -4);
         assert.deepEqual(wireRequest.subarray(5, 37), createHmac('sha256', options.legacyKey.sessionKey).update(applicationBody).digest());
@@ -130,9 +131,9 @@ export async function fixture(options = {}) {
       }
       const sequence = request.readUInt16BE(11);
       let functionCode;
-      if (options.legacyKey && requests.length >= 2) {
+      if (options.legacyKey && requestCount >= 2) {
         functionCode = request.readUInt16BE(7);
-        assert.equal(sequence, requests.length);
+        assert.equal(sequence, requestCount);
         assert.equal(request.readUInt32BE(13), 77);
         if (![0x04BB, 0x054C].includes(functionCode)) assert.equal(request.readUInt32BE(18), 77);
         if (sequence === 2) {
@@ -150,18 +151,20 @@ export async function fixture(options = {}) {
           assert.deepEqual([activation.uint(), activation.uint()], [1, 323]);
           assert.deepEqual([...activation.take(3)], [0, 2, 5]);
         } else assert.ok([0x04BB, 0x054C, 0x0586].includes(functionCode), 'No process writes or control');
-      } else if (options.cpuStart && requests.length >= 3 && request.readUInt16BE(7) === 0x04F2) {
+      } else if (options.cpuStart && requestCount >= 3 && request.readUInt16BE(7) === 0x04F2) {
         functionCode = 0x04F2;
         assert.ok(secureSocket, 'CPU start fixture requires TLS');
-        assert.equal(sequence, requests.length);
+        assert.equal(sequence, requestCount);
         assert.equal(request.readUInt32BE(13), 77);
         assert.deepEqual(request.subarray(18, -4), Buffer.from('00000034019077000803000004e88969001200000000896a001300896b00040000000000000000', 'hex'));
         cpuStarted = options.cpuStart === 'success';
-      } else functionCode = validateSessionRequest(request, requests.length, !!secureSocket, options.reference ?? false);
+      } else functionCode = validateSessionRequest(request, requestCount, !!secureSocket, options.reference ?? false);
+      requestCount++;
       requests.push({ functionCode, sequence, receivedAt: Date.now(), frame: Buffer.from(wireRequest) });
       if (functionCode === 0x04F2 && options.cpuStart === 'lost') { socket.destroy(); return; }
       if (options.terminate) { socket.end(); return; }
       if (options.stall) return;
+      if (options.readStall && functionCode === 0x054C) return;
       const header = Buffer.alloc(10);
       header[0] = 0x32; header.writeUInt16BE(functionCode, 3);
       header.writeUInt16BE(options.wrongSequence ? sequence + 1 : sequence, 7);
@@ -210,7 +213,7 @@ export async function fixture(options = {}) {
           cursor.uint();
           const path = Array.from({ length: count }, () => cursor.uint());
           const value = path[0] === 1 ? Buffer.concat([Buffer.from([0, 18]), u32(0x92000007)])
-            : path.at(-1) === 107 ? Buffer.from([0, 7, 0xFF, 0x85])
+            : path.at(-1) === 107 || path[0] === 125 ? Buffer.from([0, 7, 0xFF, 0x85])
             : path.at(-1) === 130 ? Buffer.from([0x10, 2, 10, 8, 4, 84, 69, 83, 84, 0, 0, 0, 0])
             : path.at(-1) === 112 ? Buffer.from([0, 8, 0x7F]) : Buffer.from([0, 1, 1]);
           if (options.memberError && path[0] !== 1) errors.push(vlq(ordinal), vlq(0x8104));

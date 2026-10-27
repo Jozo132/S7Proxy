@@ -43,6 +43,121 @@ Requires Node.js >= 20.
 - Explicitly configured PLC hostnames/IPs and ports, optional certificate-validation bypass, TLS 1.2/1.3 negotiation, and a separate TLS handshake deadline. Strict certificate verification remains the default.
 - Improved compatibility with composite service-status replies and operation-specific latency checks. Authorized testing obtained one genuine process-value read from each of twelve responding S7-1200 CPUs; other families and security profiles remain unqualified.
 
+## Native Parallel Sampling And Stress Measurement
+
+`src/client/s7commplus-benchmark.js` exports `runS7CommPlusBenchmark(config,
+{ signal, onRecord })`. It opens **one independent native session per lane**,
+discovers that session's own descriptors, then starts all lanes on a shared host
+monotonic clock. It does not use a single connection's queue as a connection pool.
+Each explicit stage gets fresh sessions; discovery is excluded from sampling
+rates. A failure stops sibling traffic and prevents later stages. There are no
+automatic retries, reconnects, writes, CPU mode changes or transport fallbacks.
+
+The [example plan](examples/s7commplus-benchmark.json) selects DB1 and DB2. It
+progressively reduces native read pacing from 50 to 20 to 10 ms, while a second
+connection samples numeric members every 500 ms. Its final stage adds a second
+boolean reader of the **same members** to measure replicated traffic load, not
+sharding. Review DB selection, stages and bounds for the authorized test target
+before use. Read-only traffic can still affect PLC communications and scan time.
+This example has **not** been qualified as safe or sustainable on a real CPU.
+
+From this repository, with the authorized CA path and independently approved
+certificate SHA256 in `S7PLUS_TLS_CA` and `S7PLUS_TLS_CERT_SHA256`:
+
+```bash
+node src/plus-benchmark.js --live --acknowledge-load --host 192.168.1.200 \
+  --tls --config examples/s7commplus-benchmark.json --output trace.ndjson
+```
+
+Use only an explicitly authorized test PLC. Both `--live` and
+`--acknowledge-load` are mandatory; there is no implicit production endpoint.
+`--legacy` selects legacy explicitly. TLS uses the same CA, servername and pin
+environment variables as `plus-explore.js`; `--allow-any-certificate` explicitly
+disables authentication and records `TLS_UNVERIFIED`. `--tls-min-version` accepts
+`TLSv1.2` or `TLSv1.3`. SIGINT/SIGTERM cancels owned sessions. Existing output
+files are never overwritten, and an output-open failure occurs before connection.
+
+Plan fields and hard bounds:
+
+- `dbNumbers`: explicit unique DB numbers, up to `maxBlocks` (default 64, maximum
+  256). All readable supported scalar members of the selected type are included;
+  there is no silent truncation. Empty selections or incomplete structures fail.
+  This harness currently selects DB members, not I/Q/M process-area tags.
+- `stages`: 1..32 uniquely named stages, `durationMs` 50..60000 each, at most
+  300000 ms of sampling total. Setup has a separate `startupTimeoutMs`, default
+  30000 and maximum 120000 per stage.
+- Each lane specifies unique `id`, `type` (`boolean` or `numeric`) and `periodMs`.
+  Zero means back-to-back complete sweeps, still respecting native pacing;
+  otherwise 1..60000 ms is an absolute sweep-start schedule. Overdue slots are
+  skipped, never replayed as catch-up bursts.
+- `readPacingMs`: 10..5000, default 10; this is a minimum request interval, not a
+  PLC sample-time or achievable-rate guarantee. `maxItems`: 1..64, default 32.
+  The existing response/request byte planners can split batches further.
+  `maxMembers`: 1..4096 per lane, default 4096.
+- `maxConnectionsPerTarget`: default 4, maximum 16, subject to the native
+  process-local endpoint admission limit. Each lane needs its own slot.
+- `maxRequestsPerLane`: default 20000, maximum 100000, including setup;
+  `maxSweepsPerLane`: default 10000, maximum 100000. Exhaustion fails the run;
+  it does not silently declare the requested duration completed.
+- `maxLatencyMs`: default 1000, maximum 5000. Existing native latency, request
+  timeout, integrity and CPU RUN checks remain active. Each lane also has a
+  64 MiB session byte budget and 4 MiB response budget.
+- Optional `reference: { archiveSha256, controllerKey }` records an offline
+  project reference, **not** a verified runtime revision or approved AST match.
+
+The NDJSON trace contains `run`, per-lane `manifest`, `sweep`, `stage` and final
+`summary` records. A manifest records ordered member identities (DB number/name,
+path, datatype, RID, type IDs, LID path and metadata CRC), security profile and
+certificate fingerprint. Sweep values use that exact manifest order and identify
+their request sequence; each request retains its monotonic send/receive window,
+integrity ID and application byte counts. Sequence IDs are session-scoped and can
+wrap; join using run, stage, lane and sweep, not sequence alone. BigInts serialize
+as `{ "encoding": "bigint", "decimal": "..." }` rather than losing precision.
+`performance.timeOrigin` in the run record relates host monotonic timestamps to
+host Unix time; it does not synchronize the host with the PLC.
+
+Each lane reports request/sweep/value throughput, byte throughput, skipped periods,
+response deadline overruns, and min/max/mean/stddev/p50/p95/p99 distributions:
+
+- `wirePeriodMs`: actual host application-send intervals, including inter-sweep
+  gaps; `wirePeriodDeltaMs` measures consecutive interval differences (jitter).
+- `latencyMs`: application send to complete assembled response, excluding queued
+  pacing. These are host observations, not NIC timestamps or PLC execution time.
+- `sweepPeriodMs`, signed `sweepPeriodErrorMs` against a nonzero target period,
+  and consecutive `sweepPeriodDeltaMs` distinguish full-set cadence from batches.
+- `scheduleLatenessMs`, `sweepWindowMs` and `outputWaitMs` expose scheduling
+  delay, inter-batch acquisition span and trace sink backpressure separately.
+
+`requestBytes` measures native application request frames; `responseBytes`
+measures assembled response bodies. They are **not** symmetric full TCP/TLS
+wire-byte counts. `sessionStatistics` includes setup and the client's transport
+counters; it is separate from sampling-only application throughput.
+
+`COMPLETED` means the bounded workload finished without acquisition errors, not
+that it met real-time requirements. `periodicScheduleMet` requires no skipped
+periods or response deadline overruns and is null for fastest-mode lanes. Compare
+p99/max lateness, period error and sweep windows against the diagnostic tolerance
+and shortest event duration; an acceptable rate must also be qualified against
+PLC scan/communications load on the real machine. No rate automatically earns a
+"reliable" or "safe" classification. Stop escalation on protocol/latency failures;
+deadline misses are retained so the capacity boundary remains visible.
+
+The CLI serializes records through bounded stream backpressure; output cost is
+part of the measured workload. `--max-trace-bytes` defaults to 134217728 (128 MiB),
+maximum 1073741824. A full budget, disk/write error or interrupted run can leave
+a **partial** trace; require a successful final summary before treating it as
+complete. The library stores bounded timing arrays, not an unbounded value history;
+custom `onRecord` sinks must resolve/reject promptly and honor their own storage
+budgets. Without a sink the library returns metrics but does not retain values.
+
+**Diagnostic limit:** a response window is not a PLC scan timestamp, and a
+multi-batch sweep is not atomic. Fast transitions can occur entirely between
+polls. Offline AST/rung rules may correlate sampled declarations, but polling
+cannot prove rung power, event order within a scan, absence of short pulses or an
+exact state transition time. Scan-synchronous guarantees require PLC-side trace,
+timestamps/counters or an explicitly qualified acquisition mechanism. The portal
+shared polling driver is unchanged; this is a separate native benchmark API/CLI.
+
 ## Native Read-Only S7CommPlus Foundation
 
 `S7CommPlusClient` is a separate experimental native backend with bounded object
@@ -130,12 +245,73 @@ session duration or the request budget.
 | `limits.maxDepth` | 256 | 1,024 |
 | `limits.maxResponseBytes` | 65,536 bytes | 16,777,216 bytes |
 | `limits.maxRequests` | 12 | 10,000,000 |
+| `limits.maxConnectionsPerTarget` | 4 | 16 |
+| `limits.maxQueuedRequests` | 32 | 4,096 |
 
 The default session ceiling remains 60 seconds, total received-byte budget
 262,144 bytes, and minimum pacing 250 ms. Configure larger budgets deliberately
 for an authorized acquisition; accepted maxima do not establish safe PLC load
 or support for every program size. The earlier live-test budgets below describe
 those specific runs, not the current defaults.
+
+### Concurrent HMI Sessions
+
+Each client requests `SIMATIC-ROOT-HMI`, with its own socket, TLS context, session
+ID, sequence/integrity counters, metadata caches and owned member descriptors.
+Multiple clients can connect and issue requests in parallel to the same endpoint.
+The connection registry is scoped to this loaded module in one Node process and
+keyed by case-normalized configured hostname plus port; it does not resolve DNS
+aliases or coordinate independent processes. The smallest connection limit among
+the new client and active clients governs admission. A new client cannot bypass
+an existing client's lower limit by specifying a higher one.
+
+Connecting consumes a slot before TCP setup. Failed handshakes and closed sockets
+release only their owned slot. Disconnecting or failing one client does not close
+another. Connection-limit rejection occurs before opening a socket and does not
+invalidate other sessions. Reconnect still requires an explicit new client after
+a connection attempt; there is no automatic reconnect or retry. A client rejected
+before reserving a connection slot may retry admission explicitly.
+
+Concurrent calls on one client enter a bounded FIFO request queue. Only one
+request is on the wire per session; replies still require exact sequence,
+function, protocol-version and integrity correlation. This is not same-socket
+request pipelining. Use separate clients for actual parallel requests, and
+discover each client's members separately: descriptors cannot cross sessions.
+Queued operations and read addresses are snapshotted when submitted.
+
+When the queue is full, the new call rejects with `REQUEST_QUEUE_FULL` without
+disconnecting the healthy session or transmitting that request. Disconnect aborts
+pacing, rejects active/queued work and prevents later transmission. A transport,
+protocol or request-timeout failure rejects that session's remaining queue; other
+clients remain independent. Request deadlines start when transmitted; queued work
+is also bounded by the overall session deadline. All per-session byte, request,
+latency and pacing budgets remain in force.
+
+```js
+const client = new S7CommPlusClient({
+  host: process.env.PLC_HOST,
+  securityMode: 'tls',
+  tls: approvedTlsConfiguration,
+  limits: { maxConnectionsPerTarget: 4, maxQueuedRequests: 32 },
+});
+```
+
+`client.report.concurrency` reports the HMI role, endpoint connection count,
+queue capacity/current depth, and single in-flight request limit. No pool is
+created automatically; the caller owns every client and must disconnect all of
+them in cleanup, including failed parallel-connect attempts. The TIA runtime
+continues to share its existing session per approved scope rather than opening
+connections per UI request.
+
+CPU start requires an exclusive idle endpoint connection in this process and
+blocks additional connection admission while control is active. STOP, reset and
+generic writes remain denied. These local guards cannot detect a TIA Portal
+connection or a different process. HMI identity and concurrency support do not
+prove PG coexistence or reserve engineering resources on the PLC. Connection
+caps are library bounds, not measured safe CPU capacity; aggregate traffic can
+increase with each session. Qualify load and real TIA online monitoring on the
+specific CPU/firmware before increasing production concurrency. Loopback tests
+do not establish those hardware guarantees.
 
 Historical plaintext CreateObject attempts were rejected; the numeric cause is
 not established. Subsequent authorized lab testing established verified
