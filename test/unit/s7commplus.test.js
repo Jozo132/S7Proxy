@@ -26,6 +26,25 @@ describe('S7CommPlus read-only codec', () => {
   it.each(['write', 'download', 'delete', 'cpuControl', 'invoke', 'setVariable', 'upload', '__proto__'])('denies %s before serialization', kind => {
     expect(() => encodeOperation({ kind }, context, 0)).toThrow(/not allowlisted/);
   });
+  it('denies CPU start and stop without a dedicated authorization context', () => {
+    for (const kind of ['cpuStart', 'cpuStop']) {
+      expect(() => encodeOperation({ kind }, context, 0)).toThrow(/not allowlisted/);
+    }
+  });
+  it('encodes only the explicitly authorized V2 CPU RUN request and rechecks its bytes', () => {
+    const authorized = { version: 2, sessionId: 77, integrityId: 0, cpuStartAuthorized: true };
+    const frame = encodeOperation({ kind: 'cpuStart' }, authorized, 6);
+    expect(frame.toString('hex')).toBe('7202003531000004f2000000060000004d3400000034019077000803000004e88969001200000000896a001300896b0004000000000000000072020000');
+    expect(() => assertOutgoing(frame, { kind: 'cpuStart' }, authorized, 6)).not.toThrow();
+    expect(() => assertOutgoing(frame, { kind: 'cpuStart' }, { ...authorized, cpuStartAuthorized: false }, 6)).toThrow(/not allowlisted/);
+    expect(() => encodeOperation({ kind: 'cpuStop' }, authorized, 6)).toThrow(/not allowlisted/);
+    expect(() => encodeOperation({ kind: 'setVariable' }, authorized, 6)).toThrow(/not allowlisted/);
+    expect(() => encodeOperation({ kind: 'cpuStart', objectId: 53 }, authorized, 6)).toThrow(/arbitrary/);
+    expect(() => encodeOperation({ kind: 'cpuStart' }, { ...authorized, sessionId: 0 }, 6)).toThrow(/owned TLS/);
+    expect(() => encodeOperation({ kind: 'cpuStart' }, { ...authorized, version: 1 }, 6)).toThrow(/owned TLS/);
+    frame[28] = 1;
+    expect(() => assertOutgoing(frame, { kind: 'cpuStart' }, authorized, 6)).toThrow(/canonical/);
+  });
   it('accepts larger inventories within the current default and explicit object budgets', () => {
     const bytes = Buffer.concat(Array.from({ length: 156 }, (_, index) =>
       Buffer.concat([Buffer.from([0xA1]), u32(index + 1), vlq(511), Buffer.from([0, 0, 0xA2])])));
@@ -494,6 +513,48 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
       expect(result.cpuState).toEqual({ before: 'RUN', after: 'RUN' });
       expect(result.omissions).toContainEqual(expect.objectContaining({ status: mode === 'protected' ? 'PROTECTED_BLOCK' : 'NOT_OBSERVED_IN_BOUNDED_INVENTORY' }));
       expect(server.requests.some(request => request.functionCode === 0x04BB && request.frame.readUInt32BE(18) === 0x8A130008)).toBe(false);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['success', 'rejected', 'unchanged', 'badIntegrity', 'badTail', 'lost', 'alreadyRun', 'unverifiedLab'])('performs one explicitly confirmed CPU start: %s', async mode => {
+    const scenario = /** @type {'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost'} */ (mode === 'alreadyRun' || mode === 'unverifiedLab' ? 'success' : mode);
+    const server = await fixture({ tls: credentials, programContent: true, state: mode === 'alreadyRun' ? 8 : 4, cpuStart: scenario });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: mode === 'unverifiedLab' ? { allowAnyCertificate: true } : { ca: credentials.cert, certificateSha256 }, limits: { maxRequests: 12 } });
+    try {
+      await client.connect();
+      await expect(client.cpuStart()).rejects.toMatchObject({ code: 'CPU_START_CONFIRMATION_REQUIRED' });
+      await expect(client.cpuStart({ confirmRun: true, confirmTarget: 'wrong:102' })).rejects.toMatchObject({ code: 'CPU_START_CONFIRMATION_REQUIRED' });
+      expect(server.requests).toHaveLength(5);
+      const start = client.cpuStart({ confirmRun: true, confirmTarget: `127.0.0.1:${server.port}`, allowUnverifiedIdentity: mode === 'unverifiedLab' });
+      await expect(client.cpuStart({ confirmRun: true, confirmTarget: `127.0.0.1:${server.port}` })).rejects.toMatchObject({ code: 'CONCURRENCY_LIMIT' });
+      await expect(client.readCpuState()).rejects.toMatchObject({ code: 'CONCURRENCY_LIMIT' });
+      await expect(client.explore(52)).rejects.toMatchObject({ code: 'CONCURRENCY_LIMIT' });
+      if (mode === 'success' || mode === 'alreadyRun' || mode === 'unverifiedLab') {
+        await expect(start).resolves.toMatchObject({ before: mode === 'alreadyRun' ? 'RUN' : 'STOP', after: 'RUN', commandSent: mode !== 'alreadyRun', verified: true });
+        expect(await client.readCpuState()).toBe('RUN');
+      } else {
+        const code = mode === 'unchanged' ? 'CPU_START_NOT_CONFIRMED' : mode === 'badIntegrity' ? 'INDETERMINATE_PROTOCOL_ERROR'
+          : mode === 'badTail' ? 'UNSUPPORTED_DECODING' : mode === 'lost' ? 'PEER_CLOSED' : 'PLC_REJECTED';
+        await expect(start).rejects.toMatchObject({ code });
+      }
+      expect(server.requests.filter(request => request.functionCode === 0x04F2)).toHaveLength(mode === 'alreadyRun' ? 0 : 1);
+      expect(client.productionReadOnly).toBe(mode === 'alreadyRun');
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['restricted', 'unverified', 'budget'])('denies CPU start before transmission when %s', async mode => {
+    const server = await fixture({ tls: credentials, programContent: mode !== 'restricted', state: 4 });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: mode === 'unverified' ? { allowAnyCertificate: true } : { ca: credentials.cert, certificateSha256 },
+      limits: { maxRequests: mode === 'budget' ? 6 : 12 } });
+    try {
+      await client.connect();
+      await expect(client.cpuStart({ confirmRun: true, confirmTarget: `127.0.0.1:${server.port}` })).rejects.toMatchObject({
+        code: mode === 'restricted' ? 'ACCESS_RESTRICTED' : mode === 'unverified' ? 'SECURITY_REQUIRED' : 'REQUEST_LIMIT',
+      });
+      expect(server.requests).toHaveLength(5);
+      expect(client.productionReadOnly).toBe(true);
       expect(server.errors).toEqual([]);
     } finally { await client.disconnect(); await server.close(); }
   });

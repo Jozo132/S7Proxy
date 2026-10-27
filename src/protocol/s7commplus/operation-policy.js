@@ -12,9 +12,10 @@ const policies = Object.freeze({
 
 export const BLOCK_CONTENT_ATTRIBUTES = Object.freeze([233, 2521, 2580, 2533, 2544, 2546, 2582, 2583]);
 
-/** @param {string} kind */
-export function getOperationPolicy(kind) {
+/** @param {string} kind @param {{cpuStartAuthorized?:boolean}} [authorization] */
+export function getOperationPolicy(kind, authorization = {}) {
   if (Object.hasOwn(policies, kind)) return { classification: policies[/** @type {keyof typeof policies} */ (kind)], allowed: true };
+  if (kind === 'cpuStart' && authorization.cpuStartAuthorized === true) return { classification: 'HIGH_IMPACT_MODE_CHANGE', allowed: true };
   if (['cpuStop', 'cpuStart', 'cpuControl'].includes(kind)) return { classification: 'HIGH_IMPACT_MODE_CHANGE', allowed: false };
   if (['write', 'download', 'delete', 'force', 'setVariable', 'setSecurity'].includes(kind)) return { classification: 'FORBIDDEN_MODIFICATION', allowed: false };
   if (['uploadProgramBlock', 'uploadProgram', 'controllerBackup'].includes(kind)) return { classification: 'UNQUALIFIED_TRANSFER', allowed: false };

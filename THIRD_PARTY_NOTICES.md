@@ -52,6 +52,15 @@ separately licensed project was copied. JavaScript implementations and public
 fixtures are independently constructed. Real controller binaries and engineering
 captures are not distributed.
 
+For CPU start, the pinned MIT reference's `OperatingStateRequest` table informed
+the distinction between the RUN request value (3) and observed RUN state (8).
+SetVariable field ordering, CPU object/attribute identifiers and separate write
+integrity were cross-checked against the public protocol facts in
+`S7CommPlusConnection.SetPlcOperatingState` and Core `Ids`, `SetVariableRequest`
+and `SetVariableResponse` of thomas-v2/S7CommPlusDriver. No source was copied;
+the JavaScript implementation and synthetic request/response tests were written
+independently. The reference Python client does not implement CPU mode changes.
+
 The MIT License (MIT)
 
 Copyright (c) 2013 Gijs Molenaar, Stephan Preeker

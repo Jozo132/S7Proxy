@@ -1,6 +1,6 @@
 # S7Proxy
 
-S7Comm/S7CommPlus proxy and client library with an AssemblyScript WASM protocol engine for classic S7Comm and a separate experimental native read-only S7CommPlus client. Classic S7Comm connects to Siemens S7 PLCs (S7-300/400/1200/1500) over TCP with automatic failover, data acquisition, structured DB access, and a REST/WebSocket API.
+S7Comm/S7CommPlus proxy and client library with an AssemblyScript WASM protocol engine for classic S7Comm and a separate experimental native S7CommPlus client, read-only by default with explicitly confirmed RUN-only CPU control. Classic S7Comm connects to Siemens S7 PLCs (S7-300/400/1200/1500) over TCP with automatic failover, data acquisition, structured DB access, and a REST/WebSocket API.
 
 ## Features
 
@@ -11,7 +11,7 @@ S7Comm/S7CommPlus proxy and client library with an AssemblyScript WASM protocol 
 - **REST + WebSocket API** — lightweight built-in HTTP endpoints and real-time WebSocket push with slow-consumer protection
 - **S7Comm proxy** — transparent TCP proxy with TSAP/IP-based routing and allow/deny filtering
 - **snap7 compatibility** — `S7Client` read/write subset and `S7Server`; unimplemented metadata, upload and control methods return explicit errors
-- **Native S7CommPlus** - experimental read-only TLS and legacy S7-1200 sessions, DB/type discovery, typed symbolic reads, and restricted in-memory program-content extraction
+- **Native S7CommPlus** - experimental TLS and legacy S7-1200 sessions, DB/type discovery, typed symbolic reads, restricted in-memory program-content extraction, and explicitly confirmed TLS CPU start
 - **Worker thread mode** — run the proxy in an isolated worker
 - **Prometheus metrics** — built-in `/metrics` endpoint
 
@@ -392,11 +392,10 @@ archives, `HARDWARE_SOFTWARE_UPLOAD`, `CONTROLLER_BACKUP`, or
 data, memory-card contents, hardware configuration and restore consistency are
 not implemented. RUN observations before/after do not establish an atomic snapshot.
 
-**CPU mode control is unavailable.** There is no STOP/START encoder, authorization
-token issuer or automatic restart in this backend. Selecting
+**STOP and automatic restart remain unavailable.** Selecting
 `stop-required-backup` fails with `EXPLICIT_CPU_STOP_CONFIRMATION_REQUIRED`
 without transmission; flags, stored confirmations and automated acknowledgements
-cannot enable it. A qualified interactive STOP/START workflow remains future
+cannot enable it. A qualified interactive STOP/backup/restart workflow remains future
 work, requiring independent protocol qualification and separately authorized
 equipment shutdown/readiness procedures.
 
@@ -404,6 +403,40 @@ Siemens distinguishes RUN-capable software/hardware uploads from the STOP-only
 consistent online-device backup in its
 [backup options documentation](https://docs.tia.siemens.cloud/r/en-us/v20/creating-a-backup-of-an-s7-cpu/backup-options-for-s7-cpus).
 That product documentation does not qualify S7Proxy's missing backup operations.
+
+### Explicit CPU Start
+
+`cpuStart()` is the only mode-changing API. After the operator has authorized
+starting the equipment, use a connected TLS V2 client with effective full access
+and at least five remaining requests:
+
+```js
+const { host, port } = plc.report.target;
+const result = await plc.cpuStart({
+  confirmRun: true,
+  confirmTarget: `${host}:${port}`,
+});
+console.log(result); // { before: 'STOP', after: 'RUN', commandSent: true, verified: true }
+```
+
+The exact target confirmation is required on every call, not stored in constructor
+configuration. Verified TLS identity is required by default. An isolated lab
+using `tls.allowAnyCertificate: true` additionally requires the explicit per-call
+`allowUnverifiedIdentity: true`; its report remains `TLS_UNVERIFIED`. These options
+do not establish equipment readiness or authorize production operation.
+
+The client freshly reads state, writes DINT(3) only to CPU object 52 / attribute
+2167 using SetVariable and the separate write-integrity counter, then performs up
+to three state reads to confirm RUN. An already-running CPU sends no start command.
+Acknowledgement alone is not success. The command is never retried, including
+after a timeout or lost reply; such failures can leave the actual state unknown.
+Other operations cannot interleave with this workflow. The session's
+`productionReadOnly` report becomes false when a start command is attempted.
+STOP, reset, arbitrary values/addresses and generic writes remain denied.
+
+One isolated CPU 1212C, firmware V4.5, was observed transitioning STOP to RUN on
+2026-10-27, with RUN confirmed twice. This is not qualification of other CPU or
+security profiles; see the qualification report's CPU-start update.
 
 ## Quick Start
 

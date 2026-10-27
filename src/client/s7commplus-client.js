@@ -110,6 +110,8 @@ export class S7CommPlusClient {
   /** @type {{name:string,member:RuntimeMember}[]} */
   #namedMembers = [];
   #uploadBusy = false;
+  #cpuStartBusy = false;
+  #modeChangeAttempted = false;
 
   /** @param {PlusOptions} [options] */
   constructor(options = {}) {
@@ -144,11 +146,11 @@ export class S7CommPlusClient {
     this.#plus = new PlusAssembler(this.#limits.maxResponseBytes);
   }
 
-  get productionReadOnly() { return true; }
+  get productionReadOnly() { return !this.#modeChangeAttempted; }
   get connected() { return this.#ready && !this.#failure && !!this.#socket && !this.#socket.destroyed; }
   get report() {
     return structuredClone({
-      target: { host: this.#host, port: this.#port }, productionReadOnly: true, phase: this.#phase,
+      target: { host: this.#host, port: this.#port }, productionReadOnly: this.productionReadOnly, phase: this.#phase,
       connected: this.connected, protocol: 'S7CommPlus', protocolVersion: this.#version,
       sessionEstablished: this.#established, securityMode: this.#tlsVerified ? 'TLS_VERIFIED' : this.#options.securityMode === 'tls' ? 'TLS_UNVERIFIED' : this.#legacyAuthenticated ? 'LEGACY_SESSION_KEY_INTEGRITY' : 'UNAUTHENTICATED_DISCOVERY',
       selectedProfile: this.#options.securityMode === 'tls' ? 'TLS' : 'LEGACY_PLAINTEXT',
@@ -158,7 +160,7 @@ export class S7CommPlusClient {
       capabilities: { objectExplore: this.#ready, symbolicLidRead: this.#ready && this.#cpuState === 'RUN',
         namedSymbolResolution: this.#ready && this.#cpuState === 'RUN' && this.#namedMembers.length > 0,
         blockUpload: this.#tlsVerified && this.#protection === 1 ? 'BOUNDED_NATIVE_ATTRIBUTE_CONTENT' : 'UNSUPPORTED_PROFILE',
-        controllerBackup: 'UNSUPPORTED_UNQUALIFIED', cpuModeControl: 'DENIED', recurringUploads: false },
+        controllerBackup: 'UNSUPPORTED_UNQUALIFIED', cpuModeControl: this.connected && this.#tlsEstablished && this.#protection === 1 ? 'EXPLICIT_RUN_ONLY' : 'DENIED', recurringUploads: false },
       limits: this.#limits, statistics: { requests: this.#requests, receivedBytes: this.#rxBytes,
         sentBytes: this.#txBytes, elapsedMs: this.#started ? Math.round(performance.now() - this.#started) : 0 },
       observations: this.#observations, transcript: this.#transcript,
@@ -295,7 +297,12 @@ export class S7CommPlusClient {
   }
 
   async readCpuState() {
-    this.#requireReady();
+    return this.#readCpuState();
+  }
+
+  /** @param {boolean} [allowCpuStart] */
+  async #readCpuState(allowCpuStart = false) {
+    this.#requireReady(allowCpuStart);
     const result = await this.#explore(52, { attributes: [0x8BD] });
     const codes = result.objects.filter(object => object.rid === 52)
       .flatMap(object => object.attributes.filter(attribute => attribute.id === 0x8BD && attribute.value.structId === 0xD99))
@@ -320,6 +327,38 @@ export class S7CommPlusClient {
     this.#checkScalarTail(cursor, response.expectedIntegrityId);
     this.#protection = value.value;
     if (this.#protection === null || this.#protection > 2) throw new PlusError('ACCESS_RESTRICTED', `Protection level ${this.#protection}; stop before program exploration`);
+  }
+
+  /** @param {{confirmRun?:boolean,confirmTarget?:string,allowUnverifiedIdentity?:boolean}} [options] */
+  async cpuStart(options = {}) {
+    if (options.confirmRun !== true || options.confirmTarget !== `${this.#host}:${this.#port}`
+      || Object.keys(options).some(key => !['confirmRun', 'confirmTarget', 'allowUnverifiedIdentity'].includes(key))) {
+      throw new PlusError('CPU_START_CONFIRMATION_REQUIRED', 'CPU start requires confirmRun: true and confirmTarget matching host:port');
+    }
+    this.#requireReady();
+    if (!this.#tlsEstablished || this.#version !== 2 || (!this.#tlsVerified && options.allowUnverifiedIdentity !== true)) {
+      throw new PlusError('SECURITY_REQUIRED', 'CPU start requires TLS and verified identity, or explicit allowUnverifiedIdentity for an isolated lab');
+    }
+    if (this.#protection !== 1) throw new PlusError('ACCESS_RESTRICTED', 'CPU start requires effective full access');
+    if (this.#cpuStartBusy || this.#uploadBusy || this.#busy) throw new PlusError('CONCURRENCY_LIMIT', 'CPU start cannot overlap another operation');
+    if (this.#limits.maxRequests - this.#requests < 5) throw new PlusError('REQUEST_LIMIT', 'CPU start requires a state read, one command and up to three verification reads');
+    this.#cpuStartBusy = true;
+    try {
+      const before = await this.#readCpuState(true);
+      if (before === 'RUN') return { before, after: before, commandSent: false, verified: true };
+      const response = await this.#exchange({ kind: 'cpuStart' });
+      this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const after = await this.#readCpuState(true);
+        if (after === 'RUN') {
+          const result = { before, after, commandSent: true, verified: true };
+          this.#record(this.#observations, { kind: 'cpuStartResult', ...result });
+          return result;
+        }
+      }
+      throw new PlusError('CPU_START_NOT_CONFIRMED', 'CPU start was acknowledged but RUN was not observed; command not retried');
+    } catch (error) { this.#stop(this.#asError(error)); throw error; }
+    finally { this.#cpuStartBusy = false; }
   }
 
   async listDataBlocks() {
@@ -715,9 +754,11 @@ export class S7CommPlusClient {
     });
   }
 
-  #requireReady() {
+  /** @param {boolean} [allowCpuStart] */
+  #requireReady(allowCpuStart = false) {
     if (this.#failure) throw this.#failure;
     if (!this.connected) throw new PlusError('SESSION_REQUIRED', 'No usable S7CommPlus session');
+    if (this.#cpuStartBusy && !allowCpuStart) throw new PlusError('CONCURRENCY_LIMIT', 'CPU start is in progress');
   }
 
   /** @param {any[]} entries @param {any} entry */
@@ -764,8 +805,9 @@ export class S7CommPlusClient {
     this.#sequence = (sequence + 1) & 0xFFFF;
     const context = { sessionId: this.#sessionId, version: this.#version, serverVersion: this.#serverVersion,
       securityKey: operation.kind === 'setupSession' ? this.#securityKey : undefined, sessionKey: this.#sessionKey,
+      cpuStartAuthorized: operation.kind === 'cpuStart' && this.#cpuStartBusy,
       integrityId: this.#sessionKey ? operation.kind === 'activateSession' ? this.#writeIntegrityId++ : this.#integrityId++
-        : this.#ready && this.#tls ? this.#integrityId++ : undefined };
+        : this.#ready && this.#tls ? operation.kind === 'cpuStart' ? this.#writeIntegrityId++ : this.#integrityId++ : undefined };
     try {
       const frame = encodeOperation(operation, context, sequence);
       if (frame.length > this.#limits.maxRequestBytes) throw new PlusError('REQUEST_LIMIT', 'Configured request-byte budget exceeded');
@@ -776,6 +818,7 @@ export class S7CommPlusClient {
       const started = performance.now();
       const incoming = await this.#wait(() => {
         assertOutgoing(frame, operation, context, sequence);
+        if (operation.kind === 'cpuStart') this.#modeChangeAttempted = true;
         this.#requests++;
         this.#lastRequest = performance.now();
         this.#record(this.#transcript, { direction: 'out', kind: operation.kind, sequence, hex: frame.toString('hex').slice(0, 2048) });

@@ -39,7 +39,39 @@ Username/password legitimation and other legacy key families remain unsupported.
 
 The sections below retain their historically scoped outcomes and limitations.
 
-**Current outcome: verified lab TLS sessions, native symbolic reads, genuine
+## CPU-Start Update (2026-10-27)
+
+The explicitly authorized isolated Test_v1 lab CPU 1212C (6ES7 212-1AE40-0XB0,
+firmware V4.5) transitioned from STOP to RUN through the new `cpuStart()` API.
+The session freshly observed STOP, sent exactly one SetVariable request to
+CPU object 52 / OperatingStateREQ attribute 2167 with DINT(3), validated its
+response sequence and separate write-integrity counter, and observed RUN twice
+before disconnecting. Nine Plus requests used 2,529 received bytes and 1,198
+sent bytes in approximately 2.54 seconds. No STOP, reset, download, force or
+process-value write was sent.
+
+The communication certificate file was unavailable. The lab session explicitly
+used certificate bypass and the separate per-call unverified-identity opt-in;
+before the start command, its peer certificate fingerprint was compared with
+the previously verified lab session record and matched. This is historical-pin
+continuity evidence, not fresh CA/hostname validation: the session correctly
+remained `TLS_UNVERIFIED`. Exact target, fingerprint, request/response transcript
+and result remain in ignored experimentation storage, not published fixtures.
+
+CPU start requires an exact per-call host:port confirmation, TLS V2, effective
+full access and a bounded state-verification budget. Default codec calls still
+deny mode control, and the authorized encoder accepts no arbitrary address or
+value. STOP and generic writes remain denied. No automatic retry or restart
+workflow is provided. An acknowledged start that never reports RUN fails rather
+than claiming success; communication failures leave the outcome potentially
+unknown. Hardware qualification is limited to this one lab CPU and profile.
+
+The full suite passed 465 tests across 27 files before the live attempt. The
+subsequent transition-isolation and explicit lab-opt-in checks passed all 13
+focused cases, and package type checking passed. Historical statements below
+that no mode-control request was transmitted refer to the earlier investigations.
+
+**Earlier read-only outcome: verified lab TLS sessions, native symbolic reads, genuine
 FC/OB code-content extraction and DB definition extraction succeeded. Two
 software captures produced unchanged component hashes. Full-controller and
 restorable backups remain unsupported; no CPU mode changes were transmitted.**

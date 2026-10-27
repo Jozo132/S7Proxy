@@ -10,6 +10,7 @@ export class PlusError extends Error {
 export const PLUS_FUNCTION = Object.freeze({
   explore: 0x04BB, readBlockContent: 0x04BB, createSession: 0x04CA, setupSession: 0x0542,
   read: 0x054C, readAttribute: 0x0586, initSSL: 0x05B3, activateSession: 0x04F2,
+  cpuStart: 0x04F2,
 });
 
 /** @param {number} value */
@@ -172,7 +173,7 @@ export function createSessionPayload() {
 }
 
 /** @typedef {{kind:string, objectId?:number, attributes?:number[], recursive?:boolean, accessArea?:number, lids?:number[], symbolCrc?:number, attribute?:number, maxItems?:number, items?:{accessArea:number,lids:number[],symbolCrc?:number}[]}} PlusOperation */
-/** @typedef {{sessionId:number, version:number, serverVersion?:Buffer, integrityId?:number, securityKey?:Buffer, sessionKey?:Buffer, sequence?:number}} PlusContext */
+/** @typedef {{sessionId:number, version:number, serverVersion?:Buffer, integrityId?:number, securityKey?:Buffer, sessionKey?:Buffer, sequence?:number, cpuStartAuthorized?:boolean}} PlusContext */
 
 /** @param {{accessArea:number,lids:number[],symbolCrc?:number}} item */
 function encodeReadAddress(item) {
@@ -250,6 +251,13 @@ function operationPayload(operation, context) {
       u32(context.sequence ?? 0).copy(qualified, qualified.length - 4);
       return Buffer.concat([u32(sessionId), Buffer.from([1]), vlq(323), Buffer.from([0, 2, 5]), qualified, Buffer.alloc(3)]);
     }
+    case 'cpuStart': {
+      if (!sessionId || version !== 2 || context.integrityId === undefined || context.sessionKey) {
+        throw new PlusError('SESSION_REQUIRED', 'CPU start requires an owned TLS V2 session with write integrity');
+      }
+      if (Object.keys(operation).some(key => key !== 'kind')) throw new PlusError('READ_ONLY_DENIED', 'CPU start accepts no arbitrary address or value');
+      return Buffer.concat([u32(52), Buffer.from([1]), vlq(2167), Buffer.from([0, 8, 3]), qualifier(2), Buffer.alloc(5)]);
+    }
     case 'readBlockContent':
     case 'explore': {
       const attributes = operation.attributes ?? [];
@@ -287,14 +295,14 @@ function operationPayload(operation, context) {
 
 /** @param {PlusOperation} operation @param {PlusContext} context @param {number} sequence */
 export function encodeOperation(operation, context, sequence) {
-  if (!getOperationPolicy(operation.kind).allowed) throw new PlusError('READ_ONLY_DENIED', `Operation ${operation.kind} is not allowlisted`);
+  if (!getOperationPolicy(operation.kind, context).allowed) throw new PlusError('READ_ONLY_DENIED', `Operation ${operation.kind} is not allowlisted`);
   let payload = operationPayload(operation, { ...context, sequence });
   const functionCode = PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)];
   if (functionCode === undefined) throw new PlusError('READ_ONLY_DENIED', 'Unknown function');
   if (['read', 'explore', 'readBlockContent', 'readAttribute'].includes(operation.kind) && !context.sessionId) {
     throw new PlusError('SESSION_REQUIRED', 'Read requires an established session');
   }
-  if (context.integrityId !== undefined && ['read', 'explore', 'readBlockContent', 'readAttribute', 'activateSession'].includes(operation.kind)) {
+  if (context.integrityId !== undefined && ['read', 'explore', 'readBlockContent', 'readAttribute', 'activateSession', 'cpuStart'].includes(operation.kind)) {
     const tail = ['explore', 'readBlockContent'].includes(operation.kind) ? 5 : context.sessionKey && operation.kind === 'activateSession' ? 3 : 4;
     payload = Buffer.concat([payload.subarray(0, -tail), vlq(context.integrityId), payload.subarray(-tail)]);
   }
@@ -317,7 +325,7 @@ export function encodeOperation(operation, context, sequence) {
 
 /** @param {Buffer} frame @param {PlusOperation} operation @param {PlusContext} context @param {number} sequence */
 export function assertOutgoing(frame, operation, context, sequence) {
-  if (!getOperationPolicy(operation.kind).allowed) throw new PlusError('READ_ONLY_DENIED', `Operation ${operation.kind} is not allowlisted`);
+  if (!getOperationPolicy(operation.kind, context).allowed) throw new PlusError('READ_ONLY_DENIED', `Operation ${operation.kind} is not allowlisted`);
   if (!frame.equals(encodeOperation(operation, context, sequence))) {
     throw new PlusError('READ_ONLY_DENIED', 'Outgoing bytes do not match an allowlisted canonical request');
   }

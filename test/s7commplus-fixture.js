@@ -79,7 +79,7 @@ export function validateSessionRequest(request, index, secure = false, reference
   return functionCode;
 }
 
-/** @param {FixtureOptions & {programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number}} [options] */
+/** @param {FixtureOptions & {cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number}} [options] */
 export async function fixture(options = {}) {
   /** @type {import('node:net').Socket[]} */
   const sockets = [];
@@ -101,6 +101,9 @@ export async function fixture(options = {}) {
     let secureSocket;
     let application = Buffer.alloc(0);
     let stateReads = 0;
+    let cpuStarted = false;
+    let readIntegrity = 0;
+    let writeIntegrity = 0;
     /** @param {Buffer} data */
     function sendDT(data) {
       for (let offset = 0; offset < data.length; offset += 1000) {
@@ -147,8 +150,16 @@ export async function fixture(options = {}) {
           assert.deepEqual([activation.uint(), activation.uint()], [1, 323]);
           assert.deepEqual([...activation.take(3)], [0, 2, 5]);
         } else assert.ok([0x04BB, 0x054C, 0x0586].includes(functionCode), 'No process writes or control');
+      } else if (options.cpuStart && requests.length >= 3 && request.readUInt16BE(7) === 0x04F2) {
+        functionCode = 0x04F2;
+        assert.ok(secureSocket, 'CPU start fixture requires TLS');
+        assert.equal(sequence, requests.length);
+        assert.equal(request.readUInt32BE(13), 77);
+        assert.deepEqual(request.subarray(18, -4), Buffer.from('00000034019077000803000004e88969001200000000896a001300896b00040000000000000000', 'hex'));
+        cpuStarted = options.cpuStart === 'success';
       } else functionCode = validateSessionRequest(request, requests.length, !!secureSocket, options.reference ?? false);
       requests.push({ functionCode, sequence, receivedAt: Date.now(), frame: Buffer.from(wireRequest) });
+      if (functionCode === 0x04F2 && options.cpuStart === 'lost') { socket.destroy(); return; }
       if (options.terminate) { socket.end(); return; }
       if (options.stall) return;
       const header = Buffer.alloc(10);
@@ -174,7 +185,7 @@ export async function fixture(options = {}) {
       } else if (functionCode === 0x04BB) {
         const objectId = request.readUInt32BE(18);
         payload = Buffer.concat([Buffer.from([0]), object(objectId, objectId === 52 ? [{ id: 0x8BD,
-          raw: Buffer.concat([Buffer.from([0, 23]), u32(0xD99), vlq(0xD9E), Buffer.from([0, 8, options.states?.[stateReads++] ?? options.state ?? 8, 0])]) }] : [])]);
+          raw: Buffer.concat([Buffer.from([0, 23]), u32(0xD99), vlq(0xD9E), Buffer.from([0, 8, options.states?.[stateReads++] ?? (cpuStarted ? 8 : options.state ?? 8), 0])]) }] : [])]);
       } else if (functionCode === 0x0586) payload = Buffer.from(options.programContent ? [0, 0, 4, 1] : options.protectionMarker ? [0, 0, 0, 4, 2, 0] : [0, 0, 4, 2]);
       else if (functionCode === 0x054C) payload = options.itemError ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
         : Buffer.from([0, 1, 0, 8, 42, 0, 0, ...(options.badTail ? [99] : [])]);
@@ -214,10 +225,13 @@ export async function fixture(options = {}) {
       }
       if (options.compositeReject && functionCode === 0x04CA) payload = Buffer.concat([encodeTestUInt64(0x8000000000008001n), Buffer.alloc(5)]);
       if (options.legacyKey && functionCode === 0x04F2) payload = Buffer.from([options.legacyBadCounter ? 99 : 0, 6, 0, 0, 0, 0]);
+      if (options.cpuStart && functionCode === 0x04F2) payload = Buffer.from([options.cpuStart === 'rejected' ? 1 : 0]);
       if ((secureSocket && sequence > 2) || (options.legacyKey && sequence > 3)) {
-        const integrity = vlq(options.badIntegrity ? 99 : sequence + sequence - 3);
+        const counter = options.cpuStart ? functionCode === 0x04F2 ? writeIntegrity++ : readIntegrity++ : sequence - 3;
+        const integrity = vlq(options.badIntegrity || (functionCode === 0x04F2 && options.cpuStart === 'badIntegrity') ? 99 : sequence + counter);
         if (functionCode === 0x04BB) payload = Buffer.concat([payload.subarray(0, 1), u32(request.readUInt32BE(18)), integrity, payload.subarray(1), Buffer.alloc(4)]);
         else payload = Buffer.concat([payload, integrity]);
+        if (functionCode === 0x04F2 && options.cpuStart === 'badTail') payload = Buffer.concat([payload, Buffer.from([99])]);
       }
       if (options.malformed === 'reserved') header[1] = 1;
       if (options.malformed === 'opcode') header[0] = 0x31;
