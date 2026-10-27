@@ -8,7 +8,7 @@ import { FrameAssembler } from '../src/protocol/frame-assembler.js';
 import { Cursor, decodeObjects, decodeValue, u32, vlq } from '../src/protocol/s7commplus/codec.js';
 import { metadataExplore } from './s7commplus-metadata-fixture.js';
 
-/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,initVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},abortTLS?:boolean,stallTLS?:boolean,badIntegrity?:boolean,reference?:boolean,compositeReject?:boolean,nonzeroCreateStatus?:boolean,metadata?:boolean,memberError?:boolean,memberTypeMismatch?:boolean,programContent?:boolean,programFailure?:boolean,programStall?:boolean,programEmpty?:boolean}} FixtureOptions */
+/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,initVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},abortTLS?:boolean,stallTLS?:boolean,badIntegrity?:boolean,reference?:boolean,compositeReject?:boolean,nonzeroCreateStatus?:boolean,metadata?:boolean,areaReference?:'invalid'|'zero'|'missing',areaTypeMissing?:boolean,memberError?:boolean,memberTypeMismatch?:boolean,programContent?:boolean,programFailure?:boolean,programStall?:boolean,programEmpty?:boolean}} FixtureOptions */
 
 /** @param {bigint} value */
 export function encodeTestUInt64(value) {
@@ -79,7 +79,7 @@ export function validateSessionRequest(request, index, secure = false, reference
   return functionCode;
 }
 
-/** @param {FixtureOptions & {cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number,readStall?:boolean}} [options] */
+/** @param {FixtureOptions & {cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number,readStall?:boolean,resetOnDisconnect?:boolean,resetOnRead?:boolean}} [options] */
 export async function fixture(options = {}) {
   /** @type {import('node:net').Socket[]} */
   const sockets = [];
@@ -164,6 +164,7 @@ export async function fixture(options = {}) {
       if (functionCode === 0x04F2 && options.cpuStart === 'lost') { socket.destroy(); return; }
       if (options.terminate) { socket.end(); return; }
       if (options.stall) return;
+      if (options.resetOnRead && functionCode === 0x054C) { socket.resetAndDestroy(); return; }
       if (options.readStall && functionCode === 0x054C) return;
       const header = Buffer.alloc(10);
       header[0] = 0x32; header.writeUInt16BE(functionCode, 3);
@@ -193,7 +194,8 @@ export async function fixture(options = {}) {
       else if (functionCode === 0x054C) payload = options.itemError ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
         : Buffer.from([0, 1, 0, 8, 42, 0, 0, ...(options.badTail ? [99] : [])]);
       if (options.metadata && functionCode === 0x04BB && request.readUInt32BE(18) !== 52) {
-        payload = Buffer.concat([Buffer.from([0]), metadataExplore(request.readUInt32BE(18), options.inventorySize)]);
+        const typeMissing = options.areaTypeMissing && [0x90010000, 0x90020000, 0x90030000].includes(request.readUInt32BE(18));
+        payload = Buffer.concat([Buffer.from([0]), typeMissing ? object(request.readUInt32BE(18), []) : metadataExplore(request.readUInt32BE(18), options.inventorySize)]);
       }
       if (options.programContent && functionCode === 0x04BB && request.readUInt32BE(18) !== 52) {
         const rid = request.readUInt32BE(18);
@@ -208,15 +210,18 @@ export async function fixture(options = {}) {
         const errors = [];
         for (let ordinal = 1; ordinal <= itemCount; ordinal++) {
           assert.equal(cursor.uint(), 0, 'Browsed type-entry CRC must not be used as an address CRC');
-          cursor.uint();
+          const accessArea = cursor.uint();
           const count = cursor.uint() - 1;
-          cursor.uint();
+          assert.equal(cursor.uint(), accessArea >= 0x8A0E0000 ? 2550 : 3736);
           const path = Array.from({ length: count }, () => cursor.uint());
-          const value = path[0] === 1 ? Buffer.concat([Buffer.from([0, 18]), u32(0x92000007)])
+          const areaTypes = new Map([[80, 0x90010000], [81, 0x90020000], [82, 0x90030000]]);
+          const areaReference = areaTypes.has(accessArea) && path[0] === 1;
+          const value = areaReference && options.areaReference === 'invalid' ? Buffer.from([0, 8, 1])
+            : path[0] === 1 ? Buffer.concat([Buffer.from([0, 18]), u32(areaReference && options.areaReference === 'zero' ? 0 : areaTypes.get(accessArea) ?? 0x92000007)])
             : path.at(-1) === 107 || path[0] === 125 ? Buffer.from([0, 7, 0xFF, 0x85])
             : path.at(-1) === 130 ? Buffer.from([0x10, 2, 10, 8, 4, 84, 69, 83, 84, 0, 0, 0, 0])
             : path.at(-1) === 112 ? Buffer.from([0, 8, 0x7F]) : Buffer.from([0, 1, 1]);
-          if (options.memberError && path[0] !== 1) errors.push(vlq(ordinal), vlq(0x8104));
+          if ((options.memberError && path[0] !== 1) || (areaReference && options.areaReference === 'missing')) errors.push(vlq(ordinal), vlq(0x8104));
           else values.push(vlq(ordinal), options.memberTypeMismatch && path[0] !== 1 ? Buffer.from([0, 7, 0, 1]) : value);
         }
         payload = Buffer.concat([Buffer.from([0]), ...values, Buffer.from([0]), ...errors, Buffer.from([0])]);
@@ -280,6 +285,7 @@ export async function fixture(options = {}) {
       }
     }
     socket.on('error', () => {});
+    if (options.resetOnDisconnect) socket.on('end', () => socket.resetAndDestroy());
     socket.on('data', (/** @type {Buffer} */ bytes) => {
       try {
         for (const frame of assembler.feed(bytes)) {

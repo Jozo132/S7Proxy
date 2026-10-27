@@ -18,9 +18,10 @@ const VALUE_SIZES = new Map([[1, 3], [2, 3], [4, 4], [5, 4], [6, 6], [7, 7],
   [54, 7], [55, 3], [64, 11]]);
 
 /** @typedef {{type:'DB',number:number,name:string|null,objectRid:number,typeInfoId:number|null,status:string,evidence:unknown}} BlockMetadata */
+/** @typedef {{type:'I'|'Q'|'M',name:'I'|'Q'|'M',objectRid:number,typeInfoId:number|null,status:string,evidence:unknown}} AreaMetadata */
 /** @typedef {{name:string|null,path:string|null,parentPath:string|null,datatype:string,softdatatype:number,memberId:number,typeInfoId:number,referencedTypeInfoId:number|null,accessPath:number[],symbolCrc:number,arrayDimensions:{lowerBound:number,count:number}[],status:string,readable:boolean}} RuntimeMember */
 
-/** @param {BlockMetadata} block @param {PlusObject[]} objects @param {number} [maxMembers] */
+/** @template {{typeInfoId:number|null}} T @param {T} block @param {PlusObject[]} objects @param {number} [maxMembers] */
 export function buildBlockMembers(block, objects, maxMembers = 4096) {
   if (!Number.isSafeInteger(maxMembers) || maxMembers < 1 || maxMembers > 1048576) throw new PlusError('ARGUMENT', 'Member budget must be 1..1048576');
   /** @type {Map<number, PlusObject[]>} */

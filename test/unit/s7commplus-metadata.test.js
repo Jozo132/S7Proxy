@@ -177,6 +177,189 @@ describe('native type metadata', () => {
   });
 });
 
+describe('native I/Q/M area discovery', () => {
+  it('resolves native area type references without browsing DBs', async () => {
+    const server = await fixture({ metadata: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 30, readPacingMs: 10 } });
+    try {
+      await client.connect();
+      for (const [type, objectRid, typeInfoId] of /** @type {const} */ ([['I', 80, 0x90010000], ['Q', 81, 0x90020000], ['M', 82, 0x90030000]])) {
+        const area = await client.getAreaMetadata({ type });
+        expect(area).toMatchObject({ type, name: type, objectRid, typeInfoId, status: 'TYPE_REFERENCE_RESOLVED' });
+        const discovery = await client.listAreaMembers({ type });
+        expect(discovery.area).toEqual(area);
+        expect(discovery.members).toEqual(expect.arrayContaining([expect.objectContaining({ path: 'Enabled', readable: true, datatype: 'BOOL' })]));
+        const selected = ['Enabled', 'Count', 'Details.Ready', 'Samples[-1]', 'Title'].map(path => {
+          const member = discovery.members.find(candidate => candidate.path === path && candidate.readable);
+          if (!member) throw new Error('Missing synthetic area member');
+          return member;
+        });
+        expect(await client.readMember(selected[0])).toMatchObject({ block: { type, objectRid },
+          runtime: { objectRid, typeInfoId, accessPath: [101], symbolCrc: 0 }, observation: { value: true, quality: 'GOOD' } });
+        expect(await client.readSymbol(`${type}.Details.Ready`)).toMatchObject({ runtime: { objectRid, accessPath: [120, 132] } });
+        expect((await client.readMembers(selected, { maxItems: 2 })).map(result => result.observation.value)).toEqual([true, -123, true, -123, 'TEST']);
+      }
+      expect(server.requests.some(request => request.functionCode === 0x04BB && request.frame.readUInt32BE(18) === 3)).toBe(false);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+
+  it('rejects invalid area selectors and discovery budgets before transmission', async () => {
+    const server = await fixture({ metadata: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const before = server.requests.length;
+      for (const selector of [null, undefined, 'I', {}, { type: 'DB', number: 7 }, { type: 'i' }, { type: 'I', number: 0 }, { type: 'constructor' }, { type: '__proto__' }]) {
+        await expect(client.getAreaMetadata(/** @type {any} */ (selector))).rejects.toMatchObject({ code: 'ARGUMENT' });
+        await expect(client.listAreaMembers(/** @type {any} */ (selector))).rejects.toMatchObject({ code: 'ARGUMENT' });
+      }
+      for (const options of [null, [], { maxTypes: 0 }, { maxTypes: 65537 }, { maxTypes: 1.5 }, { maxMembers: 0 }, { maxMembers: 1048577 }, { recursive: false }]) {
+        await expect(client.listAreaMembers({ type: 'I' }, /** @type {any} */ (options))).rejects.toMatchObject({ code: 'ARGUMENT' });
+      }
+      expect(server.requests).toHaveLength(before);
+      expect(client.connected).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+
+  it('isolates cached area metadata, budgets and name bindings from DBs and other areas', async () => {
+    const server = await fixture({ metadata: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 40, readPacingMs: 10 } });
+    try {
+      await client.connect();
+      const selector = { type: /** @type {'I'|'Q'|'M'} */ ('I') };
+      const pending = client.getAreaMetadata(selector);
+      selector.type = 'Q';
+      const metadata = await pending;
+      expect(metadata).toMatchObject({ type: 'I', objectRid: 80 });
+      metadata.objectRid = 999;
+      expect(await client.getAreaMetadata({ type: 'I' })).toMatchObject({ type: 'I', objectRid: 80 });
+      const first = await client.listAreaMembers({ type: 'I' });
+      await client.listAreaMembers({ type: 'Q' });
+      await client.listAreaMembers({ type: 'M' });
+      await client.listBlockMembers({ type: 'DB', number: 7 });
+      const before = server.requests.length;
+      first.area.typeInfoId = 999;
+      first.members[0].accessPath[0] = 999;
+      first.members[0].path = 'tampered';
+      const cached = await client.listAreaMembers({ type: 'I' });
+      expect(cached.area.typeInfoId).toBe(0x90010000);
+      expect(cached.members[0]).toMatchObject({ path: 'Enabled', accessPath: [101] });
+      expect(cached.receivedAt).toBe(first.receivedAt);
+      expect(server.requests).toHaveLength(before);
+      const partial = await client.listAreaMembers({ type: 'I' }, { maxTypes: 1 });
+      expect(partial.completeness).toBe('PARTIAL');
+      expect(partial.diagnostics).toEqual(expect.arrayContaining([expect.objectContaining({ code: 'TYPE_UNAVAILABLE', typeInfoId: child })]));
+      await expect(client.listAreaMembers({ type: 'I' }, { maxMembers: 1 })).rejects.toMatchObject({ code: 'RESPONSE_LIMIT' });
+      for (const name of ['I.Enabled', 'Q.Enabled', 'M.Enabled', 'SampleDB.Enabled']) {
+        expect(await client.readSymbol(name)).toMatchObject({ observation: { value: true, quality: 'GOOD' } });
+      }
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+
+  it('keeps area descriptors session-owned and supports mixed DB/area batches', async () => {
+    const server = await fixture({ metadata: true });
+    const options = { host: '127.0.0.1', port: server.port, limits: { maxRequests: 30, readPacingMs: 10 } };
+    const client = new S7CommPlusClient(options);
+    const other = new S7CommPlusClient(options);
+    try {
+      await client.connect();
+      await other.connect();
+      const area = await client.listAreaMembers({ type: 'I' });
+      const db = await client.listBlockMembers({ type: 'DB', number: 7 });
+      const member = area.members.find(candidate => candidate.path === 'Enabled' && candidate.readable);
+      const dbMember = db.members.find(candidate => candidate.path === 'Count' && candidate.readable);
+      if (!member || !dbMember) throw new Error('Missing synthetic member');
+      const before = server.requests.length;
+      await expect(other.readMember(member)).rejects.toMatchObject({ code: 'UNVERIFIED_ADDRESS' });
+      await expect(other.readMembers([member])).rejects.toMatchObject({ code: 'UNVERIFIED_ADDRESS' });
+      await expect(client.readMember({ ...member })).rejects.toMatchObject({ code: 'UNVERIFIED_ADDRESS' });
+      expect(server.requests).toHaveLength(before);
+      member.accessPath[0] = 999;
+      expect((await client.readMembers([member, dbMember])).map(result => result.observation.value)).toEqual([true, -123]);
+      expect(server.requests).toHaveLength(before + 1);
+      const request = server.requests.at(-1);
+      if (!request) throw new Error('Missing mixed read request');
+      const cursor = new Cursor(request.frame.subarray(18, -4));
+      cursor.uint32();
+      const count = cursor.uint();
+      cursor.uint();
+      const addresses = Array.from({ length: count }, () => {
+        const symbolCrc = cursor.uint();
+        const accessArea = cursor.uint();
+        const pathLength = cursor.uint() - 1;
+        const accessSubArea = cursor.uint();
+        return { symbolCrc, accessArea, accessSubArea, lids: Array.from({ length: pathLength }, () => cursor.uint()) };
+      });
+      expect(addresses).toEqual([
+        { symbolCrc: 0, accessArea: 80, accessSubArea: 3736, lids: [101] },
+        { symbolCrc: 0, accessArea: 0x8A0E0007, accessSubArea: 2550, lids: [107] },
+      ]);
+      await client.disconnect();
+      await expect(client.readMember(member)).rejects.toMatchObject({ code: 'SESSION_REQUIRED' });
+      await expect(client.getAreaMetadata({ type: 'I' })).rejects.toMatchObject({ code: 'SESSION_REQUIRED' });
+      await expect(client.listAreaMembers({ type: 'I' })).rejects.toMatchObject({ code: 'SESSION_REQUIRED' });
+      expect(other.connected).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await other.disconnect(); await server.close(); }
+  });
+
+  it('explores area metadata in STOP but denies process-value reads without traffic', async () => {
+    const server = await fixture({ metadata: true, state: 4 });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const discovery = await client.listAreaMembers({ type: 'M' });
+      const member = discovery.members.find(candidate => candidate.path === 'Enabled' && candidate.readable);
+      if (!member) throw new Error('Missing synthetic area member');
+      expect(client.report.capabilities).toMatchObject({ areaExplore: true, symbolicLidRead: false });
+      const before = server.requests.length;
+      await expect(client.readMember(member)).rejects.toMatchObject({ code: 'CPU_STATE' });
+      await expect(client.readMembers([member])).rejects.toMatchObject({ code: 'CPU_STATE' });
+      await expect(client.readSymbol('M.Enabled')).rejects.toMatchObject({ code: 'CPU_STATE' });
+      expect(server.requests).toHaveLength(before);
+      expect(client.connected).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+
+  it.each([
+    { option: { areaReference: /** @type {const} */ ('zero') }, status: 'TYPE_UNAVAILABLE' },
+    { option: { areaTypeMissing: true }, status: 'TYPE_REFERENCE_RESOLVED' },
+  ])('reports unavailable area types as partial without fabricating addresses: $status', async ({ option, status }) => {
+    const server = await fixture({ metadata: true, ...option });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const discovery = await client.listAreaMembers({ type: 'I' });
+      expect(discovery.area.status).toBe(status);
+      expect(discovery.completeness).toBe('PARTIAL');
+      expect(discovery.members).toEqual([]);
+      expect(discovery.diagnostics).toEqual([expect.objectContaining({ code: 'TYPE_UNAVAILABLE' })]);
+      await expect(client.readSymbol('I.Enabled')).rejects.toMatchObject({ code: 'SYMBOL_UNAVAILABLE' });
+      expect(client.connected).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+
+  it.each([
+    { areaReference: /** @type {const} */ ('invalid'), code: 'DATATYPE_MISMATCH' },
+    { areaReference: /** @type {const} */ ('missing'), code: 'ITEM_REJECTED' },
+  ])('fails closed on invalid/rejected area references: $code', async ({ areaReference, code }) => {
+    const server = await fixture({ metadata: true, areaReference });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      await expect(client.listAreaMembers({ type: 'I' })).rejects.toMatchObject({ code });
+      expect(client.connected).toBe(false);
+      expect(client.report.failure?.code).toBe(code);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+});
+
 describe('public native discovery and qualified reads', () => {
   it('switches larger batch profiles on the same cached structure without changing value order', async () => {
     const server = await fixture({ metadata: true });

@@ -16,10 +16,11 @@ import { BLOCK_CONTENT_ATTRIBUTES, decodeBlockContent } from '../protocol/s7comm
 import { createLegacySessionKey, encodeLegacySecurityKey } from '../protocol/s7commplus/session-key.js';
 
 /** @import { PlusOperation, PlusObject, PlusValue } from '../protocol/s7commplus/codec.js' */
-/** @import { BlockMetadata, RuntimeMember } from '../protocol/s7commplus/type-info.js' */
+/** @import { BlockMetadata, AreaMetadata, RuntimeMember } from '../protocol/s7commplus/type-info.js' */
 export { getProductionHost } from '../protocol/production-policy.js';
 /** @type {Map<string, Set<S7CommPlusClient>>} */
 const activeConnections = new Map();
+const AREA_RIDS = Object.freeze({ I: 80, Q: 81, M: 82 });
 const DEFAULT_LIMITS = Object.freeze({
   requestTimeoutMs: 5000, tlsHandshakeTimeoutMs: 10000, sessionDurationMs: 60000, maxRequests: 12,
   maxRequestBytes: 900, maxResponseBytes: 65536, maxSessionBytes: 262144,
@@ -28,7 +29,7 @@ const DEFAULT_LIMITS = Object.freeze({
 });
 
 /** @typedef {Partial<Record<keyof typeof DEFAULT_LIMITS,number>>} PlusLimits */
-/** @typedef {ReturnType<typeof buildBlockMembers> & {evidence:unknown[],receivedAt:string}} BlockDiscovery */
+/** @template {BlockMetadata|AreaMetadata} [T=BlockMetadata|AreaMetadata] @typedef {ReturnType<typeof buildBlockMembers<T>> & {evidence:unknown[],receivedAt:string}} MemberDiscovery */
 /** @typedef {{host?:string,port?:number,productionReadOnly?:boolean,securityMode?:'discovery'|'legacy'|'tls',tls?:{ca?:string|Buffer,servername?:string,certificateSha256?:string,allowAnyCertificate?:boolean,minVersion?:'TLSv1.2'|'TLSv1.3'},limits?:PlusLimits}} PlusOptions */
 /** @typedef {{resolve:(value:any)=>void,reject:(error:Error)=>void,timer:ReturnType<typeof setTimeout>}} Pending */
 /** @typedef {{sentAtMonotonicMs:number,receivedAtMonotonicMs:number,latencyMs:number,requestBytes:number,responseBytes:number}} RequestTiming */
@@ -81,6 +82,9 @@ export class S7CommPlusClient {
   #durationTimer;
   /** @type {PlusError|undefined} */
   #failure;
+  #disconnectRequested = false;
+  /** @type {{code:string,message:string,phase:string,details:unknown}|undefined} */
+  #teardownWarning;
   /** @type {PlusOptions} */
   #options;
   /** @type {string} */
@@ -104,15 +108,17 @@ export class S7CommPlusClient {
   #tlsEstablished = false;
   /** @type {Map<number, BlockMetadata>} */
   #blocks = new Map();
+  /** @type {Map<'I'|'Q'|'M', AreaMetadata>} */
+  #areas = new Map();
   /** @type {{blocks:BlockMetadata[],completeness:string,receivedAt:string}|undefined} */
   #inventory;
   /** @type {Map<number, Awaited<ReturnType<S7CommPlusClient['explore']>>>} */
   #types = new Map();
-  /** @type {Map<number,{maxTypes:number,maxMembers:number,discovery:BlockDiscovery}>} */
+  /** @type {Map<number,{maxTypes:number,maxMembers:number,discovery:MemberDiscovery}>} */
   #structures = new Map();
-  /** @type {WeakMap<RuntimeMember,{block:BlockMetadata,member:RuntimeMember,metadataEvidence:unknown}>} */
+  /** @type {WeakMap<RuntimeMember,{block:BlockMetadata|AreaMetadata,member:RuntimeMember,metadataEvidence:unknown}>} */
   #memberBindings = new WeakMap();
-  /** @type {WeakMap<RuntimeMember[],{maxItems:number,members:RuntimeMember[],bindings:{block:BlockMetadata,member:RuntimeMember,metadataEvidence:unknown}[],operations:PlusOperation[]}>} */
+  /** @type {WeakMap<RuntimeMember[],{maxItems:number,members:RuntimeMember[],bindings:{block:BlockMetadata|AreaMetadata,member:RuntimeMember,metadataEvidence:unknown}[],operations:PlusOperation[]}>} */
   #readPlans = new WeakMap();
   /** @type {{name:string,member:RuntimeMember}[]} */
   #namedMembers = [];
@@ -170,7 +176,7 @@ export class S7CommPlusClient {
         maxInFlightRequests: 1, maxQueuedRequests: this.#limits.maxQueuedRequests,
         queuedRequests: this.#requestQueue.length, inFlightRequests: this.#busy ? 1 : 0 },
       identity: this.#identity, cpuState: this.#cpuState, effectiveProtectionLevel: this.#protection,
-      capabilities: { objectExplore: this.#ready, symbolicLidRead: this.#ready && this.#cpuState === 'RUN',
+      capabilities: { objectExplore: this.#ready, areaExplore: this.#ready, symbolicLidRead: this.#ready && this.#cpuState === 'RUN',
         namedSymbolResolution: this.#ready && this.#cpuState === 'RUN' && this.#namedMembers.length > 0,
         blockUpload: this.#tlsVerified && this.#protection === 1 ? 'BOUNDED_NATIVE_ATTRIBUTE_CONTENT' : 'UNSUPPORTED_PROFILE',
         controllerBackup: 'UNSUPPORTED_UNQUALIFIED', cpuModeControl: this.connected && this.#tlsEstablished && this.#protection === 1 ? 'EXPLICIT_RUN_ONLY' : 'DENIED', recurringUploads: false },
@@ -178,6 +184,7 @@ export class S7CommPlusClient {
         sentBytes: this.#txBytes, elapsedMs: this.#started ? Math.round(performance.now() - this.#started) : 0 },
       observations: this.#observations, transcript: this.#transcript,
       failure: this.#failure ? { code: this.#failure.code, message: this.#failure.message, phase: this.#failurePhase, details: this.#failure.details } : null,
+      teardownWarning: this.#teardownWarning ?? null,
       machineImpactVerified: false,
     });
   }
@@ -581,18 +588,63 @@ export class S7CommPlusClient {
       status: objects.length ? 'AVAILABLE' : 'UNAVAILABLE', evidence: structuredClone(evidence) };
   }
 
-  /** @param {{type:'DB',number:number}} selector @param {{maxMembers?:number,maxTypes?:number}} [options] */
-  async listBlockMembers(selector, options = {}) {
+  /** @param {{type:'I'|'Q'|'M'}} selector */
+  async getAreaMetadata(selector) {
     this.#requireReady();
+    this.#requireMetadataState();
+    if (!selector || typeof selector !== 'object' || !Object.hasOwn(AREA_RIDS, selector.type) || Object.keys(selector).some(key => key !== 'type')) {
+      throw new PlusError('ARGUMENT', 'Select a native I, Q or M area');
+    }
+    const type = selector.type;
+    const cached = this.#areas.get(type);
+    if (cached) return structuredClone(cached);
+    const objectRid = AREA_RIDS[type];
+    const reference = await this.#readSymbolicValue({ accessArea: objectRid, lids: [1] });
+    const value = reference.value;
+    if (value.flags !== 0 || value.datatype !== 18 || !Number.isInteger(value.value) || value.value < 0 || value.value > 0xFFFFFFFF) {
+      const error = new PlusError('DATATYPE_MISMATCH', 'Area type reference must be a scalar native RID');
+      this.#stop(error);
+      throw error;
+    }
+    const area = { type, name: type, objectRid, typeInfoId: value.value || null,
+      status: value.value ? 'TYPE_REFERENCE_RESOLVED' : 'TYPE_UNAVAILABLE', evidence: { typeReference: reference } };
+    this.#areas.set(type, structuredClone(area));
+    return structuredClone(area);
+  }
+
+  /** @param {{maxMembers?:number,maxTypes?:number}} options */
+  #discoveryLimits(options) {
+    if (!options || typeof options !== 'object' || Array.isArray(options) || Object.keys(options).some(key => !['maxTypes', 'maxMembers'].includes(key))) {
+      throw new PlusError('ARGUMENT', 'Expected maxTypes/maxMembers discovery budgets');
+    }
     const maxTypes = options.maxTypes ?? 8;
     const maxMembers = options.maxMembers ?? 4096;
     if (!Number.isSafeInteger(maxTypes) || maxTypes < 1 || maxTypes > 65536 || !Number.isSafeInteger(maxMembers) || maxMembers < 1 || maxMembers > 1048576) {
       throw new PlusError('ARGUMENT', 'Discovery budgets require 1..65536 types and 1..1048576 members');
     }
-    const block = await this.getBlockMetadata(selector);
-    const cached = this.#structures.get(block.number);
+    return { maxTypes, maxMembers };
+  }
+
+  /** @param {{type:'DB',number:number}} selector @param {{maxMembers?:number,maxTypes?:number}} [options] */
+  async listBlockMembers(selector, options = {}) {
+    this.#requireReady();
+    const limits = this.#discoveryLimits(options);
+    return this.#listMembers(await this.getBlockMetadata(selector), limits);
+  }
+
+  /** @param {{type:'I'|'Q'|'M'}} selector @param {{maxMembers?:number,maxTypes?:number}} [options] */
+  async listAreaMembers(selector, options = {}) {
+    this.#requireReady();
+    const limits = this.#discoveryLimits(options);
+    const { block: area, ...discovery } = await this.#listMembers(await this.getAreaMetadata(selector), limits);
+    return { area, ...discovery };
+  }
+
+  /** @template {BlockMetadata|AreaMetadata} T @param {T} block @param {{maxTypes:number,maxMembers:number}} limits */
+  async #listMembers(block, { maxTypes, maxMembers }) {
+    const cached = this.#structures.get(block.objectRid);
     if (cached?.maxTypes === maxTypes && cached.maxMembers === maxMembers) {
-      return this.#bindDiscovery(structuredClone(cached.discovery));
+      return this.#bindDiscovery(/** @type {MemberDiscovery<T>} */ (structuredClone(cached.discovery)));
     }
     /** @type {PlusObject[]} */
     const objects = [];
@@ -620,14 +672,14 @@ export class S7CommPlusClient {
     }
     const result = buildBlockMembers(block, objects, maxMembers);
     const discovery = { ...result, evidence, receivedAt: new Date().toISOString() };
-    this.#structures.set(block.number, { maxTypes, maxMembers, discovery: structuredClone(discovery) });
+    this.#structures.set(block.objectRid, { maxTypes, maxMembers, discovery: structuredClone(discovery) });
     return this.#bindDiscovery(discovery);
   }
 
-  /** @param {BlockDiscovery} discovery */
+  /** @template {BlockMetadata|AreaMetadata} T @param {MemberDiscovery<T>} discovery */
   #bindDiscovery(discovery) {
     const { block, members, evidence } = discovery;
-    this.#namedMembers = this.#namedMembers.filter(item => this.#memberBindings.get(item.member)?.block.number !== block.number);
+    this.#namedMembers = this.#namedMembers.filter(item => this.#memberBindings.get(item.member)?.block.objectRid !== block.objectRid);
     const nativeBlock = structuredClone(block);
     const metadataEvidence = structuredClone(evidence);
     for (const member of members.filter(member => member.readable)) {
@@ -714,7 +766,7 @@ export class S7CommPlusClient {
   async readSymbol(name) {
     this.#requireReady();
     const matches = this.#namedMembers.filter(item => item.name === name);
-    if (matches.length !== 1) throw new PlusError(matches.length ? 'AMBIGUOUS_SYMBOL' : 'SYMBOL_UNAVAILABLE', 'Discover an unambiguous readable block member before a named read');
+    if (matches.length !== 1) throw new PlusError(matches.length ? 'AMBIGUOUS_SYMBOL' : 'SYMBOL_UNAVAILABLE', 'Discover an unambiguous readable member before a named read');
     return this.readMember(matches[0].member);
   }
 
@@ -757,6 +809,7 @@ export class S7CommPlusClient {
   }
 
   async disconnect() {
+    this.#disconnectRequested = true;
     clearTimeout(this.#durationTimer);
     this.#pacingAbort.abort();
     this.#sessionKey?.fill(0);
@@ -1058,14 +1111,21 @@ export class S7CommPlusClient {
   #asError(error) { return error instanceof PlusError ? error : new PlusError('PROTOCOL', error instanceof Error ? error.message : String(error)); }
   /** @param {PlusError} error */
   #stop(error) {
-    if (error.code === 'REQUEST_QUEUE_FULL') return;
-    if (!this.#failure) this.#failurePhase = this.#phase;
-    this.#failure ??= error;
+    if (error.code === 'REQUEST_QUEUE_FULL' || (this.#disconnectRequested && error.code === 'DISCONNECTED')) return;
+    const teardownReset = this.#disconnectRequested && (
+      (error.code === 'TRANSPORT_REJECTED' && error.details?.transportCode === 'ECONNRESET')
+      || (error.code === 'TLS_HANDSHAKE_FAILED' && error.details?.tlsCode === 'ECONNRESET'));
+    if (teardownReset) {
+      this.#teardownWarning ??= { code: error.code, message: error.message, phase: this.#phase, details: error.details };
+    } else {
+      if (!this.#failure) this.#failurePhase = this.#phase;
+      this.#failure ??= error;
+    }
     this.#ready = false;
     clearTimeout(this.#durationTimer);
     this.#pacingAbort.abort();
-    this.#settle(undefined, this.#failure);
-    this.#rejectQueue(this.#failure);
+    this.#settle(undefined, this.#failure ?? error);
+    this.#rejectQueue(this.#failure ?? error);
     this.#tls?.destroy();
     this.#tunnel?.destroy();
     this.#socket?.destroy();

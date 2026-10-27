@@ -181,6 +181,63 @@ describe('S7CommPlus read-only codec', () => {
 });
 
 describe('S7CommPlus loopback lifecycle (never live)', () => {
+  it('records a reset during explicit disconnect as a teardown warning', async () => {
+    const server = await fixture({ resetOnDisconnect: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const sample = await client.readSymbolic({ accessArea: 0x8A0E0001, lids: [1] });
+      expect(sample.value.value).toBe(42);
+      expect(client.report.failure).toBeNull();
+      const requests = server.requests.length;
+      await Promise.all([client.disconnect(), client.disconnect()]);
+      expect(client.report).toMatchObject({ connected: false, phase: 'closed', failure: null,
+        teardownWarning: { code: 'TRANSPORT_REJECTED', phase: 'closed', details: { transportCode: 'ECONNRESET' } } });
+      expect(server.requests).toHaveLength(requests);
+      const report = client.report;
+      if (!report.teardownWarning) throw new Error('Missing teardown warning');
+      report.teardownWarning.message = 'tampered';
+      expect(client.report.teardownWarning?.message).toContain('ECONNRESET');
+      await client.disconnect();
+      expect(client.report.failure).toBeNull();
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('keeps a reset during an active read fatal after disconnect', async () => {
+    const server = await fixture({ resetOnRead: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      await expect(client.readSymbolic({ accessArea: 0x8A0E0001, lids: [1] })).rejects.toMatchObject({
+        code: 'TRANSPORT_REJECTED', details: { transportCode: 'ECONNRESET' },
+      });
+      const failure = client.report.failure;
+      expect(failure).toMatchObject({ code: 'TRANSPORT_REJECTED', phase: 'ready' });
+      await client.disconnect();
+      expect(client.report.failure).toEqual(failure);
+      expect(client.report.teardownWarning).toBeNull();
+      expect(client.connected).toBe(false);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('settles cancelled active and queued reads when teardown resets the socket', async () => {
+    const server = await fixture({ resetOnDisconnect: true, readStall: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const pending = Promise.allSettled(Array.from({ length: 3 }, () => client.readSymbolic({ accessArea: 0x8A0E0001, lids: [1] })));
+      await vi.waitFor(() => expect(server.requests.some(request => request.functionCode === 0x054C)).toBe(true));
+      await client.disconnect();
+      const results = await pending;
+      expect(results).toHaveLength(3);
+      expect(results.every(result => result.status === 'rejected' && result.reason.code === 'DISCONNECTED')).toBe(true);
+      expect(client.report).toMatchObject({ connected: false, failure: null,
+        teardownWarning: { details: { transportCode: 'ECONNRESET' } },
+        concurrency: { activeConnectionsPerTarget: 0, queuedRequests: 0, inFlightRequests: 0 } });
+      expect(server.requests.filter(request => request.functionCode === 0x054C)).toHaveLength(1);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
   it.each(['rejected', 'error2'])('continues past recognized legacy InitSSL %s only in an explicit legacy profile', async legacyInit => {
     const server = await fixture({ legacyInit: /** @type {'rejected'|'error2'} */ (legacyInit) });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy' });
@@ -456,6 +513,35 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
     certificateSha256 = new X509Certificate(credentials.cert).fingerprint256.replaceAll(':', '').toLowerCase();
   });
   afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
+  it.each(['disconnect', 'read', 'clean'])('classifies verified TLS resets during %s without masking acquisition errors', async resetAt => {
+    const server = await fixture({ tls: credentials, resetOnDisconnect: resetAt === 'disconnect', resetOnRead: resetAt === 'read' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 } });
+    try {
+      await client.connect();
+      if (resetAt === 'read') {
+        await expect(client.readSymbolic({ accessArea: 0x8A0E0001, lids: [1] })).rejects.toMatchObject({ code: 'TRANSPORT_REJECTED' });
+      } else {
+        expect((await client.readSymbolic({ accessArea: 0x8A0E0001, lids: [1] })).value.value).toBe(42);
+      }
+      const before = client.report.failure;
+      await client.disconnect();
+      expect(client.report.securityMode).toBe('TLS_VERIFIED');
+      expect(client.report.failure).toEqual(before);
+      if (resetAt === 'disconnect') {
+        expect(client.report.failure).toBeNull();
+        expect(client.report.teardownWarning).toMatchObject({ details: { transportCode: 'ECONNRESET' } });
+      } else if (resetAt === 'read') {
+        expect(client.report.failure).toMatchObject({ code: 'TRANSPORT_REJECTED', phase: 'ready' });
+        expect(client.report.teardownWarning).toBeNull();
+      } else {
+        expect(client.report.failure).toBeNull();
+        expect(client.report.teardownWarning).toBeNull();
+      }
+      expect(client.connected).toBe(false);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
   it('keeps TLS integrity, native member ownership and queued reads isolated across parallel sessions', async () => {
     const server = await fixture({ tls: credentials, metadata: true });
     const clients = Array.from({ length: 2 }, () => new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',

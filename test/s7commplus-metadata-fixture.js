@@ -56,6 +56,6 @@ export function metadataExplore(id, inventorySize = 1) {
     });
     return Buffer.concat([Buffer.from([0xA1]), u32(3), vlq(2520), Buffer.from([0, 0]), ...blocks, Buffer.from([0xA2])]);
   }
-  return id === 0x92000007 ? typeObject(id, syntheticMembers)
+  return [0x92000007, 0x90010000, 0x90020000, 0x90030000].includes(id) ? typeObject(id, syntheticMembers)
     : typeObject(id, [{ name: 'Ready', lid: 132, type: 1 }]);
 }

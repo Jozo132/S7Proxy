@@ -11,7 +11,7 @@ S7Comm/S7CommPlus proxy and client library with an AssemblyScript WASM protocol 
 - **REST + WebSocket API** — lightweight built-in HTTP endpoints and real-time WebSocket push with slow-consumer protection
 - **S7Comm proxy** — transparent TCP proxy with TSAP/IP-based routing and allow/deny filtering
 - **snap7 compatibility** — `S7Client` read/write subset and `S7Server`; unimplemented metadata, upload and control methods return explicit errors
-- **Native S7CommPlus** - experimental TLS and legacy S7-1200 sessions, DB/type discovery, typed symbolic reads, restricted in-memory program-content extraction, and explicitly confirmed TLS CPU start
+- **Native S7CommPlus** - experimental TLS and legacy S7-1200 sessions, DB and I/Q/M type/member discovery, typed symbolic reads, restricted in-memory program-content extraction, and explicitly confirmed TLS CPU start
 - **Worker thread mode** — run the proxy in an isolated worker
 - **Prometheus metrics** — built-in `/metrics` endpoint
 
@@ -27,6 +27,7 @@ Requires Node.js >= 20.
 
 ### 0.4.2 (current source)
 
+- Native I/Q/M exploration through `getAreaMetadata({ type: 'I' | 'Q' | 'M' })` and `listAreaMembers(selector, { maxTypes, maxMembers })`. Actual native type references drive bounded expansion; readable descriptors work with existing scalar, batch and qualified-name reads and cannot be shared between sessions.
 - Cached DB inventories and expanded member structures within a client session, avoiding repeated inventory requests and structure expansion. Cached discoveries are isolated from caller mutations and preserve their original metadata receipt time. Per-block evidence retains the relevant object's attributes and response correlation instead of the entire inventory.
 - More efficient nested-type discovery using indexed lookups and a deduplicated traversal queue, with higher configurable object, depth, response, request and member limits. These are allocation ceilings, not hardware qualification or guarantees of complete discovery.
 - Bounded diagnostic history through `limits.maxDiagnosticEntries` (default `128`, maximum `4096`) for each observation/transcript collection. Transcript hex fields retain at most 1024 bytes per entry; reports are diagnostic samples, not guaranteed complete wire captures.
@@ -158,11 +159,74 @@ exact state transition time. Scan-synchronous guarantees require PLC-side trace,
 timestamps/counters or an explicitly qualified acquisition mechanism. The portal
 shared polling driver is unchanged; this is a separate native benchmark API/CLI.
 
+## Native I/Q/M Exploration
+
+On an explicitly connected `S7CommPlusClient`, select inputs (`I`), outputs (`Q`)
+or marker memory (`M`). These are native symbolic tags, not an absolute-byte scan
+and not a list manufactured from offline project declarations.
+
+```js
+const discovery = await client.listAreaMembers({ type: 'I' }, {
+  maxTypes: 8,
+  maxMembers: 4096,
+});
+
+console.log(discovery.area, discovery.completeness, discovery.diagnostics);
+const member = discovery.members.find(candidate => candidate.readable);
+if (member) {
+  const sample = await client.readMember(member);
+  console.log(sample.observation);
+}
+```
+
+`getAreaMetadata({ type: 'Q' })` returns the area's `type`, `name`, native
+`objectRid`, actual `typeInfoId` (or null), status and type-reference evidence.
+Area RIDs are I=80, Q=81 and M=82; the client reads LID 1 rather than assuming a
+type-info RID. No DB inventory request is needed. `listAreaMembers` adds
+`members`, `diagnostics`, `completeness`, native type evidence and `receivedAt`,
+with root metadata under `area` rather than `block`.
+
+The existing scalar type and nested/array rules apply. Default discovery budgets
+are 8 types and 4096 expanded members, with maxima 65536 and 1048576 respectively;
+session request/byte/time limits still apply. Missing types remain partial, and
+unsupported/ambiguous members are not readable. Decoded native layout metadata
+remains in `evidence`; the API does not invent absolute byte/bit locations or
+validate the running program revision.
+
+Readable descriptors also work with `readMembers`, including mixed DB/I/Q/M
+batches (at most 4096 members/call). `readSymbol('I.TagName')`, `Q.TagName` and
+`M.TagName` resolve only after the corresponding area has been discovered.
+Names that conflict with a discovered DB remain ambiguous, never silently
+preferred. Scalar samples retain the existing `block` root-metadata field,
+whose `type` may now be I/Q/M and which has no DB `number` for those areas.
+Caller edits do not change the native address bound to a descriptor; copies and
+descriptors from another session are rejected.
+
+Metadata exploration is allowed in RUN or STOP. Process-value reads require RUN;
+no mode change or process write is issued. Results are defensively cloned and
+cached only within this client session, not continuously revision-refreshed.
+The portal and benchmark lane selector remain DB-only. In addition to loopback
+tests, one bounded CPU1212C V4.5 run discovered 2 input, 8 output and 14 marker
+tags and obtained 33 GOOD BOOL/BYTE observations through batch, scalar,
+qualified-name and mixed-area reads. The historical certificate fingerprint
+matched, but TLS remained unverified. RUN was confirmed before disconnect;
+a post-close ECONNRESET was retained as a teardown warning. No process writes,
+mode changes or retries were issued. This is scoped functional evidence, not
+general datatype, throughput or scan-synchronous qualification.
+
+`disconnect()` cancels pending and queued calls with `DISCONNECTED`. An
+`ECONNRESET` received after explicit disconnect begins is retained separately
+in `report.teardownWarning` (`null` on clean close), not promoted to
+`report.failure`. Earlier failures remain authoritative; resets during setup
+or active reads still fail the session. Shutdown remains bounded and does not
+retry or issue `DeleteObject`. This classifies a teardown reset without proving
+or preventing its PLC-side cause.
+
 ## Native Read-Only S7CommPlus Foundation
 
 `S7CommPlusClient` is a separate experimental native backend with bounded object
-Explore, native DB/type-member discovery and typed symbolic reads. It supports
-session-local name resolution after explicit block discovery. Explicit legacy
+Explore, native DB/I/Q/M type-member discovery and typed symbolic reads. It supports
+session-local name resolution after explicit block or area discovery. Explicit legacy
 S7-1200 SessionKey sessions and TLS sessions are supported; username/password
 legitimation, S7-1500 legacy keys and PLCSIM key families remain unsupported.
 The verified TLS V2 profile
