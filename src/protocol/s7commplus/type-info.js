@@ -11,8 +11,11 @@ export const SOFTWARE_TYPES = Object.freeze({
   62: 'WSTRING', 63: 'VARIANT', 64: 'LTIME', 65: 'LTOD', 66: 'LDT', 67: 'DTL',
 });
 const WIRE_TYPES = new Map([[1, 1], [2, 10], [4, 11], [5, 7], [6, 12], [7, 8],
-  [8, 14], [11, 8], [48, 15], [49, 5], [50, 9], [51, 13], [52, 2], [53, 3],
+  [8, 14], [11, 8], [19, 2], [48, 15], [49, 5], [50, 9], [51, 13], [52, 2], [53, 3],
   [54, 4], [55, 6], [64, 17]]);
+const VALUE_SIZES = new Map([[1, 3], [2, 3], [4, 4], [5, 4], [6, 6], [7, 7],
+  [8, 6], [11, 7], [19, 260], [48, 10], [49, 11], [50, 11], [51, 10], [52, 3], [53, 4],
+  [54, 7], [55, 3], [64, 11]]);
 
 /** @typedef {{type:'DB',number:number,name:string|null,objectRid:number,typeInfoId:number|null,status:string,evidence:unknown}} BlockMetadata */
 /** @typedef {{name:string|null,path:string|null,parentPath:string|null,datatype:string,softdatatype:number,memberId:number,typeInfoId:number,referencedTypeInfoId:number|null,accessPath:number[],symbolCrc:number,arrayDimensions:{lowerBound:number,count:number}[],status:string,readable:boolean}} RuntimeMember */
@@ -101,8 +104,25 @@ export function buildBlockMembers(block, objects, maxMembers = 4096) {
 export function validateMemberValue(member, value) {
   const expected = WIRE_TYPES.get(member.softdatatype);
   if (!member.readable || expected === undefined) throw new PlusError('UNSUPPORTED_DATATYPE', 'Member has no qualified scalar read representation');
+  if (member.softdatatype === 19) {
+    const bytes = value.value;
+    if (value.flags !== 0x10 || value.datatype !== 2 || !Array.isArray(bytes) || bytes.length < 2 || bytes.length > 256
+      || bytes.some(byte => !Number.isInteger(byte) || byte < 0 || byte > 255)
+      || bytes[0] < 1 || bytes[0] > 254 || bytes.length !== bytes[0] + 2 || bytes[1] > bytes[0]) {
+      throw new PlusError('DATATYPE_MISMATCH', 'STRING requires a bounded byte array with valid capacity and length');
+    }
+    return { datatype: member.datatype, value: Buffer.from(bytes.slice(2, 2 + bytes[1])).toString('latin1'), native: value,
+      representation: { encoding: 'latin1', maxLength: bytes[0], length: bytes[1] } };
+  }
   if (value.flags !== 0 || value.datatype !== expected) throw new PlusError('DATATYPE_MISMATCH', 'Value does not match discovered member datatype', { expectedWireType: expected, actualWireType: value.datatype });
   return { datatype: member.datatype, value: value.value, native: value,
     representation: member.softdatatype === 11 ? { unit: 'ms', signed: true, bits: 32 }
       : member.softdatatype === 64 ? { unit: 'ns', signed: true, bits: 64 } : null };
+}
+
+/** @param {RuntimeMember} member */
+export function memberValueSize(member) {
+  const size = VALUE_SIZES.get(member.softdatatype);
+  if (!member.readable || size === undefined) throw new PlusError('UNSUPPORTED_DATATYPE', 'Member has no qualified scalar read representation');
+  return size;
 }

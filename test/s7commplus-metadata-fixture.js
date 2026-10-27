@@ -42,6 +42,7 @@ export const syntheticMembers = [
   { name: 'Delay', lid: 112, type: 11 },
   { name: 'Details', lid: 120, type: 17, code: 12, relation: 0x92000009 },
   { name: 'Samples', lid: 125, type: 5, code: 10, lower: -2, count: 3 },
+  { name: 'Title', lid: 130, type: 19 },
 ];
 
 /** @param {number} id @param {number} [inventorySize] */

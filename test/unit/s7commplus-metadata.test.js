@@ -1,7 +1,8 @@
 // @ts-check
-import { describe, it, expect } from 'vitest';
-import { Cursor, decodeObjects, decodeValue } from '../../src/protocol/s7commplus/codec.js';
-import { buildBlockMembers, validateMemberValue } from '../../src/protocol/s7commplus/type-info.js';
+import { describe, it, expect, vi } from 'vitest';
+import { Cursor, decodeObjects, decodeValue, encodeOperation, planReadBatches } from '../../src/protocol/s7commplus/codec.js';
+import { buildBlockMembers, validateMemberValue, memberValueSize } from '../../src/protocol/s7commplus/type-info.js';
+import * as typeInfo from '../../src/protocol/s7commplus/type-info.js';
 import { S7CommPlusClient } from '../../src/lib.js';
 import { fixture } from '../s7commplus-fixture.js';
 import { typeObject, syntheticMembers, le32 } from '../s7commplus-metadata-fixture.js';
@@ -10,6 +11,51 @@ const root = 0x92000007;
 const child = 0x92000009;
 const block = { type: /** @type {const} */ ('DB'), number: 7, name: 'SampleDB', objectRid: 0x8A0E0007, typeInfoId: root, status: 'TYPE_REFERENCE_RESOLVED', evidence: {} };
 const objects = () => decodeObjects(new Cursor(Buffer.concat([typeObject(root, syntheticMembers), typeObject(child, [{ name: 'Ready', lid: 132, type: 1 }])])));
+
+describe('symbolic read batch planning', () => {
+  /** @param {number} count @param {number} [depth] */
+  const addresses = (count, depth = 2) => Array.from({ length: count }, (_, index) => ({
+    accessArea: 0x8A0E0007, lids: Array.from({ length: depth }, (_, part) => part ? index + 1 : 1), symbolCrc: 0,
+  }));
+  it('packs thousands of scalars without reordering or dropping indices', () => {
+    const items = addresses(4096);
+    const batches = planReadBatches(items, items.map(() => 11), { sessionId: 77, version: 2, integrityId: 1 }, { maxRequestBytes: 900, maxResponseBytes: 65536 });
+    expect(batches).toHaveLength(128);
+    expect(batches.every(batch => batch.length === 32)).toBe(true);
+    expect(batches.flat()).toEqual(items.map((_, index) => index));
+  });
+  it.each([48, 64])('packs explicitly larger %i-item batches within byte limits', maxItems => {
+    const items = addresses(4096);
+    for (const sessionKey of [undefined, Buffer.alloc(24, 35)]) {
+      const context = { sessionId: 77, version: sessionKey ? 1 : 2, sessionKey, integrityId: 0xFFFFFFFF };
+      const batches = planReadBatches(items, items.map(() => 11), context, { maxItems, maxRequestBytes: 900, maxResponseBytes: 65536 });
+      expect(batches).toHaveLength(Math.ceil(items.length / maxItems));
+      expect(batches.flat()).toEqual(items.map((_, index) => index));
+      for (const batch of batches) expect(encodeOperation({ kind: 'read', maxItems, items: batch.map(index => items[index]) }, context, 65535).length).toBeLessThanOrEqual(900);
+      expect(() => encodeOperation({ kind: 'read', items: items.slice(0, 33) }, context, 1)).toThrow(/1..32/);
+    }
+  });
+  it.each([false, true])('reserves changing integrity-counter widths and complete framing (legacy=%s)', legacy => {
+    const items = addresses(75, 16);
+    const context = { sessionId: 77, version: legacy ? 1 : 2, integrityId: 0xFFFFFFFF,
+      sessionKey: legacy ? Buffer.alloc(24, 35) : undefined };
+    const batches = planReadBatches(items, items.map(() => 11), context, { maxRequestBytes: 250, maxResponseBytes: 65536 });
+    expect(batches.length).toBeGreaterThan(3);
+    for (const batch of batches) expect(encodeOperation({ kind: 'read', items: batch.map(index => items[index]) }, context, 65535).length).toBeLessThanOrEqual(250);
+    expect(batches.flat()).toEqual(items.map((_, index) => index));
+  });
+  it('splits on estimated response bytes even when request space remains', () => {
+    const items = addresses(10);
+    const batches = planReadBatches(items, items.map(() => 3), { sessionId: 77, version: 2 }, { maxRequestBytes: 900, maxResponseBytes: 140 });
+    expect(batches.map(batch => batch.length)).toEqual([3, 3, 3, 1]);
+  });
+  it('rejects invalid estimates and individually oversized items before transmission', () => {
+    const context = { sessionId: 77, version: 2 };
+    expect(() => planReadBatches(addresses(1), [], context, { maxRequestBytes: 900, maxResponseBytes: 65536 })).toThrow(/scalar value sizes/);
+    expect(() => planReadBatches(addresses(1, 16), [11], context, { maxRequestBytes: 60, maxResponseBytes: 65536 })).toThrow(/request-byte budget/);
+    expect(() => planReadBatches(addresses(1), [11], context, { maxRequestBytes: 900, maxResponseBytes: 139 })).toThrow(/response-byte budget/);
+  });
+});
 
 describe('native type metadata', () => {
   it('decodes native identities independently of names, software types and offsets', () => {
@@ -108,6 +154,21 @@ describe('native type metadata', () => {
     expect(() => validateMemberValue(enabled, decodeValue(new Cursor(Buffer.from([0, 8, 1]))))).toThrow(/match/);
     expect(() => decodeValue(new Cursor(Buffer.from([0, 1, 2])))).toThrow(/BOOL/);
   });
+  it('validates bounded S7 STRING headers, empty values and response-size estimates', () => {
+    const member = buildBlockMembers(block, objects()).members.find(candidate => candidate.path === 'Title');
+    if (!member) throw new Error('Missing synthetic STRING');
+    const native = decodeValue(new Cursor(Buffer.from([0x10, 2, 10, 8, 4, 84, 69, 83, 84, 0, 0, 0, 0])));
+    expect(validateMemberValue(member, native)).toMatchObject({ datatype: 'STRING', value: 'TEST', representation: { encoding: 'latin1', maxLength: 8, length: 4 } });
+    expect(validateMemberValue(member, { ...native, value: [8, 0, ...Array(8).fill(0)] }).value).toBe('');
+    expect(memberValueSize(member)).toBe(260);
+    for (const value of [[], [8, 9, ...Array(8).fill(0)], [8, 1, 65], [255, 0, ...Array(255).fill(0)], [1, 1, 256]]) {
+      expect(() => validateMemberValue(member, { ...native, value })).toThrow(/capacity and length/);
+    }
+    expect(() => validateMemberValue(member, { ...native, flags: 0 })).toThrow(/capacity and length/);
+    expect(() => validateMemberValue(member, { ...native, datatype: 21 })).toThrow(/capacity and length/);
+    const items = Array.from({ length: 5 }, () => ({ accessArea: block.objectRid, lids: member.accessPath }));
+    expect(planReadBatches(items, items.map(() => memberValueSize(member)), { sessionId: 77, version: 2 }, { maxRequestBytes: 900, maxResponseBytes: 700 }).map(batch => batch.length)).toEqual([2, 2, 1]);
+  });
   it('distinguishes LTIME timespans from LINT wire values and retains 64-bit precision', () => {
     const types = decodeObjects(new Cursor(typeObject(root, [{ name: 'Duration', lid: 1, type: 64 }])));
     const member = buildBlockMembers(block, types).members[0];
@@ -117,6 +178,95 @@ describe('native type metadata', () => {
 });
 
 describe('public native discovery and qualified reads', () => {
+  it('switches larger batch profiles on the same cached structure without changing value order', async () => {
+    const server = await fixture({ metadata: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 80, readPacingMs: 10 } });
+    try {
+      await client.connect();
+      const discovery = await client.listBlockMembers({ type: 'DB', number: 7 });
+      const member = discovery.members.find(candidate => candidate.path === 'Enabled' && candidate.readable);
+      if (!member) throw new Error('Missing synthetic member');
+      const members = Array(130).fill(member);
+      for (const maxItems of [32, 48, 64, 32]) {
+        const before = server.requests.length;
+        for (let scan = 0; scan < 2; scan++) {
+          const results = await client.readMembers(members, { maxItems });
+          expect(results).toHaveLength(members.length);
+          expect(results.every(result => result.observation.value === true)).toBe(true);
+        }
+        expect(server.requests.length - before).toBe(2 * Math.ceil(members.length / maxItems));
+      }
+      const before = server.requests.length;
+      for (const maxItems of [0, 65, 1.5]) await expect(client.readMembers(members, { maxItems })).rejects.toMatchObject({ code: 'ARGUMENT' });
+      expect(server.requests).toHaveLength(before);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('caches expanded structures without trusting caller mutations or bypassing discovery budgets', async () => {
+    const build = vi.spyOn(typeInfo, 'buildBlockMembers');
+    const server = await fixture({ metadata: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 40, readPacingMs: 10 } });
+    try {
+      await client.connect();
+      const first = await client.listBlockMembers({ type: 'DB', number: 7 });
+      expect(build).toHaveBeenCalledTimes(1);
+      const requests = server.requests.length;
+      first.members[0].path = 'tampered';
+      const second = await client.listBlockMembers({ type: 'DB', number: 7 });
+      expect(build).toHaveBeenCalledTimes(1);
+      expect(server.requests).toHaveLength(requests);
+      expect(second.receivedAt).toBe(first.receivedAt);
+      expect(second.members[0].path).toBe('Enabled');
+      expect(second.members).not.toBe(first.members);
+      const member = second.members.find(candidate => candidate.path === 'Enabled' && candidate.readable);
+      if (!member) throw new Error('Missing cached synthetic member');
+      expect(await client.readMembers([member])).toMatchObject([{ observation: { value: true, quality: 'GOOD' } }]);
+      await expect(client.listBlockMembers({ type: 'DB', number: 7 }, { maxMembers: 1 })).rejects.toMatchObject({ code: 'RESPONSE_LIMIT' });
+      expect(build).toHaveBeenCalledTimes(2);
+      await client.listBlockMembers({ type: 'DB', number: 7 });
+      expect(build).toHaveBeenCalledTimes(2);
+      expect(server.errors).toEqual([]);
+    } finally { build.mockRestore(); await client.disconnect(); await server.close(); }
+  });
+  it('reuses ordered batch plans and rebuilds them when the member array changes', async () => {
+    const server = await fixture({ metadata: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 40, readPacingMs: 10 } });
+    try {
+      await client.connect();
+      const discovery = await client.listBlockMembers({ type: 'DB', number: 7 });
+      const selected = ['Enabled', 'Count', 'Delay', 'Title'].map(path => {
+        const member = discovery.members.find(candidate => candidate.path === path && candidate.readable);
+        if (!member) throw new Error('Missing synthetic member');
+        return member;
+      });
+      const members = Array.from({ length: 80 }, (_, index) => selected[index % selected.length]);
+      const expected = members.map(member => member.path === 'Enabled' ? true : member.path === 'Count' ? -123 : member.path === 'Title' ? 'TEST' : -1);
+      const before = server.requests.length;
+      expect((await client.readMembers(members)).map(result => result.observation.value)).toEqual(expected);
+      expect((await client.readMembers(members)).map(result => result.observation.value)).toEqual(expected);
+      members.reverse();
+      expect((await client.readMembers(members)).map(result => result.observation.value)).toEqual([...expected].reverse());
+      expect(server.requests.length - before).toBe(9);
+      await expect(client.readMembers([{ ...selected[0] }])).rejects.toMatchObject({ code: 'UNVERIFIED_ADDRESS' });
+      expect(client.connected).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('rejects a full batch plan before transmission when the request budget is insufficient', async () => {
+    const server = await fixture({ metadata: true });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 9 } });
+    try {
+      await client.connect();
+      const discovery = await client.listBlockMembers({ type: 'DB', number: 7 });
+      const member = discovery.members.find(candidate => candidate.path === 'Enabled' && candidate.readable);
+      if (!member) throw new Error('Missing synthetic member');
+      const before = server.requests.length;
+      await expect(client.readMembers(Array(65).fill(member))).rejects.toMatchObject({ code: 'REQUEST_LIMIT' });
+      expect(server.requests).toHaveLength(before);
+      expect(client.connected).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
   it('discovers and reads synthetic scalar/nested members from a larger bounded inventory through the standalone entry point', async () => {
     const server = await fixture({ metadata: true, inventorySize: 155 });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 20, maxObjects: 256 } });
@@ -162,7 +312,7 @@ describe('public native discovery and qualified reads', () => {
       const count = server.requests.length;
       await expect(client.getBlockMetadata({ type: 'DB', number: 0 })).rejects.toMatchObject({ code: 'ARGUMENT' });
       await expect(client.getTypeInfo(0)).rejects.toMatchObject({ code: 'ARGUMENT' });
-      await expect(client.listBlockMembers({ type: 'DB', number: 7 }, { maxTypes: 100 })).rejects.toMatchObject({ code: 'ARGUMENT' });
+      await expect(client.listBlockMembers({ type: 'DB', number: 7 }, { maxTypes: 65537 })).rejects.toMatchObject({ code: 'ARGUMENT' });
       expect(server.requests).toHaveLength(count);
     } finally { await client.disconnect(); await server.close(); }
   });

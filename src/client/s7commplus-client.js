@@ -8,9 +8,9 @@ import { performance } from 'node:perf_hooks';
 import { getProductionHost } from '../protocol/production-policy.js';
 import {
   PlusError, PLUS_FUNCTION, PlusAssembler, Cursor, decodeValue, decodeObjects,
-  encodeOperation, assertOutgoing, responsePayload,
+  encodeOperation, assertOutgoing, responsePayload, planReadBatches,
 } from '../protocol/s7commplus/codec.js';
-import { buildBlockMembers, validateMemberValue } from '../protocol/s7commplus/type-info.js';
+import { buildBlockMembers, validateMemberValue, memberValueSize } from '../protocol/s7commplus/type-info.js';
 import { decodeProgramInventory, PROGRAM_INVENTORY_ATTRIBUTES } from '../protocol/s7commplus/block-inventory.js';
 import { BLOCK_CONTENT_ATTRIBUTES, decodeBlockContent } from '../protocol/s7commplus/block-upload.js';
 import { createLegacySessionKey, encodeLegacySecurityKey } from '../protocol/s7commplus/session-key.js';
@@ -22,11 +22,12 @@ const activeHosts = new Set();
 const DEFAULT_LIMITS = Object.freeze({
   requestTimeoutMs: 5000, tlsHandshakeTimeoutMs: 10000, sessionDurationMs: 60000, maxRequests: 12,
   maxRequestBytes: 900, maxResponseBytes: 65536, maxSessionBytes: 262144,
-  maxUploadBytes: 1048576, pacingMs: 250, maxObjects: 65536, maxDepth: 256, maxDiagnosticEntries: 128,
+  maxUploadBytes: 1048576, pacingMs: 250, readPacingMs: 250, maxObjects: 65536, maxDepth: 256, maxDiagnosticEntries: 128,
   maxLatencyMs: 4000, latencyFactor: 5,
 });
 
 /** @typedef {Partial<Record<keyof typeof DEFAULT_LIMITS,number>>} PlusLimits */
+/** @typedef {ReturnType<typeof buildBlockMembers> & {evidence:unknown[],receivedAt:string}} BlockDiscovery */
 /** @typedef {{host?:string,port?:number,productionReadOnly?:boolean,securityMode?:'discovery'|'legacy'|'tls',tls?:{ca?:string|Buffer,servername?:string,certificateSha256?:string,allowAnyCertificate?:boolean,minVersion?:'TLSv1.2'|'TLSv1.3'},limits?:PlusLimits}} PlusOptions */
 /** @typedef {{resolve:(value:any)=>void,reject:(error:Error)=>void,timer:ReturnType<typeof setTimeout>}} Pending */
 
@@ -96,12 +97,16 @@ export class S7CommPlusClient {
   #tlsEstablished = false;
   /** @type {Map<number, BlockMetadata>} */
   #blocks = new Map();
-  /** @type {Awaited<ReturnType<S7CommPlusClient['listDataBlocks']>>|undefined} */
+  /** @type {{blocks:BlockMetadata[],completeness:string,receivedAt:string}|undefined} */
   #inventory;
   /** @type {Map<number, Awaited<ReturnType<S7CommPlusClient['explore']>>>} */
   #types = new Map();
+  /** @type {Map<number,{maxTypes:number,maxMembers:number,discovery:BlockDiscovery}>} */
+  #structures = new Map();
   /** @type {WeakMap<RuntimeMember,{block:BlockMetadata,member:RuntimeMember,metadataEvidence:unknown}>} */
   #memberBindings = new WeakMap();
+  /** @type {WeakMap<RuntimeMember[],{maxItems:number,members:RuntimeMember[],bindings:{block:BlockMetadata,member:RuntimeMember,metadataEvidence:unknown}[],operations:PlusOperation[]}>} */
+  #readPlans = new WeakMap();
   /** @type {{name:string,member:RuntimeMember}[]} */
   #namedMembers = [];
   #uploadBusy = false;
@@ -132,7 +137,7 @@ export class S7CommPlusClient {
     for (const [name, value] of Object.entries(this.#limits)) {
       if (!Number.isSafeInteger(value) || value <= 0) throw new PlusError('ARGUMENT', `Invalid budget ${name}`);
     }
-    if (this.#limits.pacingMs < 250 || this.#limits.maxRequestBytes > 900 || this.#limits.maxResponseBytes > 16777216 || this.#limits.maxObjects > 262144 || this.#limits.maxDepth > 1024 || this.#limits.maxDiagnosticEntries > 4096 || this.#limits.maxRequests > 10000000) {
+    if (this.#limits.pacingMs < 250 || this.#limits.readPacingMs < 10 || this.#limits.maxRequestBytes > 900 || this.#limits.maxResponseBytes > 16777216 || this.#limits.maxObjects > 262144 || this.#limits.maxDepth > 1024 || this.#limits.maxDiagnosticEntries > 4096 || this.#limits.maxRequests > 10000000) {
       throw new PlusError('ARGUMENT', 'Pacing or allocation exceeds the qualified envelope');
     }
     this.#options = { ...options, tls: options.tls ? { ...options.tls } : undefined };
@@ -528,6 +533,10 @@ export class S7CommPlusClient {
       throw new PlusError('ARGUMENT', 'Discovery budgets require 1..65536 types and 1..1048576 members');
     }
     const block = await this.getBlockMetadata(selector);
+    const cached = this.#structures.get(block.number);
+    if (cached?.maxTypes === maxTypes && cached.maxMembers === maxMembers) {
+      return this.#bindDiscovery(structuredClone(cached.discovery));
+    }
     /** @type {PlusObject[]} */
     const objects = [];
     /** @type {unknown[]} */
@@ -553,16 +562,24 @@ export class S7CommPlusClient {
       }
     }
     const result = buildBlockMembers(block, objects, maxMembers);
+    const discovery = { ...result, evidence, receivedAt: new Date().toISOString() };
+    this.#structures.set(block.number, { maxTypes, maxMembers, discovery: structuredClone(discovery) });
+    return this.#bindDiscovery(discovery);
+  }
+
+  /** @param {BlockDiscovery} discovery */
+  #bindDiscovery(discovery) {
+    const { block, members, evidence } = discovery;
     this.#namedMembers = this.#namedMembers.filter(item => this.#memberBindings.get(item.member)?.block.number !== block.number);
     const nativeBlock = structuredClone(block);
     const metadataEvidence = structuredClone(evidence);
-    for (const member of result.members.filter(member => member.readable)) {
+    for (const member of members.filter(member => member.readable)) {
       this.#memberBindings.set(member, { block: nativeBlock, member: structuredClone(member), metadataEvidence });
       if (block.name && member.path) {
         this.#namedMembers.push({ name: `${block.name}.${member.path}`, member }, { name: `"${block.name}".${member.path}`, member });
       }
     }
-    return { ...result, evidence, receivedAt: new Date().toISOString() };
+    return discovery;
   }
 
   /** @param {RuntimeMember} member */
@@ -582,6 +599,58 @@ export class S7CommPlusClient {
         symbolCrc: 0, metadataSymbolCrc: native.symbolCrc },
       observation: { ...decoded, quality: 'GOOD', source: 'S7COMMPLUS_RESPONSE', receivedAt: observation.receivedAt, nativeTimestamp: null },
       evidence: { metadata: structuredClone(binding.metadataEvidence), response: observation } };
+  }
+
+  /** @param {RuntimeMember[]} members @param {{maxItems?:number}} [options] */
+  async readMembers(members, options = {}) {
+    this.#requireReady();
+    if (this.#cpuState !== 'RUN') throw new PlusError('CPU_STATE', 'Symbolic read requires a genuine RUN reply');
+    if (!Array.isArray(members) || !members.length || members.length > 4096) throw new PlusError('ARGUMENT', 'Read requires 1..4096 session members');
+    if (!options || Object.keys(options).some(key => key !== 'maxItems')) throw new PlusError('ARGUMENT', 'Only an explicit maxItems batch limit is supported');
+    const maxItems = options.maxItems ?? 32;
+    if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 64) throw new PlusError('ARGUMENT', 'Batch item limit must be 1..64');
+    let plan = this.#readPlans.get(members);
+    if (!plan || plan.maxItems !== maxItems || plan.members.length !== members.length || plan.members.some((member, index) => member !== members[index])) {
+      const bindings = members.map(member => {
+        const binding = this.#memberBindings.get(member);
+        if (!binding) throw new PlusError('UNVERIFIED_ADDRESS', 'Use readable members discovered by this client session');
+        return binding;
+      });
+      const addresses = bindings.map(binding => ({ accessArea: binding.block.objectRid, lids: binding.member.accessPath, symbolCrc: 0 }));
+      const batches = planReadBatches(addresses, bindings.map(binding => memberValueSize(binding.member)),
+        { sessionId: this.#sessionId, version: this.#version, sessionKey: this.#sessionKey, integrityId: this.#tls ? this.#integrityId : undefined }, { ...this.#limits, maxItems });
+      plan = { maxItems, members: [...members], bindings, operations: batches.map(indices => ({ kind: 'read', maxItems, items: indices.map(index => addresses[index]) })) };
+      this.#readPlans.set(members, plan);
+    }
+    if (plan.operations.length > this.#limits.maxRequests - this.#requests) throw new PlusError('REQUEST_LIMIT', 'Remaining request budget cannot cover the full batch plan');
+    const results = [];
+    let offset = 0;
+    try {
+      for (const operation of plan.operations) {
+        const count = operation.items?.length ?? 0;
+        const response = await this.#exchange(operation);
+        const values = new Map();
+        const errors = new Map();
+        let item;
+        while ((item = response.cursor.uint()) !== 0) {
+          if (item > count || values.has(item)) throw new PlusError('MALFORMED_RESPONSE', 'Duplicate or out-of-range read item');
+          values.set(item, decodeValue(response.cursor));
+        }
+        while ((item = response.cursor.uint()) !== 0) {
+          if (item > count || values.has(item) || errors.has(item)) throw new PlusError('MALFORMED_RESPONSE', 'Duplicate or out-of-range error item');
+          errors.set(item, response.cursor.integer(64));
+        }
+        this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
+        if (errors.size) throw new PlusError('ITEM_REJECTED', 'Native batch contains rejected items', { items: [...errors].map(([number, code]) => ({ number, code: code.toString(16) })) });
+        if (values.size !== count) throw new PlusError('DATA_UNAVAILABLE', 'PLC omitted one or more requested items');
+        const receivedAt = new Date().toISOString();
+        for (let ordinal = 0; ordinal < count; ordinal++) results.push({ observation: {
+          ...validateMemberValue(plan.bindings[offset + ordinal].member, values.get(ordinal + 1)), quality: 'GOOD', source: 'S7COMMPLUS_RESPONSE', receivedAt, nativeTimestamp: null,
+        } });
+        offset += count;
+      }
+      return results;
+    } catch (error) { this.#stop(this.#asError(error)); throw error; }
   }
 
   /** @param {string} name */
@@ -691,7 +760,8 @@ export class S7CommPlusClient {
     if (this.#failure) throw this.#failure;
     if (this.#requests >= this.#limits.maxRequests) throw new PlusError('REQUEST_LIMIT', 'Request count exhausted');
     this.#busy = true;
-    const sequence = this.#sequence++;
+    const sequence = this.#sequence;
+    this.#sequence = (sequence + 1) & 0xFFFF;
     const context = { sessionId: this.#sessionId, version: this.#version, serverVersion: this.#serverVersion,
       securityKey: operation.kind === 'setupSession' ? this.#securityKey : undefined, sessionKey: this.#sessionKey,
       integrityId: this.#sessionKey ? operation.kind === 'activateSession' ? this.#writeIntegrityId++ : this.#integrityId++
@@ -699,7 +769,8 @@ export class S7CommPlusClient {
     try {
       const frame = encodeOperation(operation, context, sequence);
       if (frame.length > this.#limits.maxRequestBytes) throw new PlusError('REQUEST_LIMIT', 'Configured request-byte budget exceeded');
-      const wait = this.#limits.pacingMs - (performance.now() - this.#lastRequest);
+      const pacing = operation.kind === 'read' && operation.items ? this.#limits.readPacingMs : this.#limits.pacingMs;
+      const wait = pacing - (performance.now() - this.#lastRequest);
       if (wait > 0) await delay(wait);
       if (this.#failure) throw this.#failure;
       const started = performance.now();

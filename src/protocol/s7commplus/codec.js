@@ -171,8 +171,50 @@ export function createSessionPayload() {
   ]);
 }
 
-/** @typedef {{kind:string, objectId?:number, attributes?:number[], recursive?:boolean, accessArea?:number, lids?:number[], symbolCrc?:number, attribute?:number}} PlusOperation */
+/** @typedef {{kind:string, objectId?:number, attributes?:number[], recursive?:boolean, accessArea?:number, lids?:number[], symbolCrc?:number, attribute?:number, maxItems?:number, items?:{accessArea:number,lids:number[],symbolCrc?:number}[]}} PlusOperation */
 /** @typedef {{sessionId:number, version:number, serverVersion?:Buffer, integrityId?:number, securityKey?:Buffer, sessionKey?:Buffer, sequence?:number}} PlusContext */
+
+/** @param {{accessArea:number,lids:number[],symbolCrc?:number}} item */
+function encodeReadAddress(item) {
+  if (!item.lids.length || item.lids.length > 16) throw new PlusError('REQUEST_LIMIT', 'LID path requires 1..16 elements');
+  return Buffer.concat([vlq(item.symbolCrc ?? 0), vlq(item.accessArea), vlq(1 + item.lids.length),
+    vlq(item.accessArea >= 0x8A0E0000 ? 2550 : 3736), ...item.lids.map(vlq)]);
+}
+
+/** @param {{accessArea:number,lids:number[],symbolCrc?:number}[]} items @param {number[]} valueSizes @param {PlusContext} context @param {{maxRequestBytes:number,maxResponseBytes:number,maxItems?:number}} limits */
+export function planReadBatches(items, valueSizes, context, limits) {
+  const maxItems = limits.maxItems ?? 32;
+  if (!items.length || items.length !== valueSizes.length || valueSizes.some(size => !Number.isSafeInteger(size) || size < 1)
+    || !Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 64
+    || !Number.isSafeInteger(limits.maxRequestBytes) || limits.maxRequestBytes < 1 || limits.maxRequestBytes > 900
+    || !Number.isSafeInteger(limits.maxResponseBytes) || limits.maxResponseBytes < 1) {
+    throw new PlusError('ARGUMENT', 'Expected symbolic addresses, scalar value sizes and positive byte budgets');
+  }
+  const overhead = 8 + 14 + (context.sessionKey ? 33 : 0) + 4
+    + qualifier(context.sessionKey ? 2 : context.version).length + 4
+    + (context.sessionKey || context.integrityId !== undefined ? 5 : 0);
+  const responseOverhead = 128;
+  /** @type {number[][]} */
+  const batches = [];
+  /** @type {number[]} */
+  let batch = [];
+  let addressBytes = 0, fields = 0, responseBytes = responseOverhead;
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
+    const size = encodeReadAddress(item).length;
+    const itemFields = 4 + item.lids.length;
+    const valueBytes = 1 + valueSizes[index];
+    const requestSize = () => overhead + vlq(batch.length + 1).length + vlq(fields + itemFields).length + addressBytes + size;
+    if (batch.length && (batch.length === maxItems || requestSize() > limits.maxRequestBytes || responseBytes + valueBytes > limits.maxResponseBytes)) {
+      batches.push(batch); batch = []; addressBytes = 0; fields = 0; responseBytes = responseOverhead;
+    }
+    if (requestSize() > limits.maxRequestBytes) throw new PlusError('REQUEST_LIMIT', 'A symbolic address exceeds the request-byte budget');
+    if (responseBytes + valueBytes > limits.maxResponseBytes) throw new PlusError('RESPONSE_LIMIT', 'A scalar value exceeds the response-byte budget');
+    batch.push(index); addressBytes += size; fields += itemFields; responseBytes += valueBytes;
+  }
+  if (batch.length) batches.push(batch);
+  return batches;
+}
 
 /** @param {PlusOperation} operation @param {PlusContext} context */
 function operationPayload(operation, context) {
@@ -223,12 +265,17 @@ function operationPayload(operation, context) {
         vlq(attributes.length), ...attributes.map(vlq), Buffer.alloc(5)]);
     }
     case 'read': {
-      const lids = operation.lids ?? [];
-      if (!lids.length || lids.length > 16) throw new PlusError('REQUEST_LIMIT', 'One LID path of 1..16 elements required');
-      const area = operation.accessArea ?? 0;
-      return Buffer.concat([u32(0), vlq(1), vlq(4 + lids.length), vlq(operation.symbolCrc ?? 0),
-        vlq(area), vlq(1 + lids.length), vlq(area >= 0x8A0E0000 ? 2550 : 3736),
-        ...lids.map(vlq), qualifier(context.sessionKey ? 2 : version), u32(0)]);
+      const items = operation.items ?? [{ accessArea: operation.accessArea ?? 0, lids: operation.lids ?? [], symbolCrc: operation.symbolCrc }];
+      const maxItems = operation.maxItems ?? 32;
+      if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 64) throw new PlusError('ARGUMENT', 'Batch item limit must be 1..64');
+      if (!items.length || items.length > maxItems) throw new PlusError('REQUEST_LIMIT', `Read requires 1..${maxItems} symbolic items`);
+      let fields = 0;
+      const addresses = items.map(item => {
+        fields += 4 + item.lids.length;
+        return encodeReadAddress(item);
+      });
+      return Buffer.concat([u32(0), vlq(items.length), vlq(fields), ...addresses,
+        qualifier(context.sessionKey ? 2 : version), u32(0)]);
     }
     case 'readAttribute': {
       if (operation.attribute !== 1842) throw new PlusError('READ_ONLY_DENIED', 'Only effective protection-level attribute is qualified');
@@ -426,7 +473,7 @@ function decodeTypeMembers(cursor) {
     if (firstMemberId === undefined) firstMemberId = block.take(4).readUInt32LE();
     if (block.offset === block.bytes.length) throw new PlusError('MALFORMED_METADATA', 'Empty type-member block');
     while (block.offset < block.bytes.length) {
-      if (members.length >= 4096) throw new PlusError('RESPONSE_LIMIT', 'Type-member budget exceeded');
+      if (members.length >= 65536) throw new PlusError('RESPONSE_LIMIT', 'Type-member count exceeds 65536');
       const lid = block.take(4).readUInt32LE();
       const symbolCrc = block.take(4).readUInt32LE();
       const softdatatype = block.byte();
@@ -446,7 +493,7 @@ function decodeMemberNames(cursor) {
     if (!length) return names;
     const block = new Cursor(cursor.take(length));
     while (block.offset < block.bytes.length) {
-      if (names.length >= 4096) throw new PlusError('RESPONSE_LIMIT', 'Member-name budget exceeded');
+      if (names.length >= 65536) throw new PlusError('RESPONSE_LIMIT', 'Member-name count exceeds 65536');
       const name = new TextDecoder('utf-8', { fatal: true }).decode(block.take(block.byte()));
       if (block.byte() !== 0) throw new PlusError('MALFORMED_METADATA', 'Member name is not terminated');
       names.push(name);

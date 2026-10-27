@@ -189,17 +189,23 @@ export async function fixture(options = {}) {
       }
       if (options.metadata && functionCode === 0x054C && !options.itemError) {
         const cursor = new Cursor(request.subarray(18, -4));
-        cursor.uint32(); cursor.uint(); cursor.uint();
-        assert.equal(cursor.uint(), 0, 'Browsed type-entry CRC must not be used as an address CRC');
-        cursor.uint();
-        const count = cursor.uint() - 1;
-        cursor.uint();
-        const path = Array.from({ length: count }, () => cursor.uint());
-        const value = path[0] === 1 ? Buffer.concat([Buffer.from([0, 18]), u32(0x92000007)])
-          : path.at(-1) === 107 ? Buffer.from([0, 7, 0xFF, 0x85])
-          : path.at(-1) === 112 ? Buffer.from([0, 8, 0x7F]) : Buffer.from([0, 1, 1]);
-        payload = options.memberError && path[0] !== 1 ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
-          : Buffer.concat([Buffer.from([0, 1]), options.memberTypeMismatch && path[0] !== 1 ? Buffer.from([0, 7, 0, 1]) : value, Buffer.from([0, 0])]);
+        cursor.uint32(); const itemCount = cursor.uint(); cursor.uint();
+        const values = [];
+        const errors = [];
+        for (let ordinal = 1; ordinal <= itemCount; ordinal++) {
+          assert.equal(cursor.uint(), 0, 'Browsed type-entry CRC must not be used as an address CRC');
+          cursor.uint();
+          const count = cursor.uint() - 1;
+          cursor.uint();
+          const path = Array.from({ length: count }, () => cursor.uint());
+          const value = path[0] === 1 ? Buffer.concat([Buffer.from([0, 18]), u32(0x92000007)])
+            : path.at(-1) === 107 ? Buffer.from([0, 7, 0xFF, 0x85])
+            : path.at(-1) === 130 ? Buffer.from([0x10, 2, 10, 8, 4, 84, 69, 83, 84, 0, 0, 0, 0])
+            : path.at(-1) === 112 ? Buffer.from([0, 8, 0x7F]) : Buffer.from([0, 1, 1]);
+          if (options.memberError && path[0] !== 1) errors.push(vlq(ordinal), vlq(0x8104));
+          else values.push(vlq(ordinal), options.memberTypeMismatch && path[0] !== 1 ? Buffer.from([0, 7, 0, 1]) : value);
+        }
+        payload = Buffer.concat([Buffer.from([0]), ...values, Buffer.from([0]), ...errors, Buffer.from([0])]);
       }
       if (stages.indexOf(functionCode) === ['initSSL', 'createSession', 'setupSession'].indexOf(options.reject ?? '') && options.reject) payload = Buffer.from([1, 0]);
       if (functionCode === 0x05B3 && options.legacyInit) {

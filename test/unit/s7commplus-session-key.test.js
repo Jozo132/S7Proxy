@@ -29,11 +29,11 @@ const fragmentVectors = [
 });
 
 describe('S7-1200 legacy SessionKey known answers', () => {
-  it('completes owned-session setup, activation, health, discovery and a process read', async () => {
+  it('completes owned-session setup, activation, health, discovery and cached process batches', async () => {
     const challenge = Buffer.alloc(20, 90);
     const material = createLegacySessionKey(challenge, '01:BD426B091F08731A');
     const server = await fixture({ legacyInit: 'error2', legacyKey: { challenge, ...material }, metadata: true, legacyInventoryDelayMs: 1100 });
-    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy', limits: { maxRequests: 24, readPacingMs: 10 } });
     try {
       await client.connect();
       expect(client.report.securityMode).toBe('LEGACY_SESSION_KEY_INTEGRITY');
@@ -45,6 +45,12 @@ describe('S7-1200 legacy SessionKey known answers', () => {
       if (!member) throw new Error('Fixture must expose a readable member');
       const value = await client.readMember(member);
       expect(value.observation.quality).toBe('GOOD');
+      const members = Array(65).fill(member);
+      for (let scan = 0; scan < 2; scan++) {
+        const results = await client.readMembers(members);
+        expect(results).toHaveLength(65);
+        expect(results.every(result => result.observation.quality === 'GOOD')).toBe(true);
+      }
       expect(client.report.observations.some(observation => observation.kind === 'sessionConfirmation')).toBe(true);
       expect(server.requests.filter(request => request.functionCode === 0x04F2)).toHaveLength(1);
       expect(server.errors).toEqual([]);

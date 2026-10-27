@@ -27,9 +27,11 @@ Requires Node.js >= 20.
 
 ### 0.4.2 (current source)
 
-- Cached DB inventories within a client session, avoiding repeated inventory requests. Per-block evidence retains the relevant object's attributes and response correlation instead of the entire inventory.
+- Cached DB inventories and expanded member structures within a client session, avoiding repeated inventory requests and structure expansion. Cached discoveries are isolated from caller mutations and preserve their original metadata receipt time. Per-block evidence retains the relevant object's attributes and response correlation instead of the entire inventory.
 - More efficient nested-type discovery using indexed lookups and a deduplicated traversal queue, with higher configurable object, depth, response, request and member limits. These are allocation ceilings, not hardware qualification or guarantees of complete discovery.
 - Bounded diagnostic history through `limits.maxDiagnosticEntries` (default `128`, maximum `4096`) for each observation/transcript collection. Transcript hex fields retain at most 1024 bytes per entry; reports are diagnostic samples, not guaranteed complete wire captures.
+- Cached, response-aware `readMembers()` plans default to 32 symbolic items per request, including members from different DBs. An explicit `maxItems` option supports bounded qualification up to 64; 48-item reads succeeded on the tested target, while its 64-item attempt was rejected. Linear address sizing replaces trial-encoding each growing batch; canonical outgoing checks, fresh integrity counters and HMACs remain active.
+- Qualified S7 `STRING` reads validate native byte-array capacity/length headers and preserve the original bytes, exposing a byte-preserving Latin-1 representation. Unsupported string layouts and WSTRING remain explicit rather than guessed.
 
 ### 0.4.1
 
@@ -208,6 +210,109 @@ recursive, ambiguous or unsupported layouts readable. DB inventories and type
 queries are cached within the client session; use a new client session for a
 fresh snapshot. Raise session budgets explicitly when querying multiple blocks;
 there are no implicit reconnects or retries.
+
+### Structure cache
+
+`listBlockMembers()` caches expanded structures per DB and the exact
+`maxTypes`/`maxMembers` budgets. Repeating the same discovery skips type traversal
+and member expansion and makes no PLC request. Results are returned as isolated
+copies with fresh session-local address bindings; changing a returned object
+cannot alter the cache. `receivedAt` remains the original metadata receipt time,
+not the time of the cache hit. Changing discovery budgets rebuilds the structure
+and still enforces the requested limits.
+
+Discover once, retain the readable member arrays, and use only `readMembers()`
+inside the scan loop. The cache and compiled read plans belong to that connected
+client; no discovery is repeated per scan. After a program download or online
+edit, explicitly disconnect and rediscover with a new client. Automatic program
+revision detection and cross-session cache import are not implemented. Saved
+structure JSON under ignored experimentation is an audit snapshot, not an
+authorized source of runtime addresses for a new connection.
+
+### Batch value reads
+
+`readMembers(members)` reads 1..4096 descriptors discovered by the same connected
+client and returns lightweight `{ observation }` entries in input order. Combine
+members across DBs to fill packets instead of issuing a small request per DB.
+Plans obey the selected item ceiling, complete request-byte budget, and worst-case
+response sizes, including STRING capacity. Per-item type checks, response
+correlation and transport integrity are unchanged; rejected items or invalid
+replies fail closed. An insufficient remaining request budget rejects the whole
+plan before its first request.
+
+`readMembers(members, { maxItems: 48 })` explicitly raises the per-request item
+ceiling for a separately qualified target; accepted values are 1..64 and the
+default stays 32. The 900-byte request ceiling may split batches earlier. The
+plan cache includes this setting, so changing it cannot reuse a differently
+sized plan. Acceptance by the library is not evidence that a PLC supports that
+batch size; rejection stops the client without fallback or retry.
+
+In a connected RUN session with explicit budgets sufficient for discovery and
+the intended scans:
+
+```js
+const members = [];
+for (const block of (await plc.listDataBlocks()).blocks) {
+  const discovery = await plc.listBlockMembers({ type: 'DB', number: block.number });
+  members.push(...discovery.members.filter(member => member.readable));
+}
+const chunks = [];
+for (let offset = 0; offset < members.length; offset += 4096) {
+  chunks.push(members.slice(offset, offset + 4096));
+}
+async function readScan() {
+  const values = [];
+  for (const chunk of chunks) values.push(...await plc.readMembers(chunk));
+  return values;
+}
+const first = await readScan();
+const next = await readScan();
+```
+
+Retain the same chunk arrays to reuse session-local plans. Changed array contents
+rebuild the plan; serialized descriptors or descriptors from another session are
+not accepted. Returned positions match the original flattened member order.
+Discovery diagnostics and unreadable members must still be reported separately;
+a successful scan is not proof of an exhaustive or atomic DB snapshot.
+
+`limits.readPacingMs` defaults to 250 ms and applies specifically to multi-item
+reads. Values down to 10 ms are accepted only by explicit configuration; discovery
+and session housekeeping retain `limits.pacingMs` (minimum 250 ms). There is still
+one outstanding request per client. Lower pacing must be qualified against PLC
+load and latency, not enabled by removing safety limits. The default 12-request,
+60-second session remains a bounded acquisition, not an unlimited DAQ service.
+
+An authorized TLS test inventoried 96 DBs and read all 1109 discovered leaf values,
+including 15 STRINGs, in 35 cross-DB requests per scan. Values came from 95 DBs;
+one inventoried DB lacked complete member-name metadata and could not be read.
+Three scans at 10 ms read
+pacing took 2.75..2.79 seconds each (397..404 values/s); cold discovery took about
+35 seconds separately. The PLC remained RUN and certificate trust was explicitly
+unverified. These measurements do not establish safe load on other controllers,
+complete program coverage or restorable backup capability. Exact target details,
+per-DB values and Markdown reports remain under gitignored `experimentation/`.
+
+A subsequent single-session qualification reused the same 96-DB structure and
+1109 readable values. Retrieving every expanded structure from cache took 55 ms
+and zero PLC requests, versus about 35 seconds for initial discovery. Three
+32-item scans averaged 408 values/s in 35 requests each; three 48-item scans
+averaged 474 values/s in 24 requests each, a 16.3% improvement. The subsequent
+64-item request was rejected and the session disconnected without retry. RUN
+was confirmed after each successful scan, not after that rejection. Coverage
+remained 95 readable DBs with one incomplete member-name metadata result;
+certificate trust remained unverified. These results do not qualify a universal
+item limit or establish PLC load safety.
+
+An ordering comparison then ran five interleaved scans each with input order,
+numeric DB RID/LID order, and response-size balancing. All scans read the same
+1109 values in 24 requests, with RUN confirmed between scans and at completion.
+Aggregate throughput was 477 values/s for input order, 472 for RID ordering and
+474 for balancing. All 360 read replies used a single inbound TPKT frame, so
+the predicted fragmentation bottleneck was absent. The small differences do
+not establish a meaningful ordering advantage. The production planner retains
+input order; the ordering prototype and exact evidence remain only in ignored
+experimentation, not the packaged library. Worst-case STRING capacity estimates
+are allocation bounds, not measurements of actual reply length.
 
 `readMember()` accepts only readable descriptors discovered by that client.
 It checks the returned wire datatype and retains the raw value, request/response

@@ -26,14 +26,15 @@ describe('S7CommPlus read-only codec', () => {
   it.each(['write', 'download', 'delete', 'cpuControl', 'invoke', 'setVariable', 'upload', '__proto__'])('denies %s before serialization', kind => {
     expect(() => encodeOperation({ kind }, context, 0)).toThrow(/not allowlisted/);
   });
-  it('accepts bounded larger inventories only with an explicit object budget', () => {
+  it('accepts larger inventories within the current default and explicit object budgets', () => {
     const bytes = Buffer.concat(Array.from({ length: 156 }, (_, index) =>
       Buffer.concat([Buffer.from([0xA1]), u32(index + 1), vlq(511), Buffer.from([0, 0, 0xA2])])));
-    expect(() => decodeObjects(new Cursor(bytes))).toThrow(/budget/);
+    expect(decodeObjects(new Cursor(bytes))).toHaveLength(156);
+    expect(() => decodeObjects(new Cursor(bytes), 32)).toThrow(/Object count/);
     expect(decodeObjects(new Cursor(bytes), 256)).toHaveLength(156);
     const client = new S7CommPlusClient({ host: '127.0.0.1', limits: { maxObjects: 256, requestTimeoutMs: 3000 } });
     expect(client.report.limits).toMatchObject({ maxObjects: 256, requestTimeoutMs: 3000, tlsHandshakeTimeoutMs: 10000 });
-    expect(() => new S7CommPlusClient({ host: '127.0.0.1', limits: { maxObjects: 4097 } })).toThrow(/allocation/);
+    expect(() => new S7CommPlusClient({ host: '127.0.0.1', limits: { maxObjects: 262145 } })).toThrow(/allocation/);
   });
   it('revalidates canonical bytes before transmission', () => {
     const operation = { kind: 'explore', objectId: 52, attributes: [0x8BD] };
@@ -342,6 +343,30 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
     certificateSha256 = new X509Certificate(credentials.cert).fingerprint256.replaceAll(':', '').toLowerCase();
   });
   afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
+  it.each(['good', 'item-error', 'wrong-type'])('validates verified TLS read batches: %s', async mode => {
+    const server = await fixture({ tls: credentials, metadata: true, memberError: mode === 'item-error', memberTypeMismatch: mode === 'wrong-type' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 }, limits: { maxRequests: 24, readPacingMs: 10 } });
+    try {
+      await client.connect();
+      const discovery = await client.listBlockMembers({ type: 'DB', number: 7 });
+      const member = discovery.members.find(candidate => candidate.path === 'Enabled' && candidate.readable);
+      if (!member) throw new Error('Missing synthetic member');
+      const members = Array(65).fill(member);
+      if (mode === 'good') {
+        for (let scan = 0; scan < 2; scan++) {
+          const results = await client.readMembers(members);
+          expect(results).toHaveLength(65);
+          expect(results.every(result => result.observation.value === true && result.observation.quality === 'GOOD')).toBe(true);
+        }
+        expect(client.report.securityMode).toBe('TLS_VERIFIED');
+      } else {
+        await expect(client.readMembers(members)).rejects.toMatchObject({ code: mode === 'item-error' ? 'ITEM_REJECTED' : 'DATATYPE_MISMATCH' });
+        expect(client.connected).toBe(false);
+      }
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
   it.each([['run', 8], ['stop', 4]])('connects in %s and retrieves unchanged native files without CPU control', async (mode, state) => {
     const server = await fixture({ tls: credentials, programContent: true, state: Number(state) });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
