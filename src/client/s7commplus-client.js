@@ -14,6 +14,8 @@ import { buildBlockMembers, validateMemberValue, memberValueSize } from '../prot
 import { decodeProgramInventory, PROGRAM_INVENTORY_ATTRIBUTES } from '../protocol/s7commplus/block-inventory.js';
 import { BLOCK_CONTENT_ATTRIBUTES, decodeBlockContent } from '../protocol/s7commplus/block-upload.js';
 import { createLegacySessionKey, encodeLegacySecurityKey } from '../protocol/s7commplus/session-key.js';
+import { ACTIVE_ALARM_ATTRIBUTES } from '../protocol/s7commplus/operation-policy.js';
+import { decodeCurrentAlarms } from '../protocol/s7commplus/alarms.js';
 
 /** @import { PlusOperation, PlusObject, PlusValue } from '../protocol/s7commplus/codec.js' */
 /** @import { BlockMetadata, AreaMetadata, RuntimeMember } from '../protocol/s7commplus/type-info.js' */
@@ -21,6 +23,16 @@ export { getProductionHost } from '../protocol/production-policy.js';
 /** @type {Map<string, Set<S7CommPlusClient>>} */
 const activeConnections = new Map();
 const AREA_RIDS = Object.freeze({ I: 80, Q: 81, M: 82 });
+const COMMUNICATION_RESOURCE_FIELDS = Object.freeze([
+  { name: 'tagsPerReadRequestMax', subarea: 1037, lid: 1000 },
+  { name: 'tagsPerWriteRequestMax', subarea: 1037, lid: 1001 },
+  { name: 'subscriptionsMax', subarea: 1037, lid: 0 },
+  { name: 'attributesMax', subarea: 1037, lid: 1 },
+  { name: 'subscriptionMemoryMax', subarea: 1037, lid: 2 },
+  { name: 'subscriptionsFree', subarea: 1081, lid: 0 },
+  { name: 'attributesFree', subarea: 1081, lid: 1 },
+  { name: 'subscriptionMemoryFree', subarea: 1081, lid: 2 },
+]);
 const DEFAULT_LIMITS = Object.freeze({
   requestTimeoutMs: 5000, tlsHandshakeTimeoutMs: 10000, sessionDurationMs: 60000, maxRequests: 12,
   maxRequestBytes: 900, maxResponseBytes: 65536, maxSessionBytes: 262144,
@@ -176,7 +188,8 @@ export class S7CommPlusClient {
         maxInFlightRequests: 1, maxQueuedRequests: this.#limits.maxQueuedRequests,
         queuedRequests: this.#requestQueue.length, inFlightRequests: this.#busy ? 1 : 0 },
       identity: this.#identity, cpuState: this.#cpuState, effectiveProtectionLevel: this.#protection,
-      capabilities: { objectExplore: this.#ready, areaExplore: this.#ready, symbolicLidRead: this.#ready && this.#cpuState === 'RUN',
+      capabilities: { objectExplore: this.#ready, areaExplore: this.#ready, communicationResourceRead: this.#ready,
+        currentAlarmRead: this.connected && this.#tlsEstablished, symbolicLidRead: this.#ready && this.#cpuState === 'RUN',
         namedSymbolResolution: this.#ready && this.#cpuState === 'RUN' && this.#namedMembers.length > 0,
         blockUpload: this.#tlsVerified && this.#protection === 1 ? 'BOUNDED_NATIVE_ATTRIBUTE_CONTENT' : 'UNSUPPORTED_PROFILE',
         controllerBackup: 'UNSUPPORTED_UNQUALIFIED', cpuModeControl: this.connected && this.#tlsEstablished && this.#protection === 1 ? 'EXPLICIT_RUN_ONLY' : 'DENIED', recurringUploads: false },
@@ -306,7 +319,7 @@ export class S7CommPlusClient {
     return this.#explore(objectId, options);
   }
 
-  /** @param {number} objectId @param {{attributes?:number[],recursive?:boolean}} options @param {'explore'|'readBlockContent'} [kind] */
+  /** @param {number} objectId @param {{attributes?:number[],recursive?:boolean}} options @param {'explore'|'readBlockContent'|'readActiveAlarms'} [kind] */
   async #explore(objectId, options, kind = 'explore') {
     try {
       const response = await this.#exchange({ kind, objectId, ...options });
@@ -323,6 +336,60 @@ export class S7CommPlusClient {
 
   async readCpuState() {
     return this.#readCpuState();
+  }
+
+  /** @param {{languageId?:number,maxAlarms?:number}} [options] */
+  async readActiveAlarms(options = {}) {
+    this.#requireReady();
+    this.#requireMetadataState();
+    if (!options || typeof options !== 'object' || Array.isArray(options) || Object.keys(options).some(key => !['languageId', 'maxAlarms'].includes(key))) {
+      throw new PlusError('ARGUMENT', 'Select only languageId and maxAlarms');
+    }
+    const languageId = options.languageId ?? 1033;
+    const maxAlarms = options.maxAlarms ?? 128;
+    if (!Number.isSafeInteger(languageId) || languageId < 1 || languageId > 65535 || !Number.isSafeInteger(maxAlarms) || maxAlarms < 1 || maxAlarms > 4096) {
+      throw new PlusError('ARGUMENT', 'Alarm reads require languageId 1..65535 and maxAlarms 1..4096');
+    }
+    if (!this.#tlsEstablished) throw new PlusError('UNSUPPORTED_PROFILE', 'Current alarm reads are qualified only for the TLS V2 profile');
+    const evidence = await this.#explore(8, { recursive: true, attributes: [...ACTIVE_ALARM_ATTRIBUTES] }, 'readActiveAlarms');
+    return { ...decodeCurrentAlarms(evidence.objects, { languageId, maxAlarms }), receivedAt: evidence.receivedAt,
+      evidence: { schemaReference: 'thomas-v2/S7CommPlusDriver@dbd61e447c7aaf4486cf1f1fe0201212a6bd93c8:Alarming/BrowseAlarms.cs:GetActiveAlarms', response: evidence } };
+  }
+
+  async readCommunicationResources() {
+    this.#requireReady();
+    this.#requireMetadataState();
+    const items = COMMUNICATION_RESOURCE_FIELDS.map(field => ({ accessArea: 201, accessSubArea: field.subarea, lids: [field.lid], symbolCrc: 0 }));
+    try {
+      const response = await this.#exchange({ kind: 'read', items });
+      /** @type {Map<number, PlusValue>} */
+      const values = new Map();
+      /** @type {Map<number, bigint>} */
+      const errors = new Map();
+      let ordinal;
+      while ((ordinal = response.cursor.uint()) !== 0) {
+        if (ordinal > items.length || values.has(ordinal)) throw new PlusError('MALFORMED_RESPONSE', 'Duplicate or out-of-range resource item');
+        values.set(ordinal, decodeValue(response.cursor));
+      }
+      while ((ordinal = response.cursor.uint()) !== 0) {
+        if (ordinal > items.length || values.has(ordinal) || errors.has(ordinal)) throw new PlusError('MALFORMED_RESPONSE', 'Duplicate or out-of-range resource error');
+        errors.set(ordinal, response.cursor.integer(64));
+      }
+      this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
+      const counters = Object.fromEntries(COMMUNICATION_RESOURCE_FIELDS.map((field, index) => {
+        const rawValue = values.get(index + 1) ?? null;
+        const error = errors.get(index + 1);
+        const valid = rawValue?.flags === 0 && rawValue.datatype === 8 && Number.isInteger(rawValue.value) && rawValue.value >= 0;
+        const status = valid ? 'GOOD' : error !== undefined ? 'ITEM_REJECTED' : rawValue ? 'INVALID_VALUE' : 'UNAVAILABLE';
+        return [field.name, { value: valid ? Number(rawValue?.value) : null, status,
+          errorCode: error === undefined ? null : `0x${error.toString(16)}`, address: items[index], rawValue }];
+      }));
+      return { counters, completeness: Object.values(counters).every(counter => counter.status === 'GOOD') ? 'COMPLETE' : 'PARTIAL',
+        receivedAt: new Date().toISOString(), nativeTimestamp: null,
+        request: { sequence: response.correlation.sequence, integrityId: response.correlation.integrityId, ...response.timing },
+        semantics: { itemLimitDirection: 'REFERENCE_ASSUMPTION', subscriptionMemoryUnit: 'UNKNOWN', connectionCapacity: 'NOT_REPORTED', atomicSnapshot: false },
+        evidence: { schemaReference: 'thomas-v2/S7CommPlusDriver@dbd61e447c7aaf4486cf1f1fe0201212a6bd93c8:Core/CommRessources.cs', correlation: response.correlation } };
+    } catch (error) { this.#stop(this.#asError(error)); throw error; }
   }
 
   /** @param {boolean} [allowCpuStart] */

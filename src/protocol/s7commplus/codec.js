@@ -1,5 +1,5 @@
 // @ts-check
-import { getOperationPolicy, BLOCK_CONTENT_ATTRIBUTES } from './operation-policy.js';
+import { getOperationPolicy, BLOCK_CONTENT_ATTRIBUTES, ACTIVE_ALARM_ATTRIBUTES } from './operation-policy.js';
 import { createHmac } from 'node:crypto';
 import { FragmentHMACVerifier } from './fragment-hmac.js';
 export class PlusError extends Error {
@@ -8,7 +8,7 @@ export class PlusError extends Error {
 }
 
 export const PLUS_FUNCTION = Object.freeze({
-  explore: 0x04BB, readBlockContent: 0x04BB, createSession: 0x04CA, setupSession: 0x0542,
+  explore: 0x04BB, readBlockContent: 0x04BB, readActiveAlarms: 0x04BB, createSession: 0x04CA, setupSession: 0x0542,
   read: 0x054C, readAttribute: 0x0586, initSSL: 0x05B3, activateSession: 0x04F2,
   cpuStart: 0x04F2,
 });
@@ -172,14 +172,18 @@ export function createSessionPayload() {
   ]);
 }
 
-/** @typedef {{kind:string, objectId?:number, attributes?:number[], recursive?:boolean, accessArea?:number, lids?:number[], symbolCrc?:number, attribute?:number, maxItems?:number, items?:{accessArea:number,lids:number[],symbolCrc?:number}[]}} PlusOperation */
+/** @typedef {{kind:string, objectId?:number, attributes?:number[], recursive?:boolean, accessArea?:number, lids?:number[], symbolCrc?:number, attribute?:number, maxItems?:number, items?:{accessArea:number,lids:number[],symbolCrc?:number,accessSubArea?:number}[]}} PlusOperation */
 /** @typedef {{sessionId:number, version:number, serverVersion?:Buffer, integrityId?:number, securityKey?:Buffer, sessionKey?:Buffer, sequence?:number, cpuStartAuthorized?:boolean}} PlusContext */
 
-/** @param {{accessArea:number,lids:number[],symbolCrc?:number}} item */
+/** @param {{accessArea:number,lids:number[],symbolCrc?:number,accessSubArea?:number}} item */
 function encodeReadAddress(item) {
   if (!item.lids.length || item.lids.length > 16) throw new PlusError('REQUEST_LIMIT', 'LID path requires 1..16 elements');
+  if (item.accessSubArea !== undefined && (item.accessArea !== 201 || item.lids.length !== 1 || (item.symbolCrc ?? 0) !== 0
+    || !(item.accessSubArea === 1037 ? [0, 1, 2, 1000, 1001] : item.accessSubArea === 1081 ? [0, 1, 2] : []).includes(item.lids[0]))) {
+    throw new PlusError('ARGUMENT', 'Explicit read subareas are restricted to communication resource counters');
+  }
   return Buffer.concat([vlq(item.symbolCrc ?? 0), vlq(item.accessArea), vlq(1 + item.lids.length),
-    vlq(item.accessArea >= 0x8A0E0000 ? 2550 : 3736), ...item.lids.map(vlq)]);
+    vlq(item.accessSubArea ?? (item.accessArea >= 0x8A0E0000 ? 2550 : 3736)), ...item.lids.map(vlq)]);
 }
 
 /** @param {{accessArea:number,lids:number[],symbolCrc?:number}[]} items @param {number[]} valueSizes @param {PlusContext} context @param {{maxRequestBytes:number,maxResponseBytes:number,maxItems?:number}} limits */
@@ -258,6 +262,16 @@ function operationPayload(operation, context) {
       if (Object.keys(operation).some(key => key !== 'kind')) throw new PlusError('READ_ONLY_DENIED', 'CPU start accepts no arbitrary address or value');
       return Buffer.concat([u32(52), Buffer.from([1]), vlq(2167), Buffer.from([0, 8, 3]), qualifier(2), Buffer.alloc(5)]);
     }
+    case 'readActiveAlarms': {
+      if (!sessionId || version !== 2 || context.sessionKey || context.integrityId === undefined) throw new PlusError('UNSUPPORTED_PROFILE', 'Current alarm reads require an established TLS V2 session');
+      if (operation.objectId !== 8 || operation.recursive !== true || operation.attributes?.length !== ACTIVE_ALARM_ATTRIBUTES.length
+        || operation.attributes.some((attribute, index) => attribute !== ACTIVE_ALARM_ATTRIBUTES[index])
+        || Object.keys(operation).some(key => !['kind', 'objectId', 'recursive', 'attributes'].includes(key))) {
+        throw new PlusError('READ_ONLY_DENIED', 'Current alarm reads require the exact alarm subsystem query');
+      }
+      return Buffer.concat([u32(8), vlq(2667), Buffer.from([1, 1, 0, 0]), vlq(ACTIVE_ALARM_ATTRIBUTES.length),
+        ...ACTIVE_ALARM_ATTRIBUTES.map(vlq), Buffer.alloc(5)]);
+    }
     case 'readBlockContent':
     case 'explore': {
       const attributes = operation.attributes ?? [];
@@ -299,11 +313,11 @@ export function encodeOperation(operation, context, sequence) {
   let payload = operationPayload(operation, { ...context, sequence });
   const functionCode = PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)];
   if (functionCode === undefined) throw new PlusError('READ_ONLY_DENIED', 'Unknown function');
-  if (['read', 'explore', 'readBlockContent', 'readAttribute'].includes(operation.kind) && !context.sessionId) {
+  if (['read', 'explore', 'readBlockContent', 'readActiveAlarms', 'readAttribute'].includes(operation.kind) && !context.sessionId) {
     throw new PlusError('SESSION_REQUIRED', 'Read requires an established session');
   }
-  if (context.integrityId !== undefined && ['read', 'explore', 'readBlockContent', 'readAttribute', 'activateSession', 'cpuStart'].includes(operation.kind)) {
-    const tail = ['explore', 'readBlockContent'].includes(operation.kind) ? 5 : context.sessionKey && operation.kind === 'activateSession' ? 3 : 4;
+  if (context.integrityId !== undefined && ['read', 'explore', 'readBlockContent', 'readActiveAlarms', 'readAttribute', 'activateSession', 'cpuStart'].includes(operation.kind)) {
+    const tail = ['explore', 'readBlockContent', 'readActiveAlarms'].includes(operation.kind) ? 5 : context.sessionKey && operation.kind === 'activateSession' ? 3 : 4;
     payload = Buffer.concat([payload.subarray(0, -tail), vlq(context.integrityId), payload.subarray(-tail)]);
   }
   const header = Buffer.alloc(14);

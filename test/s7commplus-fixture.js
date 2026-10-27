@@ -79,7 +79,7 @@ export function validateSessionRequest(request, index, secure = false, reference
   return functionCode;
 }
 
-/** @param {FixtureOptions & {cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number,readStall?:boolean,resetOnDisconnect?:boolean,resetOnRead?:boolean}} [options] */
+/** @param {FixtureOptions & {currentAlarms?:'present'|'empty'|'partial'|'invalidText'|'unknownClass'|'multiple',communicationResources?:'complete'|'partial'|'invalid'|'duplicate'|'outOfRange'|'badTail',cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number,readStall?:boolean,resetOnDisconnect?:boolean,resetOnRead?:boolean}} [options] */
 export async function fixture(options = {}) {
   /** @type {import('node:net').Socket[]} */
   const sockets = [];
@@ -227,6 +227,37 @@ export async function fixture(options = {}) {
         payload = Buffer.concat([Buffer.from([0]), ...values, Buffer.from([0]), ...errors, Buffer.from([0])]);
       }
       if (stages.indexOf(functionCode) === ['initSSL', 'createSession', 'setupSession'].indexOf(options.reject ?? '') && options.reject) payload = Buffer.from([1, 0]);
+      if (options.currentAlarms && functionCode === 0x04BB && request.readUInt32BE(18) === 8) {
+        assert.ok(secureSocket, 'Current alarm fixture requires TLS');
+        const cursor = new Cursor(request.subarray(18, -4));
+        assert.deepEqual([cursor.uint32(), cursor.uint()], [8, 2667]);
+        assert.deepEqual([...cursor.take(4)], [1, 1, 0, 0]);
+        assert.equal(cursor.uint(), 10);
+        assert.deepEqual(Array.from({ length: 10 }, () => cursor.uint()), [2670, 2671, 2672, 2673, 2677, 4079, 7813, 233, 7917, 2715]);
+        payload = Buffer.concat([Buffer.from([0]), currentAlarmObjects(options.currentAlarms)]);
+      }
+      if (options.communicationResources && functionCode === 0x054C) {
+        const cursor = new Cursor(request.subarray(18, -4));
+        assert.deepEqual([cursor.uint32(), cursor.uint(), cursor.uint()], [0, 8, 40]);
+        const addresses = [];
+        for (let ordinal = 1; ordinal <= 8; ordinal++) addresses.push(Array.from({ length: 5 }, () => cursor.uint()));
+        assert.deepEqual(addresses, [[0, 201, 2, 1037, 1000], [0, 201, 2, 1037, 1001],
+          [0, 201, 2, 1037, 0], [0, 201, 2, 1037, 1], [0, 201, 2, 1037, 2],
+          [0, 201, 2, 1081, 0], [0, 201, 2, 1081, 1], [0, 201, 2, 1081, 2]]);
+        const values = [64, 64, 100, 1000, 10000, 95, 900, 9000].flatMap((value, index) => {
+          if (options.communicationResources === 'partial' && index < 2) return [];
+          const invalid = options.communicationResources === 'invalid' && index < 2;
+          const encoded = vlq(value);
+          const signed = encoded[0] & 0x40 ? Buffer.concat([Buffer.from([0x80]), encoded]) : encoded;
+          return [vlq(index + 1), Buffer.from([0, invalid && index === 0 ? 4 : 8]), invalid && index === 1 ? Buffer.from([0x7F]) : invalid ? encoded : signed];
+        });
+        if (options.communicationResources === 'duplicate' || options.communicationResources === 'outOfRange') {
+          values.push(vlq(options.communicationResources === 'duplicate' ? 1 : 9), Buffer.from([0, 8, 1]));
+        }
+        payload = Buffer.concat([Buffer.from([0]), ...values, Buffer.from([0]),
+          ...(options.communicationResources === 'partial' ? [Buffer.from([1]), vlq(0x8104)] : []),
+          Buffer.from([0]), ...(options.communicationResources === 'badTail' ? [Buffer.from([99])] : [])]);
+      }
       if (functionCode === 0x05B3 && options.legacyInit) {
         if (options.legacyInit === 'error2') header.writeUInt16BE(0x05A9, 3);
         payload = Buffer.concat([encodeTestUInt64(options.legacyInit === 'error2' ? 0x800000000000FF89n : 0x800000000000FDF9n), Buffer.alloc(4)]);
@@ -339,4 +370,29 @@ export function programExplore(rid, empty, protectionMode = 0) {
     return object(Number(id), attributes, Number(classId));
   });
   return rid === 3 ? Buffer.concat([object(3, [], 2520).subarray(0, -1), ...objects, Buffer.from([0xA2])]) : Buffer.concat(objects);
+}
+
+/** @param {'present'|'empty'|'partial'|'invalidText'|'unknownClass'|'multiple'} mode */
+function currentAlarmObjects(mode) {
+  if (mode === 'empty') return Buffer.alloc(0);
+  if (mode === 'unknownClass') return object(999, [], 999);
+  /** @param {bigint} value */
+  const wide = value => { const bytes = Buffer.alloc(8); bytes.writeBigUInt64BE(value); return bytes; };
+  const textEntries = [[1033, 2, 'I/O device unavailable'], [1033, 1, 'PROFINET device missing'], [1031, 2, 'Testmeldung']];
+  const texts = Buffer.concat([Buffer.from([0x40, 20]), ...textEntries.map(([languageId, textId, text]) => {
+    const bytes = mode === 'invalidText' ? Buffer.from([0xC3, 0x28]) : Buffer.from(String(text));
+    return Buffer.concat([vlq(Number(languageId) * 65536 + Number(textId)), vlq(0), vlq(bytes.length), bytes]);
+  }), vlq(0)]);
+  return Buffer.concat(Array.from({ length: mode === 'multiple' ? 3 : 1 }, (_, index) => {
+    const attributes = [
+      { id: 2670, raw: Buffer.concat([Buffer.from([0, 13]), wide(0x8A7E000000010000n + BigInt(index))]) },
+      { id: 2671, raw: Buffer.from([0, 2, 5]) }, { id: 2672, raw: Buffer.from([0, 3, 0, 1]) },
+      { id: 4079, raw: Buffer.from([0, 8, 1]) }, { id: 7917, raw: Buffer.from([0, 4, 7]) },
+      { id: 233, raw: Buffer.from([0, 21, 5, 65, 108, 97, 114, 109]) },
+      { id: 2673, raw: Buffer.concat([Buffer.from([0, 23]), u32(3473), vlq(3474), Buffer.from([0, 2, 5]),
+        vlq(3475), Buffer.from([0, 16]), wide(1700000000123456789n), vlq(3646), Buffer.from([0, 16]), wide(0n), vlq(0)]) },
+      { id: 2715, raw: texts },
+    ].filter(attribute => mode !== 'partial' || ![2670, 2715].includes(attribute.id));
+    return object(0x8A7E0001 + index, attributes, 2681);
+  }));
 }

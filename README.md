@@ -159,6 +159,82 @@ exact state transition time. Scan-synchronous guarantees require PLC-side trace,
 timestamps/counters or an explicitly qualified acquisition mechanism. The portal
 shared polling driver is unchanged; this is a separate native benchmark API/CLI.
 
+## Native Current Alarm Diagnostics
+
+On a connected native TLS V2 client in RUN or STOP:
+
+```js
+const snapshot = await client.readActiveAlarms({ languageId: 1033, maxAlarms: 128 });
+for (const alarm of snapshot.alarms) {
+  console.log(alarm.cpuAlarmId, alarm.text, alarm.coming?.timestamp);
+}
+```
+
+This is one fixed read-only Explore query of alarm subsystem 8, selector 2667,
+with ten reference-defined attributes. It does not create a subscription,
+acknowledge or clear alarms, change CPU mode, or modify the PLC program.
+Only `languageId` (1..65535, default 1033) and `maxAlarms` (1..4096, default 128)
+are accepted. Session request, byte, object, depth and duration limits still apply;
+the result limit does not reduce the controller's response before decoding.
+
+Records retain lossless decimal alarm IDs, raw state bits, domain/type, sequence,
+coming/going timestamps, available language texts and native evidence. Timestamp
+nanoseconds are preserved alongside UTC milliseconds and the submillisecond
+remainder; PLC clock synchronization is unknown. Missing or unsupported fields
+stay null/partial, unknown objects are diagnosed, and local result truncation is
+explicit. State-bit meanings, HMI-detail interpretation and associated-value
+decoding are not qualified; text placeholders are not expanded. No language is
+silently substituted when the requested text is unavailable.
+
+This is the current/update-relevant alarm service, **not the historical CPU
+diagnostic buffer**. An empty response does not prove a fault-free history or
+coverage of every CPU/system diagnostic source. Alarm subscriptions, fault-buffer
+history and CPU cycle/load diagnostics remain unimplemented.
+
+A bounded CPU1212C V4.5 lab query succeeded and returned zero alarm records.
+Seven total requests completed; final state RUN, read-only and disconnected.
+TLS remained unverified despite matching the historical fingerprint; the late
+reset remained a teardown warning with no acquisition failure. This qualifies
+the empty-query path on that CPU, not real positive alarm/text/timestamp decoding;
+positive records and partial cases currently have verified-TLS loopback coverage.
+
+## Native Communication Resources
+
+On a connected native `S7CommPlusClient` in RUN or STOP:
+
+```js
+const snapshot = await client.readCommunicationResources();
+console.log(snapshot.counters.tagsPerReadRequestMax);
+console.log(snapshot.counters.subscriptionsFree);
+```
+
+One eight-item `GetMultiVariables` request reads root RID 201, SystemLimits
+subarea 1037 (LIDs 1000, 1001, 0, 1, 2) and FreeItems subarea 1081
+(LIDs 0, 1, 2). Every call is fresh, not cached. Counters are
+`tagsPerReadRequestMax`, `tagsPerWriteRequestMax`, `subscriptionsMax`,
+`attributesMax`, `subscriptionMemoryMax`, `subscriptionsFree`, `attributesFree`
+and `subscriptionMemoryFree`. Each retains its native address, raw value,
+status and error code. Rejected, omitted, non-DINT or negative counters have
+`value: null`, never a fabricated default; completeness is then `PARTIAL`.
+Malformed lists, integrity failures and transport failures still stop the session.
+Request timing/correlation is retained; no PLC timestamp or atomic snapshot is
+claimed. The capability getter indicates API availability, not that a CPU has
+returned every counter successfully.
+
+The item-limit read/write interpretation follows the pinned independent
+reference and remains marked `REFERENCE_ASSUMPTION`. Subscription-memory units
+remain `UNKNOWN`; subscription capacity is not TCP/HMI connection capacity.
+No batch size, software connection budget or sampling rate is changed
+automatically, and reading a write limit does not enable writes.
+
+A bounded CPU1212C V4.5 lab run returned all eight counters: item limits 50/50,
+subscriptions maximum/free 40/40, attributes 400/400 and subscription memory
+102400/102400 (unit unqualified). Seven total session requests completed, final
+state RUN, read-only and disconnected. Historical fingerprint/identity matched
+but TLS remained unverified. A late reset was retained as `teardownWarning`,
+with no acquisition failure. This does not establish a connection ceiling or
+qualify subscriptions, actual write limits or general resource-unit semantics.
+
 ## Native I/Q/M Exploration
 
 On an explicitly connected `S7CommPlusClient`, select inputs (`I`), outputs (`Q`)

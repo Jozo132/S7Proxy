@@ -7,10 +7,12 @@ const policies = Object.freeze({
   explore: 'READ_ONLY_METADATA',
   read: 'READ_ONLY_VALUES',
   readAttribute: 'READ_ONLY_METADATA',
+  readActiveAlarms: 'READ_ONLY_DIAGNOSTICS',
   readBlockContent: 'READ_ONLY_RESOURCE_BOUNDED_PROGRAM_CONTENT',
 });
 
 export const BLOCK_CONTENT_ATTRIBUTES = Object.freeze([233, 2521, 2580, 2533, 2544, 2546, 2582, 2583]);
+export const ACTIVE_ALARM_ATTRIBUTES = Object.freeze([2670, 2671, 2672, 2673, 2677, 4079, 7813, 233, 7917, 2715]);
 
 /** @param {string} kind @param {{cpuStartAuthorized?:boolean}} [authorization] */
 export function getOperationPolicy(kind, authorization = {}) {

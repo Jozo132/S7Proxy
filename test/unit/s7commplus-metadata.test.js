@@ -13,6 +13,21 @@ const block = { type: /** @type {const} */ ('DB'), number: 7, name: 'SampleDB', 
 const objects = () => decodeObjects(new Cursor(Buffer.concat([typeObject(root, syntheticMembers), typeObject(child, [{ name: 'Ready', lid: 132, type: 1 }])])));
 
 describe('symbolic read batch planning', () => {
+  it('encodes only the reference communication resource subareas at the native root', () => {
+    const items = [1000, 1001, 0, 1, 2].map(lid => ({ accessArea: 201, accessSubArea: 1037, lids: [lid] }))
+      .concat([0, 1, 2].map(lid => ({ accessArea: 201, accessSubArea: 1081, lids: [lid] })));
+    const encoded = encodeOperation({ kind: 'read', items }, { sessionId: 77, version: 1 }, 5);
+    const cursor = new Cursor(encoded.subarray(18, -4));
+    expect([cursor.uint32(), cursor.uint(), cursor.uint()]).toEqual([0, 8, 40]);
+    expect(cursor.take(58).toString('hex')).toBe('00814902880d876800814902880d876900814902880d0000814902880d0100814902880d02008149028839000081490288390100814902883902');
+    for (const address of [
+      { accessArea: 52, accessSubArea: 1037, lids: [0] },
+      { accessArea: 201, accessSubArea: 1081, lids: [1000] },
+      { accessArea: 201, accessSubArea: 1037, lids: [3] },
+      { accessArea: 201, accessSubArea: 3736, lids: [0] },
+      { accessArea: 201, accessSubArea: 1037, lids: [0], symbolCrc: 1 },
+    ]) expect(() => encodeOperation({ kind: 'read', items: [address] }, { sessionId: 77, version: 1 }, 5)).toThrow(/restricted/);
+  });
   /** @param {number} count @param {number} [depth] */
   const addresses = (count, depth = 2) => Array.from({ length: count }, (_, index) => ({
     accessArea: 0x8A0E0007, lids: Array.from({ length: depth }, (_, part) => part ? index + 1 : 1), symbolCrc: 0,
@@ -54,6 +69,62 @@ describe('symbolic read batch planning', () => {
     expect(() => planReadBatches(addresses(1), [], context, { maxRequestBytes: 900, maxResponseBytes: 65536 })).toThrow(/scalar value sizes/);
     expect(() => planReadBatches(addresses(1, 16), [11], context, { maxRequestBytes: 60, maxResponseBytes: 65536 })).toThrow(/request-byte budget/);
     expect(() => planReadBatches(addresses(1), [11], context, { maxRequestBytes: 900, maxResponseBytes: 139 })).toThrow(/response-byte budget/);
+  });
+});
+
+describe('communication resource snapshots', () => {
+  it.each([8, 4])('reads all counters without caching or changing process values (CPU state %i)', async state => {
+    const server = await fixture({ communicationResources: 'complete', state });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const first = await client.readCommunicationResources();
+      expect(first.completeness).toBe('COMPLETE');
+      expect(Object.values(first.counters).map(counter => counter.value)).toEqual([64, 64, 100, 1000, 10000, 95, 900, 9000]);
+      expect(first.semantics).toMatchObject({ subscriptionMemoryUnit: 'UNKNOWN', connectionCapacity: 'NOT_REPORTED', atomicSnapshot: false });
+      expect(first.request.latencyMs).toBeGreaterThanOrEqual(0);
+      first.counters.tagsPerReadRequestMax.value = 999;
+      first.counters.tagsPerReadRequestMax.address.lids[0] = 999;
+      const second = await client.readCommunicationResources();
+      expect(second.counters.tagsPerReadRequestMax.value).toBe(64);
+      expect(second.counters.tagsPerReadRequestMax.address.lids).toEqual([1000]);
+      expect(second.request.sequence).toBe(first.request.sequence + 1);
+      expect(server.requests.filter(request => request.functionCode === 0x054C)).toHaveLength(2);
+      expect(client.report.failure).toBeNull();
+      expect(client.productionReadOnly).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['partial', 'invalid'])('retains unknown %s counters without inventing defaults', async mode => {
+    const server = await fixture({ communicationResources: /** @type {'partial'|'invalid'} */ (mode) });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const snapshot = await client.readCommunicationResources();
+      expect(snapshot.completeness).toBe('PARTIAL');
+      expect(snapshot.counters.tagsPerReadRequestMax).toMatchObject({ value: null, status: mode === 'partial' ? 'ITEM_REJECTED' : 'INVALID_VALUE' });
+      expect(snapshot.counters.tagsPerWriteRequestMax).toMatchObject({ value: null, status: mode === 'partial' ? 'UNAVAILABLE' : 'INVALID_VALUE' });
+      expect(snapshot.counters.tagsPerReadRequestMax.errorCode).toBe(mode === 'partial' ? '0x8104' : null);
+      expect(snapshot.counters.subscriptionsMax.value).toBe(100);
+      expect(client.connected).toBe(true);
+      expect(client.report.failure).toBeNull();
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['duplicate', 'outOfRange', 'badTail'])('fails closed on malformed resource replies (%s)', async mode => {
+    const server = await fixture({ communicationResources: /** @type {'duplicate'|'outOfRange'|'badTail'} */ (mode) });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      await expect(client.readCommunicationResources()).rejects.toMatchObject({ code: mode === 'badTail' ? 'UNSUPPORTED_DECODING' : 'MALFORMED_RESPONSE' });
+      expect(client.connected).toBe(false);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('rejects resource reads before connection without transmitting', async () => {
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: 102 });
+    await expect(client.readCommunicationResources()).rejects.toMatchObject({ code: 'SESSION_REQUIRED' });
+    expect(client.report.statistics.requests).toBe(0);
   });
 });
 

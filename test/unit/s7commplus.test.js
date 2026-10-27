@@ -13,6 +13,21 @@ import { saveSoftwareSnapshot, verifySoftwareSnapshot } from '../helpers/program
 
 const context = { version: 1, sessionId: 0x12345678 };
 describe('S7CommPlus read-only codec', () => {
+  it('encodes only the current-alarm diagnostic Explore request', () => {
+    const operation = { kind: 'readActiveAlarms', objectId: 8, recursive: true, attributes: [2670, 2671, 2672, 2673, 2677, 4079, 7813, 233, 7917, 2715] };
+    const secured = { sessionId: 77, version: 2, integrityId: 7 };
+    const frame = encodeOperation(operation, secured, 5);
+    expect(frame.readUInt16BE(7)).toBe(0x04BB);
+    expect(frame.subarray(18, -4).toString('hex')).toBe('00000008946b010100000a946e946f9470947194759f6fbd058169bd6d951b070000000000');
+    expect(() => assertOutgoing(frame, operation, secured, 5)).not.toThrow();
+    for (const change of [{ objectId: 52 }, { recursive: false }, { attributes: [2670] }, { attribute: 1 }]) {
+      expect(() => encodeOperation({ ...operation, ...change }, secured, 5)).toThrow(/exact alarm subsystem/);
+    }
+    expect(() => encodeOperation(operation, { ...secured, version: 1 }, 5)).toThrow(/TLS V2/);
+    expect(() => encodeOperation(operation, { ...secured, sessionId: 0 }, 5)).toThrow(/TLS V2/);
+    frame[23] ^= 1;
+    expect(() => assertOutgoing(frame, operation, secured, 5)).toThrow(/canonical/);
+  });
   it('restricts targets, read-only mode, pacing and TLS configuration before connecting', async () => {
     expect(() => new S7CommPlusClient({ host: 'invalid/host' })).toThrow(/IP address or hostname/);
     expect(() => new S7CommPlusClient({ host: '127.0.0.1', productionReadOnly: false })).toThrow(/cannot disable/);
@@ -181,6 +196,19 @@ describe('S7CommPlus read-only codec', () => {
 });
 
 describe('S7CommPlus loopback lifecycle (never live)', () => {
+  it('rejects an unqualified current-alarm diagnostic profile without sending the query', async () => {
+    const server = await fixture();
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await expect(client.readActiveAlarms()).rejects.toMatchObject({ code: 'SESSION_REQUIRED' });
+      await client.connect();
+      const count = server.requests.length;
+      await expect(client.readActiveAlarms()).rejects.toMatchObject({ code: 'UNSUPPORTED_PROFILE' });
+      expect(server.requests).toHaveLength(count);
+      expect(client.connected).toBe(true);
+      expect(client.report.failure).toBeNull();
+    } finally { await client.disconnect(); await server.close(); }
+  });
   it('records a reset during explicit disconnect as a teardown warning', async () => {
     const server = await fixture({ resetOnDisconnect: true });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
@@ -513,6 +541,71 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
     certificateSha256 = new X509Certificate(credentials.cert).fingerprint256.replaceAll(':', '').toLowerCase();
   });
   afterAll(async () => { if (directory) await rm(directory, { recursive: true, force: true }); });
+  it('validates current-alarm diagnostic options locally and reads available languages in STOP', async () => {
+    const server = await fixture({ tls: credentials, state: 4, currentAlarms: 'present' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 } });
+    try {
+      await client.connect();
+      const count = server.requests.length;
+      for (const options of [null, [], { languageId: 0 }, { languageId: 65536 }, { maxAlarms: 0 }, { maxAlarms: 4097 }, { acknowledge: true }]) {
+        await expect(client.readActiveAlarms(/** @type {any} */ (options))).rejects.toMatchObject({ code: 'ARGUMENT' });
+      }
+      expect(server.requests).toHaveLength(count);
+      const snapshot = await client.readActiveAlarms({ languageId: 1031 });
+      expect(snapshot.alarms[0].text).toBe('Testmeldung');
+      expect(client.report.cpuState).toBe('STOP');
+      expect(client.report.failure).toBeNull();
+      expect(server.requests).toHaveLength(count + 1);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['present', 'empty', 'partial', 'invalidText', 'unknownClass', 'multiple'])('reads bounded current-alarm diagnostic snapshots over verified TLS (%s)', async mode => {
+    const server = await fixture({ tls: credentials, currentAlarms: /** @type {'present'|'empty'|'partial'|'invalidText'|'unknownClass'|'multiple'} */ (mode) });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 } });
+    try {
+      await client.connect();
+      const snapshot = await client.readActiveAlarms({ languageId: 1033, maxAlarms: 1 });
+      expect(snapshot.scope).toBe('CURRENT_UPDATE_RELEVANT_ALARMS_NOT_DIAGNOSTIC_HISTORY');
+      expect(snapshot.alarms).toHaveLength(['empty', 'unknownClass'].includes(mode) ? 0 : 1);
+      if (mode === 'present' || mode === 'multiple') {
+        const alarm = snapshot.alarms[0];
+        expect(BigInt(alarm.cpuAlarmId).toString(16)).toBe('8a7e000000010000');
+        expect(alarm.text).toBe('I/O device unavailable');
+        expect(alarm.infoText).toBe('PROFINET device missing');
+        expect(alarm.availableLanguages).toEqual([1033, 1031]);
+        expect(alarm.coming?.timestamp).toMatchObject({ nanosecondsSinceUnixEpoch: '1700000000123456789', utc: '2023-11-14T22:13:20.123Z', subMillisecondNanoseconds: 456789 });
+        expect(alarm.coming?.acknowledgementTimestamp?.utc).toBeNull();
+        expect(alarm.status).toBe('DECODED');
+      }
+      expect(snapshot.completeness).toBe(mode === 'multiple' ? 'TRUNCATED' : ['partial', 'invalidText', 'unknownClass'].includes(mode) ? 'PARTIAL' : 'BOUNDED_RESPONSE');
+      if (mode === 'multiple') expect(snapshot.reportedAlarmCount).toBe(3);
+      if (mode === 'partial') expect(snapshot.alarms[0].cpuAlarmId).toBeNull();
+      if (mode === 'invalidText') expect(snapshot.alarms[0].text).toBeNull();
+      expect(client.report.failure).toBeNull();
+      expect(client.report.capabilities.currentAlarmRead).toBe(true);
+      expect(client.productionReadOnly).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it.each(['complete', 'partial'])('reads communication resources with verified TLS integrity (%s)', async mode => {
+    const server = await fixture({ tls: credentials, communicationResources: /** @type {'complete'|'partial'} */ (mode) });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
+      tls: { ca: credentials.cert, certificateSha256 } });
+    try {
+      await client.connect();
+      const snapshot = await client.readCommunicationResources();
+      expect(snapshot.completeness).toBe(mode === 'complete' ? 'COMPLETE' : 'PARTIAL');
+      expect(snapshot.counters.tagsPerReadRequestMax.value).toBe(mode === 'complete' ? 64 : null);
+      expect(snapshot.counters.subscriptionMemoryFree.value).toBe(9000);
+      expect(snapshot.request.integrityId).not.toBeNull();
+      expect(client.report.securityMode).toBe('TLS_VERIFIED');
+      expect(client.report.failure).toBeNull();
+      expect(client.report.capabilities.communicationResourceRead).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
   it.each(['disconnect', 'read', 'clean'])('classifies verified TLS resets during %s without masking acquisition errors', async resetAt => {
     const server = await fixture({ tls: credentials, resetOnDisconnect: resetAt === 'disconnect', resetOnRead: resetAt === 'read' });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'tls',
