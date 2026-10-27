@@ -1,5 +1,44 @@
 # S7 Native Read-Only Acquisition Report
 
+## Configured-Controller Compatibility Update
+
+The additional authorized 17-target investigation established genuine process
+reads on all twelve responding S7-1200 CPUs. Nine used explicit legacy SessionKey
+sessions (firmware V4.4/V4.5); three used TLS with explicit certificate bypass
+(V4.5/V4.7). Five targets did not answer TCP/102 within the bounded attempt.
+Inventories ranged from 17 to 314 DBs. Exact addresses, JSON transcripts and
+Markdown per-DB tables remain under ignored experimentation storage.
+
+The legacy data path is TCP/COTP, recognized InitSSL incompatibility reply,
+CreateObject, exact advertised public-key lookup and 20-byte challenge, fresh
+encrypted SessionKey setup at owned-session address 1830, fixed activation at
+owned-session address 323, then V3 HMAC-authenticated requests and fragments.
+The only new SetVariable envelope is that fixed session activation; it is not
+a process write or CPU operating-mode command. Negative statuses, malformed
+responses, unknown keys, bad HMACs/counters and version downgrades stop acquisition.
+Only three exact empty session-notification forms are recognized, with a limit
+of sixteen per session; error-bearing SystemEvents remain fatal.
+
+Compatibility fixes include signed-low-word composite service-result decoding,
+separate activation/read counter layouts, generic V2 protection-read payloads,
+V2 qualifiers inside legacy data reads, authenticated legacy fragment continuation
+and latency comparison between equivalent operations rather than unrelated setup
+and inventory responses. The four-second absolute response-latency limit remains.
+Experiments explicitly enlarged object/member/request budgets, sampled at most
+three DBs, and continued past only a local member-expansion limit in a still-live
+session. This is not exhaustive DB/value coverage or a machine-impact guarantee.
+
+Node crypto supplies AES, SHA-256, HMAC and secure randomness. The pinned
+`@noble/hashes` SHA-256 implementation supplies the finalized-state continuation
+required by older firmware; independent OpenSSL vectors cover fragment integrity.
+The complete 180-byte encrypted blob and 24-byte derived key match the independent
+HarpoS7 known-answer vector. Legacy traffic is not encrypted, a shared family
+key is not independent target identity verification, and the compatibility code
+has not undergone an independent security audit or constant-time review.
+Username/password legitimation and other legacy key families remain unsupported.
+
+The sections below retain their historically scoped outcomes and limitations.
+
 **Current outcome: verified lab TLS sessions, native symbolic reads, genuine
 FC/OB code-content extraction and DB definition extraction succeeded. Two
 software captures produced unchanged component hashes. Full-controller and
@@ -12,6 +51,23 @@ limits; historical statements remain scoped to their original investigation.
 Storage API update: uploads now return in-memory `files` arrays. Historical
 filesystem snapshot/evidence helpers below are test-only, not library exports.
 Consumers own persistence and backup policy; see the current README.
+
+Configured-target update (2026-10-27): an additional CPU 1214C V4.5 session
+established TLS 1.3 / TLS_AES_256_GCM_SHA384 with explicit certificate bypass.
+The CPU reported RUN and effective protection 1. Discovery returned 156 objects,
+including 96 DBs; decoding the selected DB yielded five members and one BOOL
+read returned false with GOOD quality. The session used 10 requests, 14,404
+received bytes, 1,259 sent bytes and 8,149 ms, then disconnected. Identity was
+TLS_UNVERIFIED, not authenticated. No process writes or mode changes were sent;
+machine impact was not independently verified. Exact target and raw evidence
+remain in gitignored experimentation storage, not published fixtures.
+
+Explicit hostnames, IP addresses and ports no longer require a lab allowlist.
+The configured production target remains the optional default, not a Plus TLS
+ban. Strict certificate verification remains the default; certificate bypass is
+an explicit library/CLI opt-in. Larger discovery counts require an explicit
+budget. Historical target/security restrictions below describe earlier stages,
+not the current configured-target API.
 
 ## A. Implemented Backend and Data Flow
 
@@ -34,17 +90,19 @@ Consumers own persistence and backup policy; see the current README.
   immediately before transmission. No public arbitrary Plus send method.
 - One outstanding request; at least 250 ms between request starts; defaults:
   12 requests, 900-byte application request, 64 KiB response, 256 KiB aggregate
-  session traffic, 32 objects, 5 s request timeout, 60 s session ceiling.
+  session traffic, 32 objects, 5 s request timeout, 10 s TLS handshake timeout,
+  60 s session ceiling. Explicit object budgets up to 4096 are accepted without
+  disabling byte/depth/session limits; 256 handled the measured 156-object reply.
   Latency above 4 s or a substantial baseline-relative increase stops work.
   No reconnect, retry, scheduler, active subscription or recurring backup.
-- Only the configured production IP, a separately configured authorized lab IP,
-  or explicit loopback fixtures are accepted. Lab and production targets cannot
-  coincide; lab profiles must be explicitly `legacy` or `tls`. The
-  production IP is rejected by the classic connection backend before socket
+- Explicit configured PLC IP addresses, hostnames and ports are accepted by the
+  Plus client. No automatic security-profile negotiation or fallback is added.
+  The production IP is still rejected by the classic connection backend before socket
   creation; classic read/write support for other endpoints is not removed.
 - TLS-over-COTP is independently offline-tested, with normal CA/hostname checks
   and a mandatory independently approved SHA-256 certificate pin checked before
-  CreateObject. It remains refused for the production target before transmission.
+  CreateObject. Explicit certificate bypass retains encryption and records the
+  observed fingerprint but reports TLS_UNVERIFIED and cannot enable program extraction.
   SessionKey, credential authentication, V3/HMAC and alternative
   security profiles are unsupported. No key probes or plaintext fallbacks.
 - Compatibility methods that previously fabricated metadata, upload results or

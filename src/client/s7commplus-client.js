@@ -5,7 +5,7 @@ import { Duplex } from 'node:stream';
 import { connect as connectTLS, checkServerIdentity } from 'node:tls';
 import { setTimeout as delay } from 'node:timers/promises';
 import { performance } from 'node:perf_hooks';
-import { getLabHost, getProductionHost } from '../protocol/production-policy.js';
+import { getProductionHost } from '../protocol/production-policy.js';
 import {
   PlusError, PLUS_FUNCTION, PlusAssembler, Cursor, decodeValue, decodeObjects,
   encodeOperation, assertOutgoing, responsePayload,
@@ -13,20 +13,21 @@ import {
 import { buildBlockMembers, validateMemberValue } from '../protocol/s7commplus/type-info.js';
 import { decodeProgramInventory, PROGRAM_INVENTORY_ATTRIBUTES } from '../protocol/s7commplus/block-inventory.js';
 import { BLOCK_CONTENT_ATTRIBUTES, decodeBlockContent } from '../protocol/s7commplus/block-upload.js';
+import { createLegacySessionKey, encodeLegacySecurityKey } from '../protocol/s7commplus/session-key.js';
 
 /** @import { PlusOperation, PlusObject, PlusValue } from '../protocol/s7commplus/codec.js' */
 /** @import { BlockMetadata, RuntimeMember } from '../protocol/s7commplus/type-info.js' */
 export { getProductionHost } from '../protocol/production-policy.js';
 const activeHosts = new Set();
 const DEFAULT_LIMITS = Object.freeze({
-  requestTimeoutMs: 5000, sessionDurationMs: 60000, maxRequests: 12,
+  requestTimeoutMs: 5000, tlsHandshakeTimeoutMs: 10000, sessionDurationMs: 60000, maxRequests: 12,
   maxRequestBytes: 900, maxResponseBytes: 65536, maxSessionBytes: 262144,
   maxUploadBytes: 1048576, pacingMs: 250, maxObjects: 32,
   maxLatencyMs: 4000, latencyFactor: 5,
 });
 
 /** @typedef {Partial<Record<keyof typeof DEFAULT_LIMITS,number>>} PlusLimits */
-/** @typedef {{host?:string,port?:number,productionReadOnly?:boolean,securityMode?:'discovery'|'legacy'|'tls',tls?:{ca:string|Buffer,servername?:string,certificateSha256?:string},limits?:PlusLimits}} PlusOptions */
+/** @typedef {{host?:string,port?:number,productionReadOnly?:boolean,securityMode?:'discovery'|'legacy'|'tls',tls?:{ca?:string|Buffer,servername?:string,certificateSha256?:string,allowAnyCertificate?:boolean,minVersion?:'TLSv1.2'|'TLSv1.3'},limits?:PlusLimits}} PlusOptions */
 /** @typedef {{resolve:(value:any)=>void,reject:(error:Error)=>void,timer:ReturnType<typeof setTimeout>}} Pending */
 
 export class S7CommPlusClient {
@@ -49,12 +50,19 @@ export class S7CommPlusClient {
   #sessionId = 0;
   #version = 1;
   #integrityId = 0;
+  #writeIntegrityId = 0;
+  /** @type {Buffer|undefined} */
+  #sessionKey;
+  /** @type {Buffer|undefined} */
+  #securityKey;
+  #legacyAuthenticated = false;
   /** @type {Buffer|undefined} */
   #serverVersion;
   #busy = false;
   #started = 0;
   #lastRequest = 0;
-  #baseline = 0;
+  /** @type {Map<string,number>} */
+  #baselines = new Map();
   #ready = false;
   #established = false;
   #phase = 'idle';
@@ -85,6 +93,7 @@ export class S7CommPlusClient {
   /** @type {string|null} */
   #peerCertificateSha256 = null;
   #tlsVerified = false;
+  #tlsEstablished = false;
   /** @type {Map<number, BlockMetadata>} */
   #blocks = new Map();
   /** @type {Map<number, Awaited<ReturnType<S7CommPlusClient['explore']>>>} */
@@ -97,33 +106,31 @@ export class S7CommPlusClient {
 
   /** @param {PlusOptions} [options] */
   constructor(options = {}) {
-    const productionHost = getProductionHost();
-    const labHost = getLabHost();
-    const host = options.host ?? productionHost;
+    const host = options.host ?? getProductionHost();
     if (!host) throw new PlusError('TARGET_DENIED', 'An explicit host or local production target configuration is required');
+    if (typeof host !== 'string' || host.length > 253 || (!isIP(host) && !host.split('.').every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))) || ['0.0.0.0', '::'].includes(host)) {
+      throw new PlusError('TARGET_DENIED', 'Expected a PLC IP address or hostname');
+    }
     this.#host = host;
     this.#port = options.port ?? 102;
-    if (![productionHost, labHost, '127.0.0.1', '::1'].includes(this.#host)) {
-      throw new PlusError('TARGET_DENIED', 'Only the locally authorized production target or an explicit loopback fixture is authorized');
-    }
     if (options.productionReadOnly === false) throw new PlusError('READ_ONLY_DENIED', 'This backend cannot disable productionReadOnly');
-    if (!Number.isInteger(this.#port) || this.#port < 1 || this.#port > 65535 || ([productionHost, labHost].includes(this.#host) && this.#port !== 102)) {
+    if (!Number.isInteger(this.#port) || this.#port < 1 || this.#port > 65535) {
       throw new PlusError('TARGET_DENIED', 'Invalid target port');
     }
     if (options.securityMode && !['discovery', 'legacy', 'tls'].includes(options.securityMode)) throw new PlusError('UNSUPPORTED_SECURITY_PROFILE', 'Select an explicit legacy or TLS profile; automatic fallback is not supported');
-    if (this.#host === labHost && !['legacy', 'tls'].includes(options.securityMode ?? '')) throw new PlusError('SECURITY_PROFILE_REQUIRED', 'An independently established lab security profile must be selected explicitly');
-    if ('password' in options || 'username' in options || 'sessionKey' in options) throw new PlusError('AUTHENTICATION_UNSUPPORTED', 'Credential and legacy SessionKey authentication are not implemented; nothing transmitted');
+    if ('password' in options || 'username' in options || 'sessionKey' in options) throw new PlusError('AUTHENTICATION_UNSUPPORTED', 'Username/password authentication and externally supplied session keys are not supported; nothing transmitted');
     if (options.tls && options.securityMode !== 'tls') throw new PlusError('SECURITY_REQUIRED', 'TLS configuration cannot be used in plaintext');
-    if (options.securityMode === 'tls' && !options.tls?.ca) throw new PlusError('SECURITY_REQUIRED', 'Verified TLS requires an authorized CA certificate');
-    if (this.#host === productionHost && options.securityMode === 'tls') throw new PlusError('UNSUPPORTED_SECURITY', 'The tunneled TLS profile is not qualified for live acquisition; nothing transmitted');
-    if (options.securityMode === 'tls' && !/^[a-fA-F0-9]{64}$/.test(options.tls?.certificateSha256 ?? '')) {
+    if (options.tls?.allowAnyCertificate !== undefined && typeof options.tls.allowAnyCertificate !== 'boolean') throw new PlusError('ARGUMENT', 'allowAnyCertificate must be a boolean');
+    if (options.tls?.minVersion !== undefined && !['TLSv1.2', 'TLSv1.3'].includes(options.tls.minVersion)) throw new PlusError('ARGUMENT', 'TLS minVersion must be TLSv1.2 or TLSv1.3');
+    if (options.securityMode === 'tls' && options.tls?.allowAnyCertificate !== true && !options.tls?.ca) throw new PlusError('SECURITY_REQUIRED', 'Verified TLS requires an authorized CA certificate');
+    if (options.securityMode === 'tls' && options.tls?.allowAnyCertificate !== true && !/^[a-fA-F0-9]{64}$/.test(options.tls?.certificateSha256 ?? '')) {
       throw new PlusError('CERTIFICATE_PIN_REQUIRED', 'Verified TLS requires an independently approved SHA-256 certificate pin');
     }
     this.#limits = Object.freeze({ ...DEFAULT_LIMITS, ...options.limits });
     for (const [name, value] of Object.entries(this.#limits)) {
       if (!Number.isSafeInteger(value) || value <= 0) throw new PlusError('ARGUMENT', `Invalid budget ${name}`);
     }
-    if (this.#limits.pacingMs < 250 || this.#limits.maxRequestBytes > 900 || this.#limits.maxResponseBytes > 1048576 || this.#limits.maxObjects > 128 || this.#limits.maxRequests > 65535) {
+    if (this.#limits.pacingMs < 250 || this.#limits.maxRequestBytes > 900 || this.#limits.maxResponseBytes > 1048576 || this.#limits.maxObjects > 4096 || this.#limits.maxRequests > 65535) {
       throw new PlusError('ARGUMENT', 'Pacing or allocation exceeds the qualified envelope');
     }
     this.#options = { ...options, tls: options.tls ? { ...options.tls } : undefined };
@@ -136,8 +143,9 @@ export class S7CommPlusClient {
     return structuredClone({
       target: { host: this.#host, port: this.#port }, productionReadOnly: true, phase: this.#phase,
       connected: this.connected, protocol: 'S7CommPlus', protocolVersion: this.#version,
-      sessionEstablished: this.#established, securityMode: this.#tlsVerified ? 'TLS_VERIFIED' : this.#options.securityMode === 'tls' ? 'TLS_UNVERIFIED' : 'UNAUTHENTICATED_DISCOVERY',
+      sessionEstablished: this.#established, securityMode: this.#tlsVerified ? 'TLS_VERIFIED' : this.#options.securityMode === 'tls' ? 'TLS_UNVERIFIED' : this.#legacyAuthenticated ? 'LEGACY_SESSION_KEY_INTEGRITY' : 'UNAUTHENTICATED_DISCOVERY',
       selectedProfile: this.#options.securityMode === 'tls' ? 'TLS' : 'LEGACY_PLAINTEXT',
+      allowAnyCertificate: this.#options.tls?.allowAnyCertificate === true,
       peerCertificateSha256: this.#peerCertificateSha256,
       identity: this.#identity, cpuState: this.#cpuState, effectiveProtectionLevel: this.#protection,
       capabilities: { objectExplore: this.#ready, symbolicLidRead: this.#ready && this.#cpuState === 'RUN',
@@ -212,8 +220,17 @@ export class S7CommPlusClient {
       this.#serverVersion = versionValue.raw;
       this.#extractIdentity(versionValue);
       const securedRole = attributes.some(attribute => attribute.id === 299 && (Number(attribute.value.value) & 0x20000000));
-      if (securedRole || (!this.#tlsVerified && attributes.some(attribute => attribute.id === 303))) {
-        throw new PlusError(this.#tlsVerified ? 'AUTHENTICATION_REQUIRED' : 'LEGACY_SESSION_KEY_REQUIRED', 'PLC advertises a challenge or secured role; the selected profile requires unsupported authentication; no key probing or bypass attempted');
+      const challenges = sessionObjects[0].attributes.filter(attribute => attribute.id === 303);
+      let legacyMaterial;
+      if (!this.#tlsEstablished && this.#options.securityMode === 'legacy' && challenges.length === 1) {
+        const fingerprints = sessionObjects[0].attributes.filter(attribute => attribute.id === 233 && typeof attribute.value.value === 'string');
+        if (fingerprints.length !== 1 || challenges[0].value.flags !== 0x10 || challenges[0].value.datatype !== 2) {
+          throw new PlusError('LEGACY_SESSION_KEY_REQUIRED', 'Missing unambiguous supported session challenge and exact public-key identity');
+        }
+        legacyMaterial = createLegacySessionKey(Buffer.from(challenges[0].value.value), fingerprints[0].value.value);
+        this.#securityKey = encodeLegacySecurityKey(legacyMaterial);
+      } else if (securedRole || (!this.#tlsEstablished && challenges.length)) {
+        throw new PlusError(this.#tlsEstablished ? 'AUTHENTICATION_REQUIRED' : 'LEGACY_SESSION_KEY_REQUIRED', 'PLC advertises a challenge or secured role; the selected profile requires unsupported authentication; no key probing or bypass attempted');
       }
       if (created.version === 2 && !this.#tls) throw new PlusError('SECURITY_REQUIRED', 'PLC replied V2; verified TLS required; no plaintext fallback');
       this.#version = this.#tls ? 2 : created.version;
@@ -223,6 +240,17 @@ export class S7CommPlusClient {
       if (errorItem !== 0) throw new PlusError('SESSION_SETUP_REJECTED', 'Session setup contains item errors', { errorItem });
       const setupTail = setup.cursor.take(setup.cursor.bytes.length - setup.cursor.offset);
       if (![0, 1, 4, 5].includes(setupTail.length) || setupTail.some(byte => byte !== 0)) throw new PlusError('MALFORMED_RESPONSE', 'Unqualified session setup fill or initial integrity value');
+      if (legacyMaterial) {
+        this.#sessionKey = legacyMaterial.sessionKey;
+        this.#plus.setSessionKey(this.#sessionKey);
+        this.#phase = 'activateSession';
+        const activated = await this.#exchange({ kind: 'activateSession' });
+        if (activated.cursor.take(activated.cursor.bytes.length - activated.cursor.offset).some(byte => byte !== 0)) throw new PlusError('MALFORMED_RESPONSE', 'Unqualified session activation response');
+        this.#integrityId++;
+        this.#writeIntegrityId++;
+        this.#legacyAuthenticated = true;
+        this.#observations.push({ kind: 'legacySessionKey', fingerprint: legacyMaterial.fingerprint, authenticatedPackets: true, encryptedTransport: false });
+      }
       this.#established = true;
       this.#ready = true;
       this.#phase = 'ready';
@@ -597,6 +625,7 @@ export class S7CommPlusClient {
 
   async disconnect() {
     clearTimeout(this.#durationTimer);
+    this.#sessionKey?.fill(0);
     const socket = this.#socket;
     this.#ready = false;
     this.#phase = 'closed';
@@ -651,7 +680,9 @@ export class S7CommPlusClient {
     this.#busy = true;
     const sequence = this.#sequence++;
     const context = { sessionId: this.#sessionId, version: this.#version, serverVersion: this.#serverVersion,
-      integrityId: this.#ready && this.#tls ? this.#integrityId++ : undefined };
+      securityKey: operation.kind === 'setupSession' ? this.#securityKey : undefined, sessionKey: this.#sessionKey,
+      integrityId: this.#sessionKey ? operation.kind === 'activateSession' ? this.#writeIntegrityId++ : this.#integrityId++
+        : this.#ready && this.#tls ? this.#integrityId++ : undefined };
     try {
       const frame = encodeOperation(operation, context, sequence);
       if (frame.length > this.#limits.maxRequestBytes) throw new PlusError('REQUEST_LIMIT', 'Configured request-byte budget exceeded');
@@ -669,20 +700,32 @@ export class S7CommPlusClient {
       });
       const latencyMs = performance.now() - started;
       this.#observations.push({ kind: operation.kind, sequence, latencyMs: Number(latencyMs.toFixed(3)), responseBytes: incoming.body.length });
-      if (latencyMs > this.#limits.maxLatencyMs || (this.#baseline && latencyMs > Math.max(1000, this.#baseline * this.#limits.latencyFactor))) {
+      const latencyKey = JSON.stringify(operation);
+      const baseline = this.#baselines.get(latencyKey);
+      if (latencyMs > this.#limits.maxLatencyMs || (baseline && latencyMs > Math.max(1000, baseline * this.#limits.latencyFactor))) {
         throw new PlusError('LATENCY_DEGRADATION', `Acquisition stopped at ${latencyMs.toFixed(1)} ms`);
       }
-      if (!this.#baseline) this.#baseline = latencyMs;
+      if (baseline === undefined) this.#baselines.set(latencyKey, latencyMs);
       if (operation.kind === 'initSSL' && incoming.version !== 1 && !(this.#options.securityMode === 'tls' && incoming.version === 2)) {
         throw new PlusError('PROTOCOL_VERSION_UNSUPPORTED', 'InitSSL envelope is not qualified for the explicitly selected security profile');
       }
-      if (this.#ready && incoming.version !== this.#version) throw new PlusError('PROTOCOL_VERSION_UNSUPPORTED', 'Response changed the negotiated data protocol version');
-      const decoded = responsePayload(incoming.body, PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)], sequence, this.#tlsVerified && operation.kind === 'createSession');
-      if (decoded.statusDetails.returnValue !== '0x0000000000000000') {
-        this.#observations.push({ kind: 'createSessionStatus', ...decoded.statusDetails, interpretation: 'Session objects and setup must validate before establishment' });
+      if (this.#ready && incoming.version !== (this.#sessionKey ? 3 : this.#version)) throw new PlusError('PROTOCOL_VERSION_UNSUPPORTED', 'Response changed the negotiated data protocol version');
+      const expectedIntegrityId = context.integrityId === undefined ? undefined
+        : this.#sessionKey && operation.kind === 'activateSession' ? context.integrityId : (sequence + context.integrityId) >>> 0;
+      let responseBody = incoming.body;
+      if (this.#sessionKey && operation.kind === 'activateSession') {
+        const prefix = new Cursor(responseBody.subarray(10));
+        this.#checkIntegrity(prefix, expectedIntegrityId);
+        responseBody = Buffer.concat([responseBody.subarray(0, 10), prefix.bytes.subarray(prefix.offset)]);
       }
-      const expectedIntegrityId = context.integrityId === undefined ? undefined : (sequence + context.integrityId) >>> 0;
-      return { ...decoded, version: incoming.version, expectedIntegrityId,
+      const decoded = responsePayload(responseBody, PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)], sequence,
+        this.#tlsEstablished && operation.kind === 'createSession', this.#options.securityMode === 'legacy' && operation.kind === 'initSSL',
+        !!this.#sessionKey && operation.kind === 'activateSession');
+      if (decoded.statusDetails.returnValue !== '0x0000000000000000') {
+        this.#observations.push({ kind: operation.kind === 'initSSL' ? 'legacyInitSSLStatus' : `${operation.kind}Status`, ...decoded.statusDetails,
+          interpretation: operation.kind === 'initSSL' ? 'Explicit legacy profile continues after a recognized InitSSL rejection; no TLS downgrade performed' : 'Session objects and setup must validate before establishment' });
+      }
+      return { ...decoded, version: incoming.version, expectedIntegrityId: this.#sessionKey && operation.kind === 'activateSession' ? undefined : expectedIntegrityId,
         correlation: { sequence, functionCode: PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)],
           integrityId: expectedIntegrityId ?? null, request: structuredClone(operation), responseBody: Buffer.from(incoming.body),
           fragmentCount: this.#plus.lastMessageFragmentCount } };
@@ -697,7 +740,8 @@ export class S7CommPlusClient {
   #wait(send) {
     if (this.#pending) return Promise.reject(new PlusError('CONCURRENCY_LIMIT', 'Exchange already pending'));
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => this.#stop(new PlusError('TIMEOUT', `Timed out during ${this.#phase}`)), this.#limits.requestTimeoutMs);
+      const timeoutMs = this.#phase === 'tls' ? this.#limits.tlsHandshakeTimeoutMs : this.#limits.requestTimeoutMs;
+      const timer = setTimeout(() => this.#stop(new PlusError('TIMEOUT', `Timed out during ${this.#phase}`)), timeoutMs);
       this.#pending = { resolve, reject, timer };
       try { send(); } catch (error) { this.#stop(this.#asError(error)); }
     });
@@ -764,10 +808,12 @@ export class S7CommPlusClient {
 
   /** @param {Buffer} bytes */
   #onApplication(bytes) {
+    const confirmations = this.#plus.sessionConfirmations;
     const messages = this.#plus.feed(bytes);
+    if (this.#plus.sessionConfirmations !== confirmations) this.#observations.push({ kind: 'sessionConfirmation', count: this.#plus.sessionConfirmations });
     if (messages.length > 1 || (messages.length && !this.#pending)) throw new PlusError('CORRELATION', 'Unexpected unsolicited or duplicate response');
     if (messages.length) {
-      if (this.#tlsVerified) this.#transcript.push({ direction: 'in', layer: 'S7CommPlus', version: messages[0].version, hex: messages[0].body.toString('hex') });
+      if (this.#tlsEstablished) this.#transcript.push({ direction: 'in', layer: 'S7CommPlus', version: messages[0].version, hex: messages[0].body.toString('hex') });
       this.#settle(messages[0]);
     }
   }
@@ -781,25 +827,28 @@ export class S7CommPlusClient {
     tunnel.on('error', error => this.#stop(new PlusError('TLS_HANDSHAKE_FAILED', error.message)));
     await this.#wait(() => {
       const peerName = this.#options.tls?.servername ?? this.#host;
+      const allowAnyCertificate = this.#options.tls?.allowAnyCertificate === true;
       this.#tls = connectTLS({ socket: tunnel, ca: this.#options.tls?.ca,
-        servername: isIP(peerName) ? undefined : peerName, rejectUnauthorized: true,
-        checkServerIdentity: (_hostname, certificate) => checkServerIdentity(peerName, certificate),
-        minVersion: 'TLSv1.2', ecdhCurve: 'X25519',
-        ciphers: 'ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256',
+        servername: isIP(peerName) ? undefined : peerName, rejectUnauthorized: !allowAnyCertificate,
+        checkServerIdentity: (_hostname, certificate) => allowAnyCertificate ? undefined : checkServerIdentity(peerName, certificate),
+        minVersion: this.#options.tls?.minVersion ?? 'TLSv1.2', ecdhCurve: 'X25519',
+        ciphers: 'TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:AES256-SHA256',
         secureOptions: constants.SSL_OP_NO_TICKET | 0x00080000 | 0x00000001 }, () => {
         const certificate = this.#tls?.getPeerCertificate().raw;
-        if (!this.#tls?.authorized || !certificate) {
+        if ((!allowAnyCertificate && !this.#tls?.authorized) || !certificate) {
           this.#stop(new PlusError('CERTIFICATE_REJECTED', 'TLS peer certificate was not verified'));
           return;
         }
         const observed = createHash('sha256').update(certificate).digest();
         this.#peerCertificateSha256 = observed.toString('hex');
         const expected = Buffer.from(this.#options.tls?.certificateSha256 ?? '', 'hex');
-        if (expected.length !== observed.length || !timingSafeEqual(observed, expected)) {
+        if (!allowAnyCertificate && (expected.length !== observed.length || !timingSafeEqual(observed, expected))) {
           this.#stop(new PlusError('CERTIFICATE_PIN_MISMATCH', 'TLS peer does not match the independently approved certificate pin', { observedSha256: this.#peerCertificateSha256 }));
           return;
         }
-        this.#tlsVerified = true;
+        this.#tlsVerified = !allowAnyCertificate;
+        this.#tlsEstablished = true;
+        this.#observations.push({ kind: 'tls', protocol: this.#tls?.getProtocol(), cipher: this.#tls?.getCipher().name, certificateVerified: this.#tlsVerified });
         this.#settle(true);
       });
       this.#tls.on('error', error => {

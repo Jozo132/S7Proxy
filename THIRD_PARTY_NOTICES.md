@@ -25,6 +25,21 @@ use independently constructed synthetic objects, not engineering archives or
 controller captures. No Python runtime is required.
 No source from the separately licensed thomas-v2/S7CommPlusDriver was incorporated.
 
+The same pinned MIT reference's `v1_session_key` modules and `_fragment_hmac.py`
+informed the JavaScript legacy SessionKey and authenticated-fragment compatibility
+implementation. The complete S7-1200 blob/key known-answer vector and independent
+OpenSSL fragment vectors are retained in the unit tests. Challenge-fingerprint
+tables and S7-1200 public-key bytes originate in MIT-licensed HarpoS7
+(https://github.com/bonk-dev/HarpoS7), as documented by that pinned reference.
+The applicable HarpoS7 notice is: Copyright (c) 2024 bonk. Its MIT permission,
+conditions and warranty disclaimer are the same as the MIT terms reproduced
+below; the notice and those terms apply to these derived portions.
+
+Legacy SHA-256 state continuation uses `@noble/hashes` version 1.8.0, Copyright
+(c) 2022 Paul Miller (https://paulmillr.com), MIT licensed. Its notice and full
+license are distributed with the dependency. AES, normal hashing, HMAC and secure
+randomness use Node.js crypto. No Python runtime is required.
+
 For native program-content extraction, public protocol facts were independently
 cross-checked against the attribute-name table in
 https://github.com/moki-ics/s7commwireshark/blob/master/src/s7comm_plus/packet-s7comm_plus.c

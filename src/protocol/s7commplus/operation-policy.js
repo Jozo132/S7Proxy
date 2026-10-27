@@ -3,6 +3,7 @@ const policies = Object.freeze({
   initSSL: 'SESSION_HOUSEKEEPING',
   createSession: 'SESSION_HOUSEKEEPING',
   setupSession: 'SESSION_HOUSEKEEPING',
+  activateSession: 'SESSION_HOUSEKEEPING',
   explore: 'READ_ONLY_METADATA',
   read: 'READ_ONLY_VALUES',
   readAttribute: 'READ_ONLY_METADATA',

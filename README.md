@@ -26,8 +26,10 @@ Requires Node.js >= 20.
 
 `S7CommPlusClient` is a separate experimental native backend with bounded object
 Explore, native DB/type-member discovery and typed symbolic reads. It supports
-session-local name resolution after explicit block discovery. Protected
-SessionKey/credential profiles remain unsupported. The verified TLS V2 profile
+session-local name resolution after explicit block discovery. Explicit legacy
+S7-1200 SessionKey sessions and TLS sessions are supported; username/password
+legitimation, S7-1500 legacy keys and PLCSIM key families remain unsupported.
+The verified TLS V2 profile
 also supports bounded native program-content attribute extraction, returning
 in-memory files; this is not a full-controller or restorable backup.
 Existing DAQ, proxy and REST/WebSocket APIs remain classic S7Comm paths.
@@ -41,8 +43,25 @@ plaintext legacy profile and makes one bounded identification attempt, printing
 the result to stdout without writing evidence or backup files.
 It never retries, dumps blocks, schedules backups or modifies PLC configuration.
 Do not rerun it to investigate a rejection without reviewing the saved evidence.
-Production TLS remains refused; offline qualification does not authorize a
-production probe. No automatic TLS/plaintext fallback is implemented.
+It accepts an explicit `--host HOST` and optional `--port PORT` (default 102).
+Without `--host`, the existing local production-target configuration is used.
+The library likewise accepts any explicitly configured PLC IP address or hostname
+and port; it does not require lab/production environment labels. Only connect to
+controllers you are authorized to access. No automatic TLS/plaintext fallback is
+implemented; select the profile configured on that controller.
+
+For controllers configured for legacy communication, use `securityMode: 'legacy'`.
+Recognized InitSSL incompatibility replies can continue only in that explicit
+profile. An exact advertised S7-1200 public key and 20-byte challenge are required;
+family-only and unknown identities stop without key guessing. The client creates
+a fresh encrypted SessionKey blob, writes it only to its owned session's setup
+address, and performs a fixed owned-session activation. Every subsequent packet
+uses V3 HMAC-SHA256 integrity, including each metadata response fragment. This is
+not TLS: legacy traffic remains readable on the network, and the shared family
+key does not independently authenticate the target's identity. Reports label it
+`LEGACY_SESSION_KEY_INTEGRITY`. No password guessing or automatic TLS downgrade
+is performed. The legacy cryptographic compatibility code is experimental and
+has not undergone an independent security audit or constant-time review.
 
 For a separately authorized lab target, configure `S7PROXY_LAB_HOST` separately
 from the production target and select `--lab --legacy` or `--lab --tls` explicitly.
@@ -53,11 +72,55 @@ verified certificate name. The corresponding library field is
 `tls.certificateSha256`. CA, hostname and pin must all verify before CreateObject;
 pinning is not trust-on-first-use. Consumers decide whether to save the results.
 
+To explicitly accept any PLC certificate, set `tls.allowAnyCertificate: true`
+in the library, or add `--allow-any-certificate` to the TLS exploration command:
+
+```sh
+node src/plus-explore.js --live --lab --tls --allow-any-certificate
+```
+
+This opt-in disables CA, hostname and SHA-256 pin validation, including any
+supplied pin. No CA or pin is required in this mode. Traffic remains encrypted,
+but the PLC identity is not authenticated and a man-in-the-middle can impersonate
+it. Reports retain the observed fingerprint and say `TLS_UNVERIFIED` with
+`allowAnyCertificate: true`; they never claim verified trust. Verification remains
+the default. Read-only limits and the verified-TLS requirement for program
+extraction are unchanged. TLS is available for any explicitly configured target.
+
+For example, with the authorized target supplied through the environment:
+
+```powershell
+node src/plus-explore.js --live --host $env:PLC_HOST --tls --allow-any-certificate --tls-min-version TLSv1.3
+```
+
+`tls.minVersion` accepts `TLSv1.2` (default, also permits TLS 1.3) or `TLSv1.3`.
+The TLS profile offers AES-GCM TLS 1.3 suites and X25519. The default TLS handshake
+deadline is 10 seconds (`limits.tlsHandshakeTimeoutMs`), separate from the
+5-second request deadline. The identification CLI retains 3-second ordinary
+request deadlines and a 20-second session ceiling.
+
+Discovery defaults to 32 decoded objects per reply. For larger programs, explicitly
+set `limits.maxObjects`, for example `256`; values up to `4096` are accepted.
+Response-byte, depth, session, pacing and request-count limits still apply.
+
 Historical plaintext CreateObject attempts were rejected; the numeric cause is
 not established. Subsequent authorized lab testing established verified
 TLS-over-COTP sessions, genuine RUN/protection replies, native DB/type metadata,
 and BOOL, INT and TIME reads. This does not qualify another controller or security
 profile, and no production retest is implied.
+An additional configured-target test on a CPU 1214C, firmware V4.5, established
+TLS 1.3 with explicit certificate bypass, discovered 96 DBs, and read one native
+BOOL with `GOOD` quality. That session used 10 requests and a 256-object budget,
+and completed in approximately 8.15 seconds. Its identity remained
+`TLS_UNVERIFIED`; it does not qualify every PLC firmware or authentication profile.
+Exact test harnesses and evidence live under gitignored `experimentation/`.
+An additional multi-controller run established process-value reads on twelve
+responding S7-1200 CPUs: nine legacy V4.4/V4.5 sessions and three TLS V4.5/V4.7
+sessions. Five other configured addresses did not answer TCP/102 within the
+bounded attempt; that does not prove they are offline. Captured inventories
+ranged from 17 to 314 DBs. The experiments used explicit budgets, up to 24 requests,
+512 objects and 1024 expanded members, and read one discovered process value per
+responding PLC. They do not prove every DB or datatype is readable.
 See [the evidence and implementation report](docs/S7_READ_ONLY_REPORT.md)
 and [reference licensing](THIRD_PARTY_NOTICES.md).
 
@@ -67,11 +130,12 @@ and [reference licensing](THIRD_PARTY_NOTICES.md).
 import { readFile } from 'node:fs/promises';
 import { S7CommPlusClient } from 's7proxy';
 
-const host = process.env.S7PROXY_LAB_HOST;
-if (!host) throw new Error('Configure an authorized lab target first');
+const host = process.env.PLC_HOST;
+if (!host) throw new Error('Configure an authorized PLC target first');
 const plc = new S7CommPlusClient({
   host,
   securityMode: 'tls',
+  limits: { maxObjects: 256 },
   tls: {
     ca: await readFile(process.env.S7PLUS_TLS_CA),
     certificateSha256: process.env.S7PLUS_TLS_CERT_SHA256,

@@ -44,14 +44,16 @@ export const syntheticMembers = [
   { name: 'Samples', lid: 125, type: 5, code: 10, lower: -2, count: 3 },
 ];
 
-/** @param {number} id */
-export function metadataExplore(id) {
+/** @param {number} id @param {number} [inventorySize] */
+export function metadataExplore(id, inventorySize = 1) {
   if (id === 3) {
-    const name = Buffer.from('SampleDB');
-    return Buffer.concat([Buffer.from([0xA1]), u32(3), vlq(2520), Buffer.from([0, 0, 0xA1]),
-      u32(0x8A0E0007), vlq(2574), Buffer.from([0, 0, 0xA3]),
-      vlq(233), Buffer.from([0, 21, name.length]), name,
-      Buffer.from([0xA3]), vlq(2521), Buffer.from([0, 3, 0, 7, 0xA2, 0xA2])]);
+    const blocks = Array.from({ length: inventorySize }, (_, index) => {
+      const name = Buffer.from(index === 0 ? 'SampleDB' : `SampleDB${index}`);
+      return Buffer.concat([Buffer.from([0xA1]), u32(0x8A0E0007 + index), vlq(2574), Buffer.from([0, 0, 0xA3]),
+        vlq(233), Buffer.from([0, 21, name.length]), name,
+        Buffer.from([0xA3]), vlq(2521), Buffer.from([0, 3]), be16(7 + index), Buffer.from([0xA2])]);
+    });
+    return Buffer.concat([Buffer.from([0xA1]), u32(3), vlq(2520), Buffer.from([0, 0]), ...blocks, Buffer.from([0xA2])]);
   }
   return id === 0x92000007 ? typeObject(id, syntheticMembers)
     : typeObject(id, [{ name: 'Ready', lid: 132, type: 1 }]);

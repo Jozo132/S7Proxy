@@ -1,5 +1,7 @@
 // @ts-check
 import { getOperationPolicy, BLOCK_CONTENT_ATTRIBUTES } from './operation-policy.js';
+import { createHmac } from 'node:crypto';
+import { FragmentHMACVerifier } from './fragment-hmac.js';
 export class PlusError extends Error {
   /** @param {string} code @param {string} message @param {Record<string,unknown>} [details] */
   constructor(code, message, details = {}) { super(message); this.name = 'PlusError'; this.code = code; this.details = details; }
@@ -7,7 +9,7 @@ export class PlusError extends Error {
 
 export const PLUS_FUNCTION = Object.freeze({
   explore: 0x04BB, readBlockContent: 0x04BB, createSession: 0x04CA, setupSession: 0x0542,
-  read: 0x054C, readAttribute: 0x0586, initSSL: 0x05B3,
+  read: 0x054C, readAttribute: 0x0586, initSSL: 0x05B3, activateSession: 0x04F2,
 });
 
 /** @param {number} value */
@@ -170,7 +172,7 @@ export function createSessionPayload() {
 }
 
 /** @typedef {{kind:string, objectId?:number, attributes?:number[], recursive?:boolean, accessArea?:number, lids?:number[], symbolCrc?:number, attribute?:number}} PlusOperation */
-/** @typedef {{sessionId:number, version:number, serverVersion?:Buffer, integrityId?:number}} PlusContext */
+/** @typedef {{sessionId:number, version:number, serverVersion?:Buffer, integrityId?:number, securityKey?:Buffer, sessionKey?:Buffer, sequence?:number}} PlusContext */
 
 /** @param {PlusOperation} operation @param {PlusContext} context */
 function operationPayload(operation, context) {
@@ -186,16 +188,25 @@ function operationPayload(operation, context) {
       if (value.flags || (value.datatype !== 4 && (value.datatype !== 23 || value.structId !== 314))) {
         throw new PlusError('SESSION_SETUP_REJECTED', 'ServerSessionVersion must be a scalar UDInt or Struct(314)');
       }
+      const start = context.securityKey
+        ? Buffer.concat([u32(sessionId), Buffer.from([2, 2]), vlq(1830), vlq(306), Buffer.from([1]), context.securityKey, Buffer.from([2])])
+        : Buffer.concat([u32(sessionId), Buffer.from([1, 1]), vlq(306), Buffer.from([1])]);
       if (value.datatype === 23) {
         const members = /** @type {{id:number,value:PlusValue}[]} */ (value.value);
         const clean = members.map(member => Buffer.concat([
           vlq(member.id), member.id === 319 ? Buffer.from([0, 21, 0]) : member.value.raw,
         ]));
-        return Buffer.concat([u32(sessionId), Buffer.from([1, 1]), vlq(306), Buffer.from([1, 0, 23]),
+        return Buffer.concat([start, Buffer.from([0, 23]),
           u32(value.structId ?? 314), ...clean, Buffer.from([0, 0]), qualifier(version), u32(0)]);
       }
-      return Buffer.concat([u32(sessionId), Buffer.from([1, 1]), vlq(306), Buffer.from([1]), value.raw,
+      return Buffer.concat([start, value.raw,
         Buffer.from([0]), qualifier(version), u32(0)]);
+    }
+    case 'activateSession': {
+      if (!sessionId || !context.sessionKey || context.integrityId === undefined) throw new PlusError('SESSION_REQUIRED', 'Session activation requires an owned authenticated session');
+      const qualified = qualifier(1);
+      u32(context.sequence ?? 0).copy(qualified, qualified.length - 4);
+      return Buffer.concat([u32(sessionId), Buffer.from([1]), vlq(323), Buffer.from([0, 2, 5]), qualified, Buffer.alloc(3)]);
     }
     case 'readBlockContent':
     case 'explore': {
@@ -217,11 +228,12 @@ function operationPayload(operation, context) {
       const area = operation.accessArea ?? 0;
       return Buffer.concat([u32(0), vlq(1), vlq(4 + lids.length), vlq(operation.symbolCrc ?? 0),
         vlq(area), vlq(1 + lids.length), vlq(area >= 0x8A0E0000 ? 2550 : 3736),
-        ...lids.map(vlq), qualifier(version), u32(0)]);
+        ...lids.map(vlq), qualifier(context.sessionKey ? 2 : version), u32(0)]);
     }
-    case 'readAttribute':
+    case 'readAttribute': {
       if (operation.attribute !== 1842) throw new PlusError('READ_ONLY_DENIED', 'Only effective protection-level attribute is qualified');
-      return Buffer.concat([u32(sessionId), Buffer.from([0x20, 4, 1]), vlq(1842), qualifier(version), Buffer.from([0, 1]), u32(0)]);
+      return Buffer.concat([u32(sessionId), Buffer.from([0x20, 4, 1]), vlq(1842), qualifier(context.sessionKey ? 2 : version), Buffer.from([0, 1]), u32(0)]);
+    }
     default: throw new PlusError('READ_ONLY_DENIED', `Operation ${operation.kind} is not allowlisted`);
   }
 }
@@ -229,14 +241,14 @@ function operationPayload(operation, context) {
 /** @param {PlusOperation} operation @param {PlusContext} context @param {number} sequence */
 export function encodeOperation(operation, context, sequence) {
   if (!getOperationPolicy(operation.kind).allowed) throw new PlusError('READ_ONLY_DENIED', `Operation ${operation.kind} is not allowlisted`);
-  let payload = operationPayload(operation, context);
+  let payload = operationPayload(operation, { ...context, sequence });
   const functionCode = PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)];
   if (functionCode === undefined) throw new PlusError('READ_ONLY_DENIED', 'Unknown function');
   if (['read', 'explore', 'readBlockContent', 'readAttribute'].includes(operation.kind) && !context.sessionId) {
     throw new PlusError('SESSION_REQUIRED', 'Read requires an established session');
   }
-  if (context.integrityId !== undefined && ['read', 'explore', 'readBlockContent', 'readAttribute'].includes(operation.kind)) {
-    const tail = ['explore', 'readBlockContent'].includes(operation.kind) ? 5 : 4;
+  if (context.integrityId !== undefined && ['read', 'explore', 'readBlockContent', 'readAttribute', 'activateSession'].includes(operation.kind)) {
+    const tail = ['explore', 'readBlockContent'].includes(operation.kind) ? 5 : context.sessionKey && operation.kind === 'activateSession' ? 3 : 4;
     payload = Buffer.concat([payload.subarray(0, -tail), vlq(context.integrityId), payload.subarray(-tail)]);
   }
   const header = Buffer.alloc(14);
@@ -247,11 +259,13 @@ export function encodeOperation(operation, context, sequence) {
   header[13] = operation.kind === 'initSSL' ? 0x30 : operation.kind === 'createSession' ? 0x36 : 0x34;
   const version = ['initSSL', 'createSession'].includes(operation.kind) ? 1 : operation.kind === 'setupSession' ? 2 : context.version;
   if (version !== 1 && version !== 2) throw new PlusError('UNSUPPORTED_VERSION', `V${version} requires an unimplemented security profile`);
-  const body = Buffer.concat([header, payload]);
+  const application = Buffer.concat([header, payload]);
+  const body = context.sessionKey ? Buffer.concat([Buffer.from([32]), createHmac('sha256', context.sessionKey).update(application).digest(), application]) : application;
   if (body.length > 900) throw new PlusError('REQUEST_LIMIT', 'Request exceeds 900 bytes');
-  const outer = Buffer.from([0x72, version, 0, 0]);
+  const envelopeVersion = context.sessionKey ? 3 : version;
+  const outer = Buffer.from([0x72, envelopeVersion, 0, 0]);
   outer.writeUInt16BE(body.length, 2);
-  return Buffer.concat([outer, body, Buffer.from([0x72, version, 0, 0])]);
+  return Buffer.concat([outer, body, Buffer.from([0x72, envelopeVersion, 0, 0])]);
 }
 
 /** @param {Buffer} frame @param {PlusOperation} operation @param {PlusContext} context @param {number} sequence */
@@ -263,6 +277,17 @@ export function assertOutgoing(frame, operation, context, sequence) {
 }
 
 export class PlusAssembler {
+  /** @type {FragmentHMACVerifier|undefined} */
+  #verifier;
+  #confirmations = 0;
+  get sessionConfirmations() { return this.#confirmations; }
+  /** @type {Buffer|undefined} */
+  #sessionKey;
+  /** @param {Buffer} key */
+  setSessionKey(key) {
+    if (key.length !== 24 || this.#sessionKey || this.#pending.length || this.#parts.length) throw new PlusError('SESSION_STATE', 'Cannot change authentication during a response');
+    this.#sessionKey = key;
+  }
   /** @type {Buffer} */
   #pending = Buffer.alloc(0);
   /** @type {Buffer[]} */
@@ -281,21 +306,37 @@ export class PlusAssembler {
     while (this.#pending.length >= 4) {
       if (this.#pending[0] !== 0x72) throw new PlusError('MALFORMED_RESPONSE', 'Expected S7CommPlus 0x72');
       const version = this.#pending[1];
-      if (version === 0xFE) throw new PlusError('SYSTEM_EVENT', 'PLC SystemEvent: stop acquisition and inspect raw response');
-      if (version !== 1 && version !== 2) throw new PlusError('PROTOCOL_VERSION_UNSUPPORTED', `Unsupported response V${version}`);
+      if (version === 0xFE) {
+        if (!this.#sessionKey || this.#pending.readUInt16BE(2) !== 16) throw new PlusError('SYSTEM_EVENT', 'PLC SystemEvent: stop acquisition and inspect raw response');
+        if (this.#pending.length < 20) break;
+        const event = this.#pending.subarray(4, 20);
+        if ((!event.equals(Buffer.from('00000000000003230000000000000000', 'hex'))
+          && !event.equals(Buffer.from('00000000000003220000000000000000', 'hex'))
+          && !event.equals(Buffer.from('00000000000004430000000000000000', 'hex'))) || ++this.#confirmations > 16) {
+          throw new PlusError('SYSTEM_EVENT', 'Unknown or excessive PLC SystemEvent; acquisition stopped');
+        }
+        this.#pending = this.#pending.subarray(20);
+        continue;
+      }
+      if (this.#sessionKey ? version !== 3 : version !== 1 && version !== 2) throw new PlusError('PROTOCOL_VERSION_UNSUPPORTED', `Unsupported response V${version} for selected authentication`);
       if (this.#version && this.#version !== version) throw new PlusError('MALFORMED_RESPONSE', 'Fragment version changed');
       this.#version = version;
       const length = this.#pending.readUInt16BE(2);
       if (length + 4 + this.#bytes > this.maxBytes) throw new PlusError('RESPONSE_LIMIT', 'Declared fragment exceeds budget');
       if (this.#pending.length < length + 4) break;
-      const body = this.#pending.subarray(4, 4 + length);
+      let body = this.#pending.subarray(4, 4 + length);
       this.#pending = this.#pending.subarray(4 + length);
       if (!length) {
         if (!this.#parts.length) throw new PlusError('MALFORMED_RESPONSE', 'Empty response is not success');
         this.#lastFragmentCount = this.#parts.length;
         messages.push({ version, body: Buffer.concat(this.#parts) });
         this.#parts = []; this.#bytes = 0; this.#version = 0;
+        this.#verifier = undefined;
       } else {
+        if (this.#sessionKey) {
+          this.#verifier ??= new FragmentHMACVerifier(this.#sessionKey);
+          body = this.#verifier.verify(body);
+        }
         if (this.#parts.length >= this.maxFragments) throw new PlusError('RESPONSE_LIMIT', 'Too many response fragments');
         this.#parts.push(Buffer.from(body)); this.#bytes += length;
       }
@@ -304,8 +345,8 @@ export class PlusAssembler {
   }
 }
 
-/** @param {Buffer} body @param {number} expectedFunction @param {number} sequence @param {boolean} [verifiedTlsCreate] */
-export function responsePayload(body, expectedFunction, sequence, verifiedTlsCreate = false) {
+/** @param {Buffer} body @param {number} expectedFunction @param {number} sequence @param {boolean} [verifiedTlsCreate] @param {boolean} [legacyInit] @param {boolean} [authenticatedActivation] */
+export function responsePayload(body, expectedFunction, sequence, verifiedTlsCreate = false, legacyInit = false, authenticatedActivation = false) {
   if (body.length < 11 || ![0x32, 0x02].includes(body[0]) || body[1] || body[2] || body[5] || body[6]) {
     throw new PlusError('MALFORMED_RESPONSE', 'Invalid ten-byte response header or missing ReturnValue');
   }
@@ -313,15 +354,15 @@ export function responsePayload(body, expectedFunction, sequence, verifiedTlsCre
     throw new PlusError('CORRELATION', 'Unexpected response sequence');
   }
   const functionCode = body.readUInt16BE(3);
-  if (functionCode !== expectedFunction && functionCode !== 0x04B1) throw new PlusError('CORRELATION', 'Unexpected response function');
-  const identifiers = { functionCode, sequence, transportFlags: body[9], bodyBytes: body.length };
-  if (functionCode === 0x04B1) {
-    throw new PlusError('INDETERMINATE_PROTOCOL_ERROR', 'Generic Error response; its payload is not assumed to be a service ReturnValue', identifiers);
+  const identifiers = { functionCode, expectedFunction, sequence, transportFlags: body[9], bodyBytes: body.length };
+  if (functionCode !== expectedFunction && ![0x04B1, 0x05A9].includes(functionCode)) throw new PlusError('CORRELATION', 'Unexpected response function', identifiers);
+  if (functionCode === 0x04B1 || (functionCode === 0x05A9 && !(legacyInit && expectedFunction === PLUS_FUNCTION.initSSL))) {
+    throw new PlusError('INDETERMINATE_PROTOCOL_ERROR', 'Generic Error response; its payload is not assumed to be a service ReturnValue', { ...identifiers, payloadHex: body.subarray(10).toString('hex') });
   }
   const payload = body.subarray(10);
   const cursor = new Cursor(payload);
   const status = cursor.integer(64);
-  const serviceResultCode = status & (1n << 63n) ? Number(BigInt.asIntN(16, status)) : status <= 32767n ? Number(status) : null;
+  const serviceResultCode = Number(BigInt.asIntN(16, status));
   const statusDetails = {
     ...identifiers, returnValue: `0x${status.toString(16).padStart(16, '0')}`,
     returnValueHex: payload.subarray(0, cursor.offset).toString('hex'), returnValueBodyOffset: 10,
@@ -330,7 +371,10 @@ export function responsePayload(body, expectedFunction, sequence, verifiedTlsCre
   if (expectedFunction === PLUS_FUNCTION.createSession && serviceResultCode === -134) {
     throw new PlusError('ENGINEERING_SESSION_IN_USE', 'PLC reports Service Multi-ES Not Supported; release other engineering connections before an explicit new attempt', statusDetails);
   }
-  if (status !== 0n && !(verifiedTlsCreate && expectedFunction === PLUS_FUNCTION.createSession && serviceResultCode !== null && serviceResultCode >= 0)) {
+  const legacyInitRejection = legacyInit && expectedFunction === PLUS_FUNCTION.initSSL
+    && ((functionCode === PLUS_FUNCTION.initSSL && serviceResultCode === -519) || (functionCode === 0x05A9 && serviceResultCode === -119));
+  const activationStatus = authenticatedActivation && expectedFunction === PLUS_FUNCTION.activateSession && status === 6n;
+  if (status !== 0n && !legacyInitRejection && !activationStatus && !(verifiedTlsCreate && expectedFunction === PLUS_FUNCTION.createSession && serviceResultCode !== null && serviceResultCode >= 0)) {
     const code = expectedFunction === PLUS_FUNCTION.initSSL ? 'INITSSL_REJECTED'
       : expectedFunction === PLUS_FUNCTION.createSession ? 'SESSION_CREATE_REJECTED'
       : expectedFunction === PLUS_FUNCTION.setupSession ? 'SESSION_SETUP_REJECTED' : 'PLC_REJECTED';

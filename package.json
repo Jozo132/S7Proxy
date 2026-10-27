@@ -40,6 +40,7 @@
   "license": "MIT",
   "dependencies": {
     "@assemblyscript/loader": "^0.28.14",
+    "@noble/hashes": "1.8.0",
     "ws": "^8.20.0"
   },
   "devDependencies": {

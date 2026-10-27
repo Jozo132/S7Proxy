@@ -8,4 +8,5 @@ data/*.db*
 data/s7proxy.json
 backups/
 .s7proxy-target.local.json
+experimentation/
 

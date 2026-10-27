@@ -117,11 +117,12 @@ describe('native type metadata', () => {
 });
 
 describe('public native discovery and qualified reads', () => {
-  it('discovers and reads synthetic scalar/nested members through the standalone entry point', async () => {
-    const server = await fixture({ metadata: true });
-    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 20 } });
+  it('discovers and reads synthetic scalar/nested members from a larger bounded inventory through the standalone entry point', async () => {
+    const server = await fixture({ metadata: true, inventorySize: 155 });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 20, maxObjects: 256 } });
     try {
       await client.connect();
+      expect((await client.listDataBlocks()).blocks).toHaveLength(155);
       const metadata = await client.getBlockMetadata({ type: 'DB', number: 7 });
       expect(metadata).toMatchObject({ name: 'SampleDB', objectRid: 0x8A0E0007, typeInfoId: root });
       const discovery = await client.listBlockMembers({ type: 'DB', number: 7 });
