@@ -68,3 +68,46 @@ export function decodeProgramInventory(evidence) {
   return { blocks, otherObjects, receivedAt: evidence.receivedAt,
     completeness: 'BOUNDED_NATIVE_INVENTORY_NOT_PROVEN_EXHAUSTIVE', evidence };
 }
+
+/** @param {ReturnType<typeof decodeProgramInventory>} inventory @param {{objectId:number,objects:PlusObject[],receivedAt:string}} evidence @param {number} [maxEvents] */
+export function decodeProgramEventMetadata(inventory, evidence, maxEvents = 128) {
+  if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 128) throw new PlusError('ARGUMENT', 'Select maxEvents in 1..128');
+  const advertised = inventory.evidence.objects.filter(object => object.rid === 10 && object.classId === 2483 && object.parentRid === 3);
+  const roots = evidence.objects.filter(object => object.rid === 10 && object.classId === 2483 && object.parentRid === null);
+  if (evidence.objectId !== 10 || advertised.length !== 1 || roots.length !== 1
+    || attribute(advertised[0], 233)?.value !== 'SWEvents' || attribute(roots[0], 233)?.value !== 'SWEvents') {
+    throw new PlusError('METADATA_MISMATCH', 'Software-event root does not match the observed program inventory');
+  }
+  const seen = new Set();
+  const events = [];
+  /** @type {{code:string,objectRid:number,relationId?:number,targetRid?:number}[]} */
+  const diagnostics = [];
+  for (const object of evidence.objects) {
+    if (seen.has(object.rid)) throw new PlusError('AMBIGUOUS_METADATA', 'Repeated software-event object RID');
+    if (object.rid !== 10 && (object.parentRid !== 10 || !seen.has(10))) {
+      throw new PlusError('MALFORMED_METADATA', 'Software-event object is outside the expected container');
+    }
+    seen.add(object.rid);
+    const nameValue = attribute(object, 233);
+    if (nameValue && (nameValue.flags !== 0 || nameValue.datatype !== 21 || typeof nameValue.value !== 'string')) {
+      throw new PlusError('MALFORMED_METADATA', 'Software-event name is not a scalar native string');
+    }
+    if (object.rid === 10) continue;
+    if (events.length >= maxEvents) throw new PlusError('RESPONSE_LIMIT', 'Software-event count exceeds maxEvents');
+    if (!nameValue) diagnostics.push({ code: 'EVENT_NAME_UNAVAILABLE', objectRid: object.rid });
+    const relations = (object.relations ?? []).map(relation => {
+      const matches = inventory.blocks.filter(block => block.objectRid === relation.targetRid && block.status === 'IDENTIFIED');
+      const target = matches.length === 1 ? matches[0] : null;
+      if (!target) diagnostics.push({ code: 'RELATION_TARGET_UNRESOLVED', objectRid: object.rid, relationId: relation.id, targetRid: relation.targetRid });
+      return { id: relation.id, targetRid: relation.targetRid,
+        status: target ? 'RESOLVED_IN_INVENTORY' : 'UNRESOLVED',
+        targetBlock: target ? { type: target.type, number: target.number, name: target.name, objectRid: target.objectRid, classId: target.classId } : null };
+    });
+    events.push({ objectRid: object.rid, classId: object.classId, parentRid: object.parentRid,
+      name: nameValue ? String(nameValue.value) : null, relations, nativeAttributes: structuredClone(object.attributes) });
+  }
+  return { status: diagnostics.length ? 'PARTIAL' : 'BOUNDED_METADATA', events, diagnostics,
+    completeness: 'BOUNDED_EVENT_METADATA_NOT_EXECUTION_HISTORY', revisionStatus: 'UNKNOWN', atomicSnapshot: false,
+    relationSemantics: 'UNINTERPRETED_NATIVE_RELATIONS', blockContentRetrieved: false,
+    receivedAt: evidence.receivedAt, inventoryReceivedAt: inventory.receivedAt, evidence, inventory };
+}

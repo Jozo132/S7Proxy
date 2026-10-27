@@ -1,6 +1,6 @@
 // @ts-check
 import { describe, it, expect, vi } from 'vitest';
-import { Cursor, decodeObjects, decodeValue, encodeOperation, planReadBatches } from '../../src/protocol/s7commplus/codec.js';
+import { Cursor, decodeObjects, decodeValue, encodeOperation, planReadBatches, u32, vlq } from '../../src/protocol/s7commplus/codec.js';
 import { buildBlockMembers, validateMemberValue, memberValueSize } from '../../src/protocol/s7commplus/type-info.js';
 import * as typeInfo from '../../src/protocol/s7commplus/type-info.js';
 import { S7CommPlusClient } from '../../src/lib.js';
@@ -11,6 +11,37 @@ const root = 0x92000007;
 const child = 0x92000009;
 const block = { type: /** @type {const} */ ('DB'), number: 7, name: 'SampleDB', objectRid: 0x8A0E0007, typeInfoId: root, status: 'TYPE_REFERENCE_RESOLVED', evidence: {} };
 const objects = () => decodeObjects(new Cursor(Buffer.concat([typeObject(root, syntheticMembers), typeObject(child, [{ name: 'Ready', lid: 132, type: 1 }])])));
+
+describe('native object relations', () => {
+  /** @param {number} rid @param {number} classId */
+  const start = (rid, classId) => Buffer.concat([Buffer.from([0xA1]), u32(rid), vlq(classId), Buffer.from([0, 0])]);
+  /** @param {number} id @param {number} targetRid */
+  const relation = (id, targetRid) => Buffer.concat([Buffer.from([0xA4]), vlq(id), u32(targetRid)]);
+  it('preserves ordered VLQ IDs and big-endian targets on their owning nested objects', () => {
+    const decoded = decodeObjects(new Cursor(Buffer.concat([
+      start(10, 2483), relation(1024, 0x8A320001), start(96, 2059), relation(1024, 0),
+      Buffer.from([0xA2]), relation(0xFFFFFFFF, 0xFFFFFFFF), Buffer.from([0xA2]),
+    ])));
+    expect(decoded[0].relations).toEqual([{ id: 1024, targetRid: 0x8A320001 }, { id: 0xFFFFFFFF, targetRid: 0xFFFFFFFF }]);
+    expect(decoded[1].relations).toEqual([{ id: 1024, targetRid: 0 }]);
+    expect(decoded[1].parentRid).toBe(10);
+    expect(decodeObjects(new Cursor(Buffer.concat([start(10, 2483), Buffer.from([0xA2])])))[0].relations).toBeUndefined();
+  });
+  it('fails closed on duplicate, truncated, orphaned and unknown elements', () => {
+    const encoded = relation(1024, 0x8A320001);
+    expect(() => decodeObjects(new Cursor(Buffer.concat([start(10, 2483), encoded, encoded, Buffer.from([0xA2])])))).toThrow(/Duplicate object relation/);
+    for (let length = 1; length < encoded.length; length++) {
+      expect(() => decodeObjects(new Cursor(Buffer.concat([start(10, 2483), encoded.subarray(0, length)])))).toThrow(/Truncated/);
+    }
+    expect(() => decodeObjects(new Cursor(encoded))).toThrow(/Unhandled object element/);
+    expect(() => decodeObjects(new Cursor(Buffer.concat([start(10, 2483), Buffer.from([0xA5, 0xA2])])))).toThrow(/Unhandled object element/);
+  });
+  it('enforces a finite relation budget without dropping records', () => {
+    const entries = Array.from({ length: 129 }, (_, index) => relation(index, index));
+    expect(decodeObjects(new Cursor(Buffer.concat([start(10, 2483), ...entries.slice(0, 128), Buffer.from([0xA2])])))[0].relations).toHaveLength(128);
+    expect(() => decodeObjects(new Cursor(Buffer.concat([start(10, 2483), ...entries, Buffer.from([0xA2])])))).toThrow(/Relation budget/);
+  });
+});
 
 describe('symbolic read batch planning', () => {
   it('encodes only the reference communication resource subareas at the native root', () => {

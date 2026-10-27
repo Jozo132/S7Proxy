@@ -11,11 +11,12 @@ import {
   encodeOperation, assertOutgoing, responsePayload, planReadBatches,
 } from '../protocol/s7commplus/codec.js';
 import { buildBlockMembers, validateMemberValue, memberValueSize } from '../protocol/s7commplus/type-info.js';
-import { decodeProgramInventory, PROGRAM_INVENTORY_ATTRIBUTES } from '../protocol/s7commplus/block-inventory.js';
+import { decodeProgramInventory, decodeProgramEventMetadata, PROGRAM_INVENTORY_ATTRIBUTES } from '../protocol/s7commplus/block-inventory.js';
 import { BLOCK_CONTENT_ATTRIBUTES, decodeBlockContent } from '../protocol/s7commplus/block-upload.js';
 import { createLegacySessionKey, encodeLegacySecurityKey } from '../protocol/s7commplus/session-key.js';
 import { ACTIVE_ALARM_ATTRIBUTES } from '../protocol/s7commplus/operation-policy.js';
 import { decodeCurrentAlarms } from '../protocol/s7commplus/alarms.js';
+import { PlusReceiveRouter } from '../protocol/s7commplus/subscription-notifications.js';
 
 /** @import { PlusOperation, PlusObject, PlusValue } from '../protocol/s7commplus/codec.js' */
 /** @import { BlockMetadata, AreaMetadata, RuntimeMember } from '../protocol/s7commplus/type-info.js' */
@@ -64,6 +65,7 @@ export class S7CommPlusClient {
   #cotp = [];
   #cotpBytes = 0;
   #plus;
+  #receiveRouter = new PlusReceiveRouter();
   #sequence = 0;
   #sessionId = 0;
   #version = 1;
@@ -480,6 +482,35 @@ export class S7CommPlusClient {
     } catch (error) { this.#stop(this.#asError(error)); throw error; }
   }
 
+  /** @param {{maxEvents?:number}} [options] */
+  async readProgramEventMetadata(options = {}) {
+    this.#requireReady();
+    this.#requireMetadataState();
+    if (!options || typeof options !== 'object' || Array.isArray(options) || Object.keys(options).some(key => key !== 'maxEvents')) {
+      throw new PlusError('ARGUMENT', 'Select only maxEvents');
+    }
+    const maxEvents = options.maxEvents ?? 128;
+    if (!Number.isSafeInteger(maxEvents) || maxEvents < 1 || maxEvents > 128) throw new PlusError('ARGUMENT', 'Select maxEvents in 1..128');
+    const inventory = await this.listProgramBlocks();
+    try {
+      const containers = inventory.evidence.objects.filter(object => object.rid === 10 && object.classId === 2483 && object.parentRid === 3);
+      if (!containers.length) return { status: 'NOT_REPORTED_IN_INVENTORY', events: [],
+        diagnostics: [{ code: 'EVENT_CONTAINER_NOT_REPORTED', objectRid: 10 }],
+        completeness: 'BOUNDED_EVENT_METADATA_NOT_EXECUTION_HISTORY', revisionStatus: 'UNKNOWN', atomicSnapshot: false,
+        relationSemantics: 'UNINTERPRETED_NATIVE_RELATIONS', blockContentRetrieved: false,
+        receivedAt: inventory.receivedAt, inventoryReceivedAt: inventory.receivedAt, evidence: null, inventory,
+        controller: structuredClone(this.#identity), cpuState: this.#cpuState, artifactClass: 'PROGRAM_EVENT_METADATA' };
+      const names = containers[0].attributes.filter(attribute => attribute.id === 233);
+      if (containers.length !== 1 || names.length !== 1 || names[0].value.flags !== 0
+        || names[0].value.datatype !== 21 || names[0].value.value !== 'SWEvents') {
+        throw new PlusError('METADATA_MISMATCH', 'Software-event container was not uniquely advertised by native inventory');
+      }
+      const evidence = await this.#explore(10, { recursive: true });
+      return { ...decodeProgramEventMetadata(inventory, evidence, maxEvents), controller: structuredClone(this.#identity),
+        cpuState: this.#cpuState, artifactClass: 'PROGRAM_EVENT_METADATA' };
+    } catch (error) { this.#stop(this.#asError(error)); throw error; }
+  }
+
   /** @param {{type:string,number:number}} selector @param {{mode?:'run'|'stop'}} [options] */
   async uploadProgramBlock(selector, options = {}) {
     if (!selector || !['DB', 'FC', 'OB'].includes(selector.type) || !Number.isInteger(selector.number) || selector.number < 1 || selector.number > 65535) {
@@ -877,6 +908,7 @@ export class S7CommPlusClient {
 
   async disconnect() {
     this.#disconnectRequested = true;
+    this.#receiveRouter.close();
     clearTimeout(this.#durationTimer);
     this.#pacingAbort.abort();
     this.#sessionKey?.fill(0);
@@ -1040,7 +1072,7 @@ export class S7CommPlusClient {
       return { ...decoded, timing, version: incoming.version, expectedIntegrityId: this.#sessionKey && operation.kind === 'activateSession' ? undefined : expectedIntegrityId,
         correlation: { sequence, functionCode: PLUS_FUNCTION[/** @type {keyof typeof PLUS_FUNCTION} */ (operation.kind)],
           integrityId: expectedIntegrityId ?? null, request: structuredClone(operation), responseBody: Buffer.from(incoming.body),
-          fragmentCount: this.#plus.lastMessageFragmentCount } };
+          fragmentCount: incoming.fragmentCount } };
     } catch (error) {
       const failure = this.#asError(error);
       this.#stop(failure);
@@ -1121,12 +1153,12 @@ export class S7CommPlusClient {
   /** @param {Buffer} bytes */
   #onApplication(bytes) {
     const confirmations = this.#plus.sessionConfirmations;
-    const messages = this.#plus.feed(bytes);
+    const messages = this.#plus.feed(bytes).map(message => ({ ...message, receivedAtMonotonicMs: performance.now() }));
     if (this.#plus.sessionConfirmations !== confirmations) this.#record(this.#observations, { kind: 'sessionConfirmation', count: this.#plus.sessionConfirmations });
-    if (messages.length > 1 || (messages.length && !this.#pending)) throw new PlusError('CORRELATION', 'Unexpected unsolicited or duplicate response');
-    if (messages.length) {
-      if (this.#tlsEstablished) this.#record(this.#transcript, { direction: 'in', layer: 'S7CommPlus', version: messages[0].version, hex: messages[0].body.toString('hex').slice(0, 2048) });
-      this.#settle({ ...messages[0], receivedAtMonotonicMs: performance.now() });
+    const reply = this.#receiveRouter.route(messages, !!this.#pending);
+    if (reply) {
+      if (this.#tlsEstablished) this.#record(this.#transcript, { direction: 'in', layer: 'S7CommPlus', version: reply.version, hex: reply.body.toString('hex').slice(0, 2048) });
+      this.#settle(reply);
     }
   }
 
@@ -1190,6 +1222,7 @@ export class S7CommPlusClient {
     }
     this.#ready = false;
     clearTimeout(this.#durationTimer);
+    this.#receiveRouter.close();
     this.#pacingAbort.abort();
     this.#settle(undefined, this.#failure ?? error);
     this.#rejectQueue(this.#failure ?? error);

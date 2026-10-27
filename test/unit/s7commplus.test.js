@@ -6,12 +6,357 @@ import { join } from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
 import { rootCertificates } from 'node:tls';
 import { X509Certificate } from 'node:crypto';
-import { Cursor, decodeValue, vlq, u32, PlusAssembler, encodeOperation, assertOutgoing, responsePayload, decodeObjects } from '../../src/protocol/s7commplus/codec.js';
+import { Cursor, decodeValue, decodeDataNotification, vlq, u32, PlusAssembler, encodeOperation, assertOutgoing, responsePayload, decodeObjects } from '../../src/protocol/s7commplus/codec.js';
 import { S7CommPlusClient } from '../../src/client/s7commplus-client.js';
 import { fixture, validateSessionRequest, encodeTestUInt64 } from '../s7commplus-fixture.js';
 import { saveSoftwareSnapshot, verifySoftwareSnapshot } from '../helpers/program-store.js';
+import { DataNotificationBuffer, PlusReceiveRouter } from '../../src/protocol/s7commplus/subscription-notifications.js';
+import { OwnedSubscriptionSession } from '../../src/protocol/s7commplus/subscription-session.js';
 
 const context = { version: 1, sessionId: 0x12345678 };
+describe('offline data notification decoding', () => {
+  const owner = { subscriptionRid: 0x10000001, changeCounter: 1, referenceIds: [1, 128, 300] };
+  const header = Buffer.from('331000000104000000000005810001', 'hex');
+  const fixed = Buffer.from('9200000001000101', 'hex');
+  const variable = Buffer.from('9b81000007007b', 'hex');
+  const failure = Buffer.from('130000012c', 'hex');
+  /** @param {Buffer} body */
+  const message = body => ({ version: 2, body });
+  it('decodes fixed and VLQ references and item errors without ordinary response parsing', () => {
+    const body = Buffer.concat([header, fixed, variable, failure, Buffer.from([0])]);
+    const result = decodeDataNotification(message(body), owner);
+    expect(result).toMatchObject({ subscriptionRid: owner.subscriptionRid, creditTick: 5, sequenceNumber: 128,
+      changeCounter: 1, timestampMicroseconds: null, completeness: 'DELTA_ITEMS_NOT_FULL_SNAPSHOT' });
+    expect(result.items.map(item => [item.referenceId, item.value?.value ?? null, item.errorCode])).toEqual([[1, true, null], [128, 123, null], [300, null, 0x13]]);
+    expect(() => responsePayload(body, 0x054C, 128)).toThrow(/header/);
+    body[0] = 0;
+    expect(result.rawBody[0]).toBe(0x33);
+  });
+  it('preserves timestamp microseconds losslessly and accepts an empty delta', () => {
+    const timestamp = Buffer.from('00ffffffffffffff', 'hex');
+    const result = decodeDataNotification(message(Buffer.concat([header.subarray(0, -1), timestamp, Buffer.from([1, 0])])), owner);
+    expect(result.timestampMicroseconds).toBe(BigInt('0x00ffffffffffffff').toString());
+    expect(result.items).toEqual([]);
+    expect(result.timestampSemantics).toContain('NOT_QUALIFIED_SCAN_TIME');
+  });
+  it('rejects wrong owners, changed subscriptions, unknown references and duplicate value/error records', () => {
+    const body = Buffer.concat([header, fixed, Buffer.from([0])]);
+    expect(() => decodeDataNotification(message(body), { ...owner, subscriptionRid: 99 })).toThrow(/owner/);
+    expect(() => decodeDataNotification(message(body), { ...owner, changeCounter: 2 })).toThrow(/change counter/);
+    expect(() => decodeDataNotification(message(body), { ...owner, referenceIds: [128] })).toThrow(/reference/);
+    expect(() => decodeDataNotification(message(Buffer.concat([header, fixed, fixed, Buffer.from([0])])), owner)).toThrow(/Duplicate/);
+    expect(() => decodeDataNotification(message(Buffer.concat([header, fixed, Buffer.from('030000000100', 'hex')])), owner)).toThrow(/Duplicate/);
+  });
+  it('fails closed on truncated fields, missing terminators, unqualified markers and unsupported variants', () => {
+    const body = Buffer.concat([header, fixed, variable, failure, Buffer.from([0])]);
+    for (let length = 0; length < body.length; length++) expect(() => decodeDataNotification(message(body.subarray(0, length)), owner)).toThrow();
+    for (const status of [0x81, 0x83, 0x9C, 0xFF]) expect(() => decodeDataNotification(message(Buffer.concat([header, Buffer.from([status, 0])])), owner)).toThrow(/Unsupported/);
+    expect(() => decodeDataNotification(message(Buffer.concat([header, Buffer.from([0, 0])])), owner)).toThrow(/Trailing/);
+    const unknownMarker = Buffer.from(body); unknownMarker[5] = 3;
+    expect(() => decodeDataNotification(message(unknownMarker), owner)).toThrow(/marker/);
+    expect(() => decodeDataNotification({ version: 3, body }, owner)).toThrow(/V2/);
+  });
+  it('enforces explicit owner and byte/item limits before accepting a notification', () => {
+    const body = Buffer.concat([header, fixed, variable, Buffer.from([0])]);
+    expect(() => decodeDataNotification(message(body), { ...owner, maxItems: 1 })).toThrow(/item budget/);
+    expect(() => decodeDataNotification(message(body), { ...owner, maxBytes: 16 })).toThrow(/byte budget/);
+    for (const referenceIds of [[], [0], [1, 1], [0x100000000]]) expect(() => decodeDataNotification(message(body), { ...owner, referenceIds })).toThrow(/reference IDs/);
+    expect(() => decodeDataNotification(message(body), { ...owner, maxItems: 0 })).toThrow(/limits/);
+  });
+  it('bounds queues by count and bytes, and never clears delta loss after later updates', () => {
+    /** @param {number} sequence */
+    const update = sequence => message(Buffer.concat([header.subarray(0, 12), vlq(sequence), Buffer.from([1]), fixed, Buffer.from([0])]));
+    const queue = new DataNotificationBuffer(owner, { queueSize: 1 });
+    queue.push(update(1)); queue.push(update(2));
+    expect(queue.diagnostics).toMatchObject({ queuedUpdates: 1, droppedUpdates: 1, requiresResynchronization: true, baselineStatus: 'NOT_ESTABLISHED' });
+    expect(queue.pop()?.sequenceNumber).toBe(2);
+    queue.push(update(3)); queue.pop();
+    expect(queue.diagnostics.requiresResynchronization).toBe(true);
+    const bytes = update(1).body.length;
+    const byteQueue = new DataNotificationBuffer({ ...owner, maxBytes: bytes }, { queueSize: 8, maxBufferedBytes: bytes });
+    byteQueue.push(update(1)); byteQueue.push(update(2));
+    expect(byteQueue.diagnostics).toMatchObject({ queuedUpdates: 1, bufferedBytes: bytes, droppedUpdates: 1 });
+  });
+  it('detects gaps, rejects duplicate and reordered deltas and handles UInt32 wrap without fabricating a baseline', () => {
+    /** @param {number} sequence */
+    const update = sequence => message(Buffer.concat([header.subarray(0, 12), vlq(sequence), Buffer.from([1, 0])]));
+    const queue = new DataNotificationBuffer(owner);
+    expect(queue.push(update(0xFFFFFFFF))).toBe(true);
+    expect(queue.push(update(0))).toBe(true);
+    expect(queue.diagnostics.missedUpdates).toBe(0);
+    expect(queue.push(update(0))).toBe(false);
+    expect(queue.push(update(0xFFFFFFFF))).toBe(false);
+    expect(queue.diagnostics).toMatchObject({ missedUpdates: 0, requiresResynchronization: true });
+    expect(queue.push(update(3))).toBe(true);
+    expect(queue.diagnostics).toMatchObject({ lastSequence: 3, missedUpdates: 2, duplicates: 1, outOfOrder: 1, requiresResynchronization: true });
+    const ambiguous = new DataNotificationBuffer(owner);
+    ambiguous.push(update(0));
+    expect(ambiguous.push(update(0x80000000))).toBe(false);
+    expect(ambiguous.diagnostics).toMatchObject({ lastSequence: 0, outOfOrder: 1, requiresResynchronization: true });
+  });
+  it('snapshots owner references, retains state on parse failure and discards queued deltas on close', () => {
+    const mutableOwner = { ...owner, referenceIds: [...owner.referenceIds] };
+    const queue = new DataNotificationBuffer(mutableOwner);
+    mutableOwner.referenceIds.length = 0;
+    const body = Buffer.concat([header, fixed, Buffer.from([0])]);
+    expect(queue.push(message(body))).toBe(true);
+    const before = queue.diagnostics;
+    expect(() => queue.push(message(body.subarray(0, -1)))).toThrow();
+    expect(queue.diagnostics).toEqual(before);
+    body[0] = 0;
+    expect(queue.pop()?.rawBody[0]).toBe(0x33);
+    queue.push(message(Buffer.concat([header, fixed, Buffer.from([0])])));
+    expect(queue.diagnostics.duplicates).toBe(1);
+    const fresh = new DataNotificationBuffer(owner);
+    fresh.push(message(Buffer.concat([header, fixed, Buffer.from([0])])));
+    fresh.close(); fresh.close();
+    expect(fresh.pop()).toBeNull();
+    expect(fresh.diagnostics).toMatchObject({ closed: true, queuedUpdates: 0, bufferedBytes: 0, discardedOnClose: 1 });
+    expect(() => fresh.push(message(body))).toThrow(/closed/);
+    expect(() => new DataNotificationBuffer(owner, { queueSize: 0 })).toThrow(/slots/);
+    expect(() => new DataNotificationBuffer(owner, { maxBufferedBytes: 16 })).toThrow(/byte budget/);
+  });
+  it('assembles fragmented notification envelopes without treating transport chunks as updates', () => {
+    const body = Buffer.concat([header, fixed, Buffer.from([0])]);
+    const wire = Buffer.concat([Buffer.from([0x72, 2, 0, 8]), body.subarray(0, 8),
+      Buffer.from([0x72, 2, 0, body.length - 8]), body.subarray(8), Buffer.from([0x72, 2, 0, 0])]);
+    const assembler = new PlusAssembler();
+    expect(assembler.feed(wire.subarray(0, 7))).toEqual([]);
+    const updates = assembler.feed(wire.subarray(7));
+    expect(updates).toHaveLength(1);
+    expect(decodeDataNotification(updates[0], owner).items[0].value?.value).toBe(true);
+    expect(assembler.lastMessageFragmentCount).toBe(2);
+  });
+});
+
+describe('owned subscription receive routing', () => {
+  const notification = { version: 2, body: Buffer.from('331000000104000000000005010100', 'hex') };
+  const reply = { version: 2, body: Buffer.from([0x32]) };
+  it('demultiplexes either interleaving and receives deltas without a pending reply', () => {
+    const router = new PlusReceiveRouter();
+    const receive = vi.fn();
+    router.register(0x10000001, {}, receive);
+    expect(router.route([notification, reply, notification], true)).toBe(reply);
+    expect(receive).toHaveBeenCalledTimes(2);
+    expect(router.route([notification], false)).toBeNull();
+    expect(router.route([{ ...reply, body: Buffer.from([0x02]) }], true)?.body[0]).toBe(0x02);
+  });
+  it('rejects foreign owners, duplicate replies, unsolicited replies and unknown families', () => {
+    const router = new PlusReceiveRouter();
+    expect(() => router.route([notification], true)).toThrow(/Unowned/);
+    expect(() => router.route([reply, reply], true)).toThrow(/duplicate/);
+    expect(() => router.route([reply], false)).toThrow(/unsolicited/);
+    expect(() => router.route([{ ...reply, body: Buffer.from([0x34]) }], true)).toThrow(/family/);
+    expect(() => router.route([{ ...notification, body: Buffer.from([0x33]) }], true)).toThrow(/Truncated/);
+  });
+  it('uses session-local handle identity, bounded registrations and irreversible close', () => {
+    const router = new PlusReceiveRouter();
+    const token = {};
+    router.register(1, token, () => {});
+    expect(() => router.register(1, {}, () => {})).toThrow(/already/);
+    expect(() => router.unregister(1, {})).toThrow(/not owned/);
+    router.unregister(1, token);
+    for (let rid = 1; rid <= 16; rid++) router.register(rid, {}, () => {});
+    expect(() => router.register(17, {}, () => {})).toThrow(/budget/);
+    router.close(); router.close();
+    expect(() => router.route([reply], true)).toThrow(/closed/);
+    expect(() => router.register(1, {}, () => {})).toThrow(/closed/);
+  });
+  it('retains per-message fragment evidence when coalesced replies and notifications share transport chunks', () => {
+    /** @param {Buffer[]} parts */
+    const wire = parts => Buffer.concat([...parts.map(part => Buffer.concat([Buffer.from([0x72, 2, 0, part.length]), part])), Buffer.from([0x72, 2, 0, 0])]);
+    const bytes = Buffer.concat([wire([Buffer.from([0x32]), Buffer.from([0])]), wire([notification.body])]);
+    const assembler = new PlusAssembler();
+    expect(assembler.feed(bytes.subarray(0, 3))).toEqual([]);
+    const messages = assembler.feed(bytes.subarray(3));
+    const router = new PlusReceiveRouter();
+    const receive = vi.fn();
+    router.register(0x10000001, {}, receive);
+    expect(router.route(messages, true)?.fragmentCount).toBe(2);
+    expect(receive.mock.calls[0][0].fragmentCount).toBe(1);
+    expect(assembler.lastMessageFragmentCount).toBe(1);
+  });
+});
+
+describe('offline owned subscription lifecycle', () => {
+  const selection = { changeCounter: 1, referenceIds: [1] };
+  const receipt = { sessionRid: 77, containerRid: 88, subscriptionRid: 0x10000001 };
+  /** @param {number} sequence @param {number} tick @param {number} [rid] */
+  const update = (sequence, tick, rid = receipt.subscriptionRid) => ({ version: 2,
+    body: Buffer.concat([Buffer.from([0x33]), u32(rid), Buffer.from('040000000000', 'hex'), Buffer.from([tick]), vlq(sequence), Buffer.from([1, 0])]) });
+  function setup() {
+    const adapter = { create: vi.fn(async () => ({ ...receipt })), renew: vi.fn(async () => {}),
+      deleteOwned: vi.fn(async (/** @type {import('../../src/protocol/s7commplus/subscription-session.js').OwnedSubscriptionReceipt} */ _receipt, /** @type {AbortSignal} */ _signal) => {}), abort: vi.fn() };
+    let now = 0;
+    const session = new OwnedSubscriptionSession({ ...receipt, adapter, clock: () => now, staleAfterMs: 100, requestTimeoutMs: 20 });
+    return { session, adapter, advance: (/** @type {number} */ elapsed) => { now += elapsed; } };
+  }
+  it('routes owned deltas around replies and counts finite credits without claiming GOOD or a baseline', async () => {
+    const { session, adapter, advance } = setup();
+    const handle = await session.create(selection, { credits: 2 });
+    expect(session.diagnostics(handle)).toMatchObject({ freshness: 'AWAITING_INITIAL', creditsRemaining: 2, quality: 'UNKNOWN' });
+    const reply = { version: 2, body: Buffer.from([0x32]) };
+    expect(session.route([update(1, 0), reply, update(2, 1)], true)).toBe(reply);
+    expect(session.diagnostics(handle)).toMatchObject({ freshness: 'CREDIT_EXHAUSTED', creditsRemaining: 0, queuedUpdates: 2, baselineStatus: 'NOT_ESTABLISHED' });
+    await session.renew(handle, 2);
+    expect(adapter.renew).toHaveBeenCalledWith(receipt, 4, expect.any(AbortSignal));
+    expect(session.diagnostics(handle).creditsRemaining).toBe(2);
+    advance(100);
+    expect(session.diagnostics(handle).freshness).toBe('STALE');
+    session.route([update(3, 2)], false);
+    expect(session.diagnostics(handle).freshness).toBe('RECENT_DELTA_NOT_GOOD');
+    expect(session.pop(handle)?.sequenceNumber).toBe(1);
+    await session.close();
+    expect(adapter.deleteOwned).toHaveBeenCalledExactlyOnceWith(receipt, expect.any(AbortSignal));
+    expect(session.report.state).toBe('CLOSED');
+  });
+  it('does not refresh silence on duplicates and keeps gaps/overflow sticky across renewals', async () => {
+    const { session, adapter, advance } = setup();
+    const handle = await session.create(selection, { credits: 10, queueSize: 1 });
+    session.route([update(1, 0)], false);
+    advance(100); session.route([update(1, 0)], false);
+    expect(session.diagnostics(handle)).toMatchObject({ freshness: 'STALE', creditsRemaining: 9, duplicates: 1 });
+    session.route([update(3, 2)], false);
+    expect(session.diagnostics(handle)).toMatchObject({ freshness: 'RESYNC_REQUIRED', missedUpdates: 1, droppedUpdates: 1, creditsRemaining: 7 });
+    await expect(session.renew(handle, 1)).rejects.toMatchObject({ code: 'RESYNC_REQUIRED' });
+    expect(adapter.renew).not.toHaveBeenCalled();
+    await session.close();
+  });
+  it('preflights finite grants and owner options and never permits unqualified rollover', async () => {
+    const { session, adapter } = setup();
+    for (const credits of [-1, 0, 255, Infinity]) await expect(session.create(selection, { credits })).rejects.toMatchObject({ code: 'ARGUMENT' });
+    await expect(session.create({ ...selection, referenceIds: [] })).rejects.toThrow();
+    expect(adapter.create).not.toHaveBeenCalled();
+    const handle = await session.create(selection, { credits: 254 });
+    await expect(session.renew(handle, 1)).rejects.toMatchObject({ code: 'UNSUPPORTED_PROFILE' });
+    expect(session.report.state).toBe('OPEN');
+    await session.close();
+  });
+  it('aborts on unowned notifications and credit-window violations, without speculative cleanup', async () => {
+    for (const foreign of [false, true]) {
+      const { session, adapter } = setup();
+      const handle = await session.create(selection, { credits: 1 });
+      expect(() => session.route([update(1, foreign ? 0 : 1, foreign ? 99 : receipt.subscriptionRid)], false)).toThrow();
+      expect(session.report.state).toBe('ABORTED');
+      expect(session.diagnostics(handle)).toMatchObject({ closed: true, queuedUpdates: 0, quality: 'UNKNOWN' });
+      expect(adapter.abort).toHaveBeenCalledTimes(1);
+      expect(adapter.deleteOwned).not.toHaveBeenCalled();
+    }
+  });
+  it('rejects foreign creation receipts and failed creation without deleting guessed RIDs', async () => {
+    const foreign = setup();
+    foreign.adapter.create.mockResolvedValue({ ...receipt, containerRid: 99 });
+    await expect(foreign.session.create(selection)).rejects.toMatchObject({ code: 'CORRELATION' });
+    expect(foreign.adapter.deleteOwned).not.toHaveBeenCalled();
+    expect(foreign.adapter.abort).toHaveBeenCalledTimes(1);
+    const failed = setup();
+    failed.adapter.create.mockRejectedValue(new Error('creation response lost'));
+    await expect(failed.session.create(selection)).rejects.toThrow(/lost/);
+    expect(failed.session.report).toMatchObject({ state: 'ABORTED', handles: 0 });
+    expect(failed.adapter.deleteOwned).not.toHaveBeenCalled();
+  });
+  it('cancels a pending creation promptly and cannot attach a late acknowledgement', async () => {
+    const { session, adapter } = setup();
+    /** @type {(value:typeof receipt)=>void} */
+    let complete = () => {};
+    adapter.create.mockImplementation(() => new Promise(resolve => { complete = resolve; }));
+    const controller = new AbortController();
+    const pending = session.create(selection, { signal: controller.signal });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'CANCELLED' });
+    await Promise.resolve(); controller.abort(); await rejected;
+    complete(receipt); await Promise.resolve();
+    expect(session.report).toMatchObject({ state: 'ABORTED', handles: 0 });
+    expect(adapter.deleteOwned).not.toHaveBeenCalled();
+    expect(adapter.abort).toHaveBeenCalledTimes(1);
+  });
+  it('bounds timeouts and aborts uncertain credit renewal without committing the grant', async () => {
+    const { session, adapter } = setup();
+    const handle = await session.create(selection, { credits: 2 });
+    adapter.renew.mockImplementation(() => new Promise(() => {}));
+    await expect(session.renew(handle, 2)).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(session.diagnostics(handle)).toMatchObject({ creditLimit: 2, closed: true });
+    expect(adapter.abort).toHaveBeenCalledTimes(1);
+  });
+  it('cleans up only owned handles once and rejects handles after reconnect', async () => {
+    const previous = setup();
+    const handle = await previous.session.create(selection);
+    expect(() => previous.session.cancel({})).toThrow(/Foreign/);
+    await Promise.all([previous.session.cancel(handle), previous.session.cancel(handle), previous.session.close()]);
+    expect(previous.adapter.deleteOwned).toHaveBeenCalledTimes(1);
+    const next = setup();
+    await expect(next.session.renew(handle, 1)).rejects.toMatchObject({ code: 'CORRELATION' });
+    const newHandle = await next.session.create(selection);
+    expect(newHandle).not.toBe(handle);
+    expect(next.session.diagnostics(newHandle)).toMatchObject({ freshness: 'AWAITING_INITIAL', lastSequence: null, creditsRemaining: 10 });
+    expect(next.session.report.automaticRestore).toBe(false);
+    await next.session.close();
+  });
+  it('records cleanup failure, aborts once and never retries arbitrary deletion', async () => {
+    const { session, adapter } = setup();
+    await session.create(selection);
+    adapter.deleteOwned.mockRejectedValue(new Error('cleanup failed'));
+    await expect(session.close()).rejects.toThrow(/cleanup failed/);
+    await expect(session.close()).rejects.toThrow(/cleanup failed/);
+    expect(session.report).toMatchObject({ state: 'ABORTED', failures: [{ operation: 'deleteOwned', code: 'ADAPTER_FAILURE' }] });
+    expect(adapter.abort).toHaveBeenCalledTimes(1);
+    expect(adapter.deleteOwned).toHaveBeenCalledTimes(1);
+  });
+  it('does not transmit pre-cancelled creation and aborts in-flight creation on session close', async () => {
+    const { session, adapter } = setup();
+    await expect(session.create(selection, { signal: AbortSignal.abort() })).rejects.toMatchObject({ code: 'CANCELLED' });
+    expect(adapter.create).not.toHaveBeenCalled();
+    expect(session.report.state).toBe('OPEN');
+    adapter.create.mockImplementation(() => new Promise(() => {}));
+    const pending = session.create(selection);
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'CANCELLED' });
+    await Promise.resolve(); await session.close(); await rejected;
+    expect(adapter.abort).toHaveBeenCalledTimes(1);
+    expect(adapter.deleteOwned).not.toHaveBeenCalled();
+  });
+  it('bounds creation timeouts and discards late renewal acknowledgements after abort', async () => {
+    const missing = setup();
+    missing.adapter.create.mockImplementation(() => new Promise(() => {}));
+    await expect(missing.session.create(selection)).rejects.toMatchObject({ code: 'TIMEOUT' });
+    expect(missing.session.report.state).toBe('ABORTED');
+    const active = setup();
+    const handle = await active.session.create(selection, { credits: 2 });
+    /** @type {()=>void} */
+    let acknowledge = () => {};
+    active.adapter.renew.mockImplementation(() => new Promise(resolve => { acknowledge = () => resolve(); }));
+    const renewing = active.session.renew(handle, 2);
+    const rejected = expect(renewing).rejects.toMatchObject({ code: 'CANCELLED' });
+    await Promise.resolve(); await active.session.close(); await rejected;
+    acknowledge(); await Promise.resolve();
+    expect(active.session.diagnostics(handle)).toMatchObject({ creditLimit: 2, closed: true });
+    expect(active.adapter.deleteOwned).not.toHaveBeenCalled();
+  });
+  it('discards deltas during owned cancellation and cleans multiple distinct children without deleting a container', async () => {
+    const { session, adapter } = setup();
+    const first = await session.create(selection);
+    const secondReceipt = { ...receipt, subscriptionRid: 0x10000002 };
+    adapter.create.mockResolvedValue(secondReceipt);
+    await session.create(selection);
+    /** @type {()=>void} */
+    let deleted = () => {};
+    adapter.deleteOwned.mockImplementationOnce(() => new Promise(resolve => { deleted = () => resolve(); }));
+    const cancellation = session.cancel(first);
+    await Promise.resolve();
+    session.route([update(1, 0)], false);
+    expect(session.diagnostics(first)).toMatchObject({ state: 'DELETING', queuedUpdates: 0, discardedWhileClosing: 1 });
+    deleted(); await cancellation; await session.close();
+    expect(adapter.deleteOwned.mock.calls.map(call => call[0])).toEqual([receipt, secondReceipt]);
+    expect(adapter.abort).not.toHaveBeenCalled();
+  });
+  it('never deletes an already-owned RID when another creation returns the same RID', async () => {
+    const { session, adapter } = setup();
+    const handle = await session.create(selection);
+    await expect(session.create(selection)).rejects.toMatchObject({ code: 'CORRELATION' });
+    expect(session.diagnostics(handle).closed).toBe(true);
+    expect(adapter.deleteOwned).not.toHaveBeenCalled();
+    expect(adapter.abort).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('S7CommPlus read-only codec', () => {
   it('encodes only the current-alarm diagnostic Explore request', () => {
     const operation = { kind: 'readActiveAlarms', objectId: 8, recursive: true, attributes: [2670, 2671, 2672, 2673, 2677, 4079, 7813, 233, 7917, 2715] };
@@ -120,7 +465,7 @@ describe('S7CommPlus read-only codec', () => {
     const parser = new PlusAssembler();
     expect(parser.feed(Buffer.from('720100026162', 'hex'))).toEqual([]);
     expect(parser.feed(Buffer.from('72010001637201', 'hex'))).toEqual([]);
-    expect(parser.feed(Buffer.from('0000', 'hex'))).toEqual([{ version: 1, body: Buffer.from('abc') }]);
+    expect(parser.feed(Buffer.from('0000', 'hex'))).toEqual([{ version: 1, body: Buffer.from('abc'), fragmentCount: 2 }]);
   });
   it('rejects unsupported versions, changing versions and response allocation overruns', () => {
     expect(() => new PlusAssembler().feed(Buffer.from('72030000', 'hex'))).toThrow(/V3/);

@@ -367,7 +367,7 @@ export class PlusAssembler {
   get lastMessageFragmentCount() { return this.#lastFragmentCount; }
   /** @param {number} [maxBytes] @param {number} [maxFragments] */
   constructor(maxBytes = 65536, maxFragments = 64) { this.maxBytes = maxBytes; this.maxFragments = maxFragments; }
-  /** @param {Buffer} bytes @returns {{version:number,body:Buffer}[]} */
+  /** @param {Buffer} bytes @returns {{version:number,body:Buffer,fragmentCount:number}[]} */
   feed(bytes) {
     if (this.#pending.length + this.#bytes + bytes.length > this.maxBytes) throw new PlusError('RESPONSE_LIMIT', 'Response allocation budget exceeded');
     this.#pending = Buffer.concat([this.#pending, bytes]);
@@ -398,7 +398,7 @@ export class PlusAssembler {
       if (!length) {
         if (!this.#parts.length) throw new PlusError('MALFORMED_RESPONSE', 'Empty response is not success');
         this.#lastFragmentCount = this.#parts.length;
-        messages.push({ version, body: Buffer.concat(this.#parts) });
+        messages.push({ version, body: Buffer.concat(this.#parts), fragmentCount: this.#lastFragmentCount });
         this.#parts = []; this.#bytes = 0; this.#version = 0;
         this.#verifier = undefined;
       } else {
@@ -452,9 +452,71 @@ export function responsePayload(body, expectedFunction, sequence, verifiedTlsCre
   return { cursor, payload, statusDetails };
 }
 
+/** @typedef {{subscriptionRid:number,changeCounter:number,referenceIds:number[],maxItems?:number,maxBytes?:number}} DataNotificationOwner */
+
+/** @param {DataNotificationOwner} owner */
+export function validateDataNotificationOwner(owner) {
+  const validId = /** @param {number} value */ value => Number.isSafeInteger(value) && value > 0 && value <= 0xFFFFFFFF;
+  if (!owner || !validId(owner.subscriptionRid) || !Number.isInteger(owner.changeCounter) || owner.changeCounter < 1 || owner.changeCounter > 255
+    || !Array.isArray(owner.referenceIds) || !owner.referenceIds.length || owner.referenceIds.length > 4096
+    || owner.referenceIds.some(id => !validId(id)) || new Set(owner.referenceIds).size !== owner.referenceIds.length) {
+    throw new PlusError('ARGUMENT', 'Expected a subscription owner, change counter and distinct nonzero UInt32 reference IDs');
+  }
+  const maxItems = owner.maxItems ?? owner.referenceIds.length;
+  const maxBytes = owner.maxBytes ?? 262144;
+  if (!Number.isSafeInteger(maxItems) || maxItems < 1 || maxItems > 4096
+    || !Number.isSafeInteger(maxBytes) || maxBytes < 16 || maxBytes > 1048576) {
+    throw new PlusError('ARGUMENT', 'Notification limits must be 1..4096 items and 16..1048576 bytes');
+  }
+  return { subscriptionRid: owner.subscriptionRid, changeCounter: owner.changeCounter,
+    referenceIds: [...owner.referenceIds], maxItems, maxBytes };
+}
+
+/** @param {{version:number,body:Buffer}} message @param {DataNotificationOwner} owner */
+export function decodeDataNotification(message, owner) {
+  const { maxItems, maxBytes } = validateDataNotificationOwner(owner);
+  if (message.version !== 2) throw new PlusError('UNSUPPORTED_DECODING', 'Data notification decoding currently requires the V2 envelope');
+  if (message.body.length > maxBytes) throw new PlusError('RESPONSE_LIMIT', 'Notification byte budget exceeded');
+  const cursor = new Cursor(message.body);
+  if (cursor.byte() !== 0x33) throw new PlusError('MALFORMED_RESPONSE', 'Expected a data notification opcode');
+  const subscriptionRid = cursor.uint32();
+  if (subscriptionRid !== owner.subscriptionRid) throw new PlusError('CORRELATION', 'Notification subscription owner mismatch');
+  const marker = cursor.take(6);
+  if (!marker.equals(Buffer.from([4, 0, 0, 0, 0, 0]))) throw new PlusError('UNSUPPORTED_DECODING', 'Unqualified notification format marker');
+  const creditTick = cursor.byte();
+  const sequenceNumber = cursor.uint();
+  let changeCounter = cursor.byte();
+  let timestampMicroseconds = null;
+  if (changeCounter === 0) {
+    cursor.offset--;
+    timestampMicroseconds = cursor.take(8).readBigUInt64BE().toString();
+    changeCounter = cursor.byte();
+  }
+  if (changeCounter !== owner.changeCounter) throw new PlusError('CORRELATION', 'Notification subscription change counter mismatch');
+  const expected = new Set(owner.referenceIds);
+  const seen = new Set();
+  /** @type {{referenceId:number,status:number,value:PlusValue|null,errorCode:number|null}[]} */
+  const items = [];
+  for (let status = cursor.byte(); status !== 0; status = cursor.byte()) {
+    if (![0x92, 0x9B, 0x03, 0x13].includes(status)) throw new PlusError('UNSUPPORTED_DECODING', 'Unsupported data notification item status', { status });
+    if (items.length >= maxItems) throw new PlusError('RESPONSE_LIMIT', 'Notification item budget exceeded');
+    const referenceId = status === 0x9B ? cursor.uint() : cursor.uint32();
+    if (!expected.has(referenceId)) throw new PlusError('CORRELATION', 'Unknown notification item reference', { referenceId });
+    if (seen.has(referenceId)) throw new PlusError('MALFORMED_RESPONSE', 'Duplicate notification item reference', { referenceId });
+    seen.add(referenceId);
+    const failed = status === 0x03 || status === 0x13;
+    items.push({ referenceId, status, value: failed ? null : decodeValue(cursor), errorCode: failed ? status : null });
+  }
+  const trailing = cursor.take(cursor.bytes.length - cursor.offset);
+  if (trailing.length) throw new PlusError('UNSUPPORTED_DECODING', 'Trailing notification data or alarm extensions are not qualified');
+  return { subscriptionRid, creditTick, sequenceNumber, changeCounter, timestampMicroseconds, items,
+    timestampSemantics: 'REFERENCE_MICROSECONDS_NOT_QUALIFIED_SCAN_TIME',
+    completeness: 'DELTA_ITEMS_NOT_FULL_SNAPSHOT', rawBody: Buffer.from(message.body) };
+}
+
 /** @typedef {{code:number,optimizedOffset:number,standardOffset:number,relationId:number|null,dimensions:{lowerBound:number,count:number}[],raw:Buffer}} TypeOffset */
 /** @typedef {{lid:number,symbolCrc:number,softdatatype:number,attributeFlags:number,bitFlags:number,offset:TypeOffset}} TypeMember */
-/** @typedef {{rid:number,classId:number,classFlags:number,attributeId:number,attributeFlags?:number,parentRid:number|null,attributes:{id:number,value:PlusValue}[],typeMembers?:TypeMember[],memberNames?:string[],firstMemberId?:number}} PlusObject */
+/** @typedef {{rid:number,classId:number,classFlags:number,attributeId:number,attributeFlags?:number,parentRid:number|null,attributes:{id:number,value:PlusValue}[],relations?:{id:number,targetRid:number}[],typeMembers?:TypeMember[],memberNames?:string[],firstMemberId?:number}} PlusObject */
 
 /** @param {Cursor} cursor @returns {TypeOffset} */
 function decodeTypeOffset(cursor, code = 8) {
@@ -549,6 +611,13 @@ export function decodeObjects(cursor, maxObjects = 65536, maxDepth = 256) {
       const current = /** @type {PlusObject} */ (stack.at(-1));
       if (current.attributes.length >= 128) throw new PlusError('RESPONSE_LIMIT', 'Attribute budget exceeded');
       current.attributes.push({ id: cursor.uint(), value: decodeValue(cursor) });
+    } else if (tag === 0xA4 && stack.length) {
+      const current = /** @type {PlusObject} */ (stack.at(-1));
+      const relations = current.relations ??= [];
+      if (relations.length >= 128) throw new PlusError('RESPONSE_LIMIT', 'Relation budget exceeded');
+      const id = cursor.uint();
+      if (relations.some(relation => relation.id === id)) throw new PlusError('MALFORMED_METADATA', 'Duplicate object relation');
+      relations.push({ id, targetRid: cursor.uint32() });
     } else if (tag === 0xAB && stack.length) {
       const current = /** @type {PlusObject} */ (stack.at(-1));
       if (current.typeMembers) throw new PlusError('MALFORMED_METADATA', 'Duplicate type-member list');

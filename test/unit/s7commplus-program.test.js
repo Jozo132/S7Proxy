@@ -1,6 +1,6 @@
 // @ts-check
 import { describe, expect, it } from 'vitest';
-import { decodeProgramInventory } from '../../src/protocol/s7commplus/block-inventory.js';
+import { decodeProgramInventory, decodeProgramEventMetadata } from '../../src/protocol/s7commplus/block-inventory.js';
 import { getOperationPolicy } from '../../src/protocol/s7commplus/operation-policy.js';
 import { BLOCK_CONTENT_ATTRIBUTES } from '../../src/protocol/s7commplus/operation-policy.js';
 import { decodeBlockContent } from '../../src/protocol/s7commplus/block-upload.js';
@@ -97,6 +97,117 @@ describe('native program inventory', () => {
       expect(server.requests.slice(5).map(request => request.functionCode)).toEqual([0x04BB, 0x04BB]);
       expect(server.errors).toEqual([]);
     } finally { await client.disconnect(); await server.close(); }
+  });
+});
+
+describe('native program event metadata', () => {
+  function samples() {
+    const program = inventory();
+    const root = { rid: 10, classId: 2483, classFlags: 0, attributeId: 0, parentRid: 3,
+      attributes: [{ id: 233, value: { flags: 0, datatype: 21, value: 'SWEvents', raw: Buffer.alloc(0) } }] };
+    program.objects.push(root);
+    const event = { rid: 96, classId: 2059, classFlags: 0, attributeId: 0, parentRid: 10,
+      attributes: [{ id: 233, value: { flags: 0, datatype: 21, value: 'ProgramCycle', raw: Buffer.alloc(0) } }],
+      relations: [{ id: 2057, targetRid: 0x8A320009 }] };
+    return { inventory: decodeProgramInventory(program), evidence: { objectId: 10,
+      objects: /** @type {import('../../src/protocol/s7commplus/codec.js').PlusObject[]} */ ([{ ...root, parentRid: null }, event]),
+      receivedAt: '2026-01-01T00:00:01.000Z' } };
+  }
+  it('resolves native links by exact RID without claiming execution or revision identity', () => {
+    const sample = samples();
+    const result = decodeProgramEventMetadata(sample.inventory, sample.evidence);
+    expect(result).toMatchObject({ status: 'BOUNDED_METADATA', atomicSnapshot: false, revisionStatus: 'UNKNOWN',
+      blockContentRetrieved: false, relationSemantics: 'UNINTERPRETED_NATIVE_RELATIONS' });
+    expect(result.events[0]).toMatchObject({ name: 'ProgramCycle', objectRid: 96, classId: 2059,
+      relations: [{ id: 2057, targetRid: 0x8A320009, status: 'RESOLVED_IN_INVENTORY', targetBlock: { type: 'OB', number: 9, name: 'Cycle' } }] });
+    expect(result.receivedAt).not.toBe(result.inventoryReceivedAt);
+    result.events[0].nativeAttributes[0].value.value = 'Changed';
+    expect(sample.evidence.objects[1].attributes[0].value.value).toBe('ProgramCycle');
+  });
+  it('preserves unknown relation IDs and unresolved targets without following or guessing them', () => {
+    const sample = samples();
+    sample.evidence.objects[1].relations = [{ id: 0xFFFFFFFE, targetRid: 0x8A320001 }];
+    const result = decodeProgramEventMetadata(sample.inventory, sample.evidence);
+    expect(result.status).toBe('PARTIAL');
+    expect(result.events[0].relations[0]).toMatchObject({ id: 0xFFFFFFFE, targetRid: 0x8A320001, status: 'UNRESOLVED', targetBlock: null });
+    expect(result.diagnostics[0].code).toBe('RELATION_TARGET_UNRESOLVED');
+  });
+  it('keeps missing names and empty relation lists explicit', () => {
+    const sample = samples();
+    sample.evidence.objects[1].attributes = [];
+    sample.evidence.objects[1].relations = [];
+    expect(decodeProgramEventMetadata(sample.inventory, sample.evidence)).toMatchObject({ status: 'PARTIAL',
+      events: [{ name: null, relations: [] }], diagnostics: [{ code: 'EVENT_NAME_UNAVAILABLE' }] });
+  });
+  it('rejects unadvertised or mismatched roots, foreign objects, duplicates and malformed names', () => {
+    for (const mutate of [
+      /** @param {ReturnType<typeof samples>} sample */ sample => { sample.inventory.evidence.objects.pop(); },
+      /** @param {ReturnType<typeof samples>} sample */ sample => { sample.evidence.objects[0].classId = 9999; },
+      /** @param {ReturnType<typeof samples>} sample */ sample => { sample.evidence.objects[1].parentRid = 3; },
+      /** @param {ReturnType<typeof samples>} sample */ sample => { sample.evidence.objects.push(sample.evidence.objects[1]); },
+      /** @param {ReturnType<typeof samples>} sample */ sample => { sample.evidence.objects[1].attributes[0].value.flags = 16; },
+    ]) {
+      const sample = samples(); mutate(sample);
+      expect(() => decodeProgramEventMetadata(sample.inventory, sample.evidence)).toThrow();
+    }
+  });
+  it.each([8, 4])('reads fresh inventory and event metadata without writes in native CPU state %i', async state => {
+    const server = await fixture({ programEvents: 'present', state });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, limits: { maxRequests: 10 } });
+    try {
+      await client.connect();
+      const before = server.requests.length;
+      const result = await client.readProgramEventMetadata({ maxEvents: 16 });
+      expect(result.events[0].relations[0]).toMatchObject({ status: 'RESOLVED_IN_INVENTORY', targetBlock: { type: 'OB', number: 9, name: 'Cycle' } });
+      expect(result.artifactClass).toBe('PROGRAM_EVENT_METADATA');
+      await client.readProgramEventMetadata();
+      expect(server.requests.slice(before).map(request => [request.functionCode, request.frame.readUInt32BE(18)]))
+        .toEqual([[0x04BB, 3], [0x04BB, 10], [0x04BB, 3], [0x04BB, 10]]);
+      expect(client.report.productionReadOnly).toBe(true);
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('does not query an unadvertised container or turn its absence into an empty successful snapshot', async () => {
+    const server = await fixture({ programEvents: 'missing' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const before = server.requests.length;
+      expect(await client.readProgramEventMetadata()).toMatchObject({ status: 'NOT_REPORTED_IN_INVENTORY', events: [], evidence: null });
+      expect(server.requests.slice(before).map(request => request.frame.readUInt32BE(18))).toEqual([3]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('keeps unresolved links partial and stops on a mismatched reply', async () => {
+    for (const mode of /** @type {const} */ (['unresolved', 'mismatch'])) {
+      const server = await fixture({ programEvents: mode });
+      const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+      try {
+        await client.connect();
+        if (mode === 'unresolved') expect(await client.readProgramEventMetadata()).toMatchObject({ status: 'PARTIAL', events: [{ relations: [{ targetBlock: null }] }] });
+        else {
+          await expect(client.readProgramEventMetadata()).rejects.toMatchObject({ code: 'METADATA_MISMATCH' });
+          expect(client.report.failure?.code).toBe('METADATA_MISMATCH');
+        }
+        expect(server.errors).toEqual([]);
+      } finally { await client.disconnect(); await server.close(); }
+    }
+  });
+  it('rejects invalid limits before sending metadata requests', async () => {
+    const server = await fixture({ programEvents: 'present' });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
+    try {
+      await client.connect();
+      const before = server.requests.length;
+      for (const maxEvents of [0, 129, 1.5, NaN]) await expect(client.readProgramEventMetadata({ maxEvents })).rejects.toMatchObject({ code: 'ARGUMENT' });
+      expect(server.requests).toHaveLength(before);
+      expect(client.report.failure).toBeNull();
+    } finally { await client.disconnect(); await server.close(); }
+  });
+  it('enforces explicit event limits instead of silently dropping objects', () => {
+    const sample = samples();
+    sample.evidence.objects.push({ ...sample.evidence.objects[1], rid: 107 });
+    expect(() => decodeProgramEventMetadata(sample.inventory, sample.evidence, 1)).toThrow(/maxEvents/);
+    for (const limit of [0, 129, 1.5, NaN]) expect(() => decodeProgramEventMetadata(sample.inventory, sample.evidence, limit)).toThrow(/maxEvents/);
   });
 });
 

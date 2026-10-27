@@ -79,7 +79,7 @@ export function validateSessionRequest(request, index, secure = false, reference
   return functionCode;
 }
 
-/** @param {FixtureOptions & {currentAlarms?:'present'|'empty'|'partial'|'invalidText'|'unknownClass'|'multiple',communicationResources?:'complete'|'partial'|'invalid'|'duplicate'|'outOfRange'|'badTail',cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number,readStall?:boolean,resetOnDisconnect?:boolean,resetOnRead?:boolean}} [options] */
+/** @param {FixtureOptions & {programEvents?:'present'|'missing'|'mismatch'|'unresolved',currentAlarms?:'present'|'empty'|'partial'|'invalidText'|'unknownClass'|'multiple',communicationResources?:'complete'|'partial'|'invalid'|'duplicate'|'outOfRange'|'badTail',cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number,readStall?:boolean,resetOnDisconnect?:boolean,resetOnRead?:boolean}} [options] */
 export async function fixture(options = {}) {
   /** @type {import('node:net').Socket[]} */
   const sockets = [];
@@ -202,6 +202,18 @@ export async function fixture(options = {}) {
         if (options.programStall && rid !== 3) return;
         payload = options.programFailure && rid === 0x8A130008 ? Buffer.from([1])
           : Buffer.concat([Buffer.from([0]), programExplore(rid, options.programEmpty ?? false, options.programProtected ? 1 : 0)]);
+      }
+      if (options.programEvents && functionCode === 0x04BB && request.readUInt32BE(18) !== 52) {
+        const rid = request.readUInt32BE(18);
+        assert.ok([3, 10].includes(rid), 'Event metadata must not follow targets or read block content');
+        const container = object(10, [{ id: 233, raw: Buffer.from([0, 21, 8, ...Buffer.from('SWEvents')]) }], 2483);
+        const event = object(96, [{ id: 233, raw: Buffer.from([0, 21, 12, ...Buffer.from('ProgramCycle')]) }], 2059);
+        const linkedEvent = Buffer.concat([event.subarray(0, -1), Buffer.from([0xA4]), vlq(2057),
+          u32(options.programEvents === 'unresolved' ? 0x8A320099 : 0x8A320009), Buffer.from([0xA2])]);
+        payload = Buffer.concat([Buffer.from([0]), rid === 3
+          ? Buffer.concat([programExplore(3, false).subarray(0, -1), ...(options.programEvents === 'missing' ? [] : [container]), Buffer.from([0xA2])])
+          : options.programEvents === 'mismatch' ? object(10, [], 9999)
+          : Buffer.concat([container.subarray(0, -1), linkedEvent, Buffer.from([0xA2])])]);
       }
       if (options.metadata && functionCode === 0x054C && !options.itemError) {
         const cursor = new Cursor(request.subarray(18, -4));

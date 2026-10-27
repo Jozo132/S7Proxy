@@ -159,6 +159,70 @@ exact state transition time. Scan-synchronous guarantees require PLC-side trace,
 timestamps/counters or an explicitly qualified acquisition mechanism. The portal
 shared polling driver is unchanged; this is a separate native benchmark API/CLI.
 
+## Offline Data Notification Foundation
+
+This is **not live subscription support**. The internal `decodeDataNotification`
+and `DataNotificationBuffer` modules accept already assembled V2 bodies offline.
+`PlusReceiveRouter` is the native client's single application dispatcher: replies
+retain the existing sequence/function/integrity checks; notifications require a
+session-local owner token. No live owner registration API or lifecycle wire adapter
+is enabled, so unsolicited live notifications still fail closed. No outgoing
+operation was added and the 22 named native client methods are unchanged.
+
+The supported format is opcode `0x33`, owner RID, the six-byte `040000000000`
+marker, credit tick, UInt32-VLQ sequence, change counter/optional timestamp and
+terminated item records. Status `0x92` uses a fixed UInt32 reference, `0x9B` a VLQ
+reference; `0x03`/`0x13` retain explicit item errors without inventing values.
+Registered references and the expected owner/change counter must match. Unknown
+statuses, markers, versions, duplicate references, truncation and trailing bytes
+(including possible alarm extensions) are rejected, not silently skipped.
+Timestamps remain lossless decimal strings with unqualified reference-microsecond
+semantics; they are not qualified scan times. Each result is a delta, not a full
+snapshot or evidence that omitted members are freshly GOOD.
+
+Limits are 1..4096 items and 16..1048576 body bytes (defaults: registered reference
+count and 262144 bytes). The buffer defaults to 16 slots and 1048576 retained
+wire-body bytes; maxima are 128 slots and 16777216 bytes. This byte accounting is
+not a total JavaScript heap measurement. Overflow drops oldest updates and counts
+them explicitly. Gaps, reordering/ambiguous sequence distances and overflow leave
+a sticky resynchronization requirement. Duplicates are counted and rejected.
+UInt32 modular sequence ordering/wrap is an **offline reference assumption**, not
+hardware qualification. A new buffer does not establish an initial value baseline;
+close discards queued deltas and rejects further input. Caller-supplied owner fields
+are not proof of live session ownership.
+
+`OwnedSubscriptionSession` is an **offline lifecycle adapter**, not a public PLC
+subscription API. Its trusted adapter supplies create/renew/delete-owned/transport-
+abort operations; no wire encoder or live authorization is supplied. The adapter
+must serialize qualified requests, validate actual PLC response ownership and stop
+the transport when aborted. The helper validates receipt session/container IDs,
+child RID uniqueness and opaque handle identity. It never accepts a caller's RID
+as a deletion command, deletes a container, or guesses an object after uncertain
+creation. RIDs cannot be reused within one generation; at most 16 handles may be
+issued. A new session requires explicit recreation and a new baseline, not replay
+of old handles or automatic restoration.
+
+Finite credits use a deliberately narrow **unqualified reference assumption**:
+zero-based ticks below an acknowledged boundary, 1..254 total credits before
+rollover. Initial grants default to 10; explicit renewal only commits after an
+acknowledgement. Unlimited credits, rollover and automatic replenishment are
+rejected. Gaps consume the observed tick distance; duplicates do not extend
+freshness or consume a second credit. Invalid credit windows abort the transport.
+Reported states include `AWAITING_INITIAL`, `CREDIT_EXHAUSTED`, `STALE`,
+`RESYNC_REQUIRED`, `RECENT_DELTA_NOT_GOOD` and `CLOSED`; quality remains `UNKNOWN`.
+Silence is checked using a monotonic clock (default 3000 ms) whenever diagnostics
+are requested; it is not an autonomous staleness event or a PLC timestamp.
+
+Lifecycle calls have bounded deadlines (default 1000 ms, configurable 1..60000 ms).
+Pre-cancelled creation sends nothing; cancellation/timeout after transmission or
+an uncertain acknowledgement aborts without speculative deletion. Normal close
+deletes only acknowledged owned children once, then closes local routing; the
+adapter owner remains responsible for its transport's final normal close.
+Known deltas arriving during deletion are parsed and counted as discarded, never
+queued as fresh samples. Cleanup failure is retained, aborts transport and is not
+retried. Alarm notifications, scan-time/quality qualification and a live lifecycle
+adapter remain unimplemented.
+
 ## Native Current Alarm Diagnostics
 
 On a connected native TLS V2 client in RUN or STOP:
@@ -641,6 +705,56 @@ Discovery is a bounded session snapshot, not a complete program inventory or
 proof of a downloaded project revision. Nested/array reconstruction is covered
 by synthetic tests; it is not blanket hardware qualification for all optimized
 DBs, FB sections or multi-instance layouts.
+
+### Native software-event metadata
+
+Generic `explore` now preserves native object relations as optional
+`object.relations: Array<{id:number,targetRid:number}>`. Element `0xA4` carries a
+VLQ relation ID and a big-endian UInt32 target RID, independently checked against
+the pinned C# reference's `Core/PObject.cs` and `Core/ElementID.cs`. Relations stay
+on their owning object, including nested objects; duplicate IDs, truncated fields
+and more than 128 relations per object fail closed. Unknown elements still stop
+the session. Relation decoding does not automatically follow targets.
+
+`readProgramEventMetadata({maxEvents:128})` turns this into a structured,
+read-only RUN/STOP workflow on a connected client. It freshly inventories the
+program, requires the observed RID/class/parent/name of `SWEvents`, then reads
+only that container. Each event retains its native attributes and relations;
+exact target RIDs are resolved to identified blocks from that same inventory.
+Unknown targets return `PARTIAL` with diagnostics, and an unadvertised container
+returns `NOT_REPORTED_IN_INVENTORY` without a guessed-object query. Exceeding
+`maxEvents` (1..128) or receiving a mismatched tree stops the session rather than
+silently dropping records. Calls are not cached and never follow relation targets.
+
+```js
+const snapshot = await plc.readProgramEventMetadata({ maxEvents: 128 });
+for (const event of snapshot.events) console.log(event.name, event.relations);
+```
+
+The result includes raw evidence, inventory, controller identity, receipt times,
+`atomicSnapshot: false` and `revisionStatus: 'UNKNOWN'`. Resolved targets are
+identity matches, not a decoded meaning for every relation ID. Event names do
+not establish active faults or prove the corresponding code was executed.
+
+A bounded CPU1212C V4.5 lab read recovered the observed `SWEvents` container and
+12 software-event objects. `ProgramCycle` (RID 96) returned relation ID 2057 to
+`0x8A320001`, independently matching OB1 `Main` in the same session's inventory.
+The other 11 event objects returned no relations. This is native program/event
+metadata, not a PLC execution trace, fault history or runtime revision proof.
+
+The observed `RuntimeMeters` object (RID 86/class 7825) returned 14 attributes,
+including two native structs. Numeric fields were zero and the Boolean field was
+false. Their meanings, units and activation requirements are not qualified; this
+is not a typed CPU cycle/load API. The identity-checked nine-request session ended
+in RUN and disconnected, with `report.failure: null` and a late ECONNRESET
+teardown warning. TLS remained unverified. Program-content security gates below
+are unchanged. See the parent runtime report for retained raw evidence.
+
+The structured API was separately qualified on that lab target: eight requests,
+12 events and the same exact OB1 link, final RUN/read-only/disconnected, no main
+failure and the existing late reset warning. TLS remained unverified. This adds
+a usable metadata workflow, not a claim of novel protocol discovery or greater
+overall coverage than the reference libraries.
 
 ### Native program content as in-memory files
 
