@@ -145,5 +145,8 @@ export function loadConfig(configPath, overrides = {}) {
     metrics: { ...DEFAULT_CONFIG.metrics, ...fileConfig.metrics },
   };
 
+  if (config.listen.mode !== undefined && !['classic', 'passthrough'].includes(config.listen.mode)) {
+    throw new Error('listen.mode must be classic or passthrough');
+  }
   return config;
 }

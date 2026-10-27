@@ -186,7 +186,7 @@
 
 /**
  * @typedef {Object} S7ProxyConfig
- * @property {{ ip: string; port: number }} listen
+ * @property {{ ip: string; port: number; mode?: 'classic' | 'passthrough' }} listen
  * @property {PlcTarget[]} targets
  * @property {RoutingRule[]} routing
  * @property {FilterRule[]} filters

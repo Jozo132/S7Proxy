@@ -8,6 +8,7 @@ import { ConnectionPool } from './client/connection-pool.js';
 import { TcpListener } from './server/tcp-listener.js';
 import { ClientSession } from './server/client-session.js';
 import { ProxyRouter } from './router/router.js';
+import { PassthroughRouter } from './router/passthrough-router.js';
 import { DaqEngine } from './daq/daq-engine.js';
 import { RestServer } from './api/rest-server.js';
 import { WsServer } from './api/ws-server.js';
@@ -38,6 +39,8 @@ export class ProxyServer {
   #tcpListener = null;
   /** @type {ProxyRouter | null} */
   #router = null;
+  /** @type {PassthroughRouter | null} */
+  #passthroughRouter = null;
   /** @type {DaqEngine | null} */
   #daq = null;
   /** @type {RestServer | null} */
@@ -156,6 +159,13 @@ export class ProxyServer {
     if (idx === -1) this.#config.targets.push(target);
     else this.#config.targets[idx] = { ...this.#config.targets[idx], ...target };
 
+    if (this.#passthroughRouter) {
+      const replacement = new PassthroughRouter(this.#config, this.#logger, this.#metrics);
+      this.#passthroughRouter.close();
+      this.#passthroughRouter = replacement;
+      this.#adminWs?.broadcastState();
+      return { active: true, targetId: target.id, reconfigured: true };
+    }
     if (!this.#bridge || !this.#tcpListener) {
       this.#adminWs?.broadcastState();
       return { active: false, requiresRestart: false };
@@ -189,6 +199,14 @@ export class ProxyServer {
     const idx = this.#config.targets.findIndex((t) => t.id === targetId);
     if (idx !== -1) this.#config.targets.splice(idx, 1);
 
+    if (this.#passthroughRouter) {
+      this.#config.routing = (this.#config.routing ?? []).filter(rule => rule.targetId !== targetId);
+      const replacement = new PassthroughRouter(this.#config, this.#logger, this.#metrics);
+      this.#passthroughRouter.close();
+      this.#passthroughRouter = replacement;
+      this.#adminWs?.broadcastState();
+      return { active: false, targetId };
+    }
     const wasActive = this.#pool?.targetId === targetId;
     if (!wasActive) {
       this.#adminWs?.broadcastState();
@@ -293,6 +311,10 @@ export class ProxyServer {
     if (!this.#tcpListener || this.#routerConnectionHandlerInstalled) return;
 
     this.#tcpListener.on('connection', (socket) => {
+      if (this.#passthroughRouter) {
+        this.#passthroughRouter.handleConnection(socket);
+        return;
+      }
       if (!this.#bridge || !this.#router) {
         socket.destroy();
         return;
@@ -306,6 +328,12 @@ export class ProxyServer {
   }
 
   async start() {
+    if (this.#config.listen.mode !== undefined && !['classic', 'passthrough'].includes(this.#config.listen.mode)) {
+      throw new Error('listen.mode must be classic or passthrough');
+    }
+    if (this.#config.listen.mode === 'passthrough') {
+      this.#passthroughRouter = new PassthroughRouter(this.#config, this.#logger, this.#metrics);
+    }
     this.#startedAt = Date.now();
     this.#logger.info('Starting S7Proxy...');
 
@@ -319,14 +347,16 @@ export class ProxyServer {
     }
 
     // 1. Load WASM engine
-    const wasmImports = createWasmImports(this.#logger);
-    const engine = await loadWasmEngine(wasmImports);
-    this.#bridge = new WasmBridge(engine);
-    this.#logger.info('WASM engine loaded');
+    if (!this.#passthroughRouter) {
+      const wasmImports = createWasmImports(this.#logger);
+      const engine = await loadWasmEngine(wasmImports);
+      this.#bridge = new WasmBridge(engine);
+      this.#logger.info('WASM engine loaded');
+    }
 
     // 2. Connection pool (first target only for now)
     const target = this.#config.targets[0];
-    if (target) await this.#activateTargetRuntime(target);
+    if (target && !this.#passthroughRouter) await this.#activateTargetRuntime(target);
 
     // 4. TCP listener + router
     this.#tcpListener = new TcpListener(this.#config.listen.port, this.#config.listen.ip, this.#logger);
@@ -454,6 +484,8 @@ export class ProxyServer {
       this.#wsServer = null;
       await this.#restServer?.stop();
       this.#restServer = null;
+      this.#passthroughRouter?.close();
+      this.#passthroughRouter = null;
       await this.#tcpListener?.stop();
       this.#tcpListener = null;
       this.#structs.shutdown();
