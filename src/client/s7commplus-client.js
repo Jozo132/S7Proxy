@@ -773,6 +773,35 @@ export class S7CommPlusClient {
     return this.#bindDiscovery({ block: nativeBlock, members: structuredClone(members), diagnostics: [], evidence: [evidence], completeness: 'ARCHIVE_UNVERIFIED', receivedAt: new Date().toISOString() });
   }
 
+  /** @param {MemberDiscovery<BlockMetadata|AreaMetadata>} discovery */
+  bindCachedMembers(discovery) {
+    this.#requireReady();
+    const { block, members } = discovery;
+    const areaRid = { I: 80, Q: 81, M: 82 };
+    const validBlock = block?.type === 'DB'
+      ? Number.isInteger(block.number) && block.number > 0 && block.number <= 65535 && block.objectRid === 0x8A0E0000 + block.number
+      : block && Object.hasOwn(areaRid, block.type) && (!('number' in block) || block.number === 0) && block.objectRid === areaRid[/** @type {'I'|'Q'|'M'} */ (block.type)];
+    if (!validBlock || typeof block.name !== 'string' || !block.name || !Array.isArray(members) || members.length > 1048576) throw new PlusError('ARGUMENT', 'Exact cached DB or process-area identity and bounded members required');
+    const paths = new Set();
+    const addresses = new Set();
+    for (const member of members) {
+      if (!member.readable) continue;
+      if (typeof member.path !== 'string' || !member.path || paths.has(member.path)) throw new PlusError('ARGUMENT', 'Cached member paths must be unique');
+      paths.add(member.path);
+      const address = JSON.stringify(member.accessPath);
+      if (!Array.isArray(member.accessPath) || !member.accessPath.length || member.accessPath.length > 16
+        || member.accessPath.some(lid => !Number.isInteger(lid) || lid < 0 || lid > 0xFFFFFFFF)
+        || !Number.isInteger(member.memberId) || member.memberId < 1 || member.memberId > 0xFFFFFFFF
+        || member.datatype !== SOFTWARE_TYPES[/** @type {keyof typeof SOFTWARE_TYPES} */ (member.softdatatype)] || addresses.has(address)) {
+        throw new PlusError('ARGUMENT', 'Cached members require unambiguous supported scalar LID addresses');
+      }
+      memberValueSize(member);
+      addresses.add(address);
+    }
+    const evidence = { source: 'PLC_CACHE', revisionStatus: 'UNVERIFIED', runtimeMetadataObserved: false };
+    return this.#bindDiscovery({ ...structuredClone(discovery), evidence: [evidence], receivedAt: new Date().toISOString() });
+  }
+
   /** @template {BlockMetadata|AreaMetadata} T @param {T} block @param {{maxTypes:number,maxMembers:number}} limits */
   async #listMembers(block, { maxTypes, maxMembers }) {
     const cached = this.#structures.get(block.objectRid);

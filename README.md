@@ -554,9 +554,26 @@ a stale LID may identify another value of the same type. No fallback discovery,
 retry, writes, CPU-mode changes or role changes are performed. Bind again in each
 new session; never reuse descriptors from a previous or different client.
 
+### Cached PLC Members
+
+`bindCachedMembers(discovery)` binds previously extracted DB or I/Q/M metadata
+in a connected session without inventory or type queries. `discovery.block`
+must identify the exact DB RID (`0x8A0E0000 + number`) or I/Q/M RID (80/81/82).
+Persist structural member metadata, not protocol evidence, observations or old
+handles. Readable entries require unique paths, supported scalar software types
+and unambiguous bounded LID access paths. Unreadable unresolved entries remain
+unbound. The returned members are fresh session-owned handles.
+
+Evidence is `source: 'PLC_CACHE'`, `revisionStatus: 'UNVERIFIED'` and
+`runtimeMetadataObserved: false`. Callers retain the original capture timestamp
+and enforce target/profile/scope isolation. Binding does not establish that the
+PLC program is unchanged; even a GOOD read may address a different value of the
+same type after a download. Refresh explicitly after program changes. No fallback
+discovery or writes are performed.
+
 ### Batch Value Reads
 
-`readMembers(members)` reads 1..4096 descriptors discovered or explicitly archive-bound by the same connected
+`readMembers(members)` reads 1..4096 descriptors discovered or explicitly archive/cache-bound by the same connected
 client and returns lightweight `{ observation }` entries in input order. Combine
 members across DBs to fill packets instead of issuing a small request per DB.
 Plans obey the selected item ceiling, complete request-byte budget, and worst-case
@@ -1395,7 +1412,19 @@ test/
 
 ## Recent Updates
 
-### 0.4.4 (current source)
+### 0.4.6 (current source)
+
+- Add `bindCachedMembers(discovery)` to restore serialized DB and I/Q/M structure metadata into fresh session-owned descriptors without inventory, type queries or first-read rediscovery. Persistence and target/profile/scope isolation remain the caller's responsibility; S7Proxy does not provide database storage.
+- Validate exact DB/process-area RIDs, supported scalar software types and unique bounded LID addresses. Unreadable entries, including unresolved paths, remain unbound. Old session descriptors are still rejected.
+- Mark restored metadata as `PLC_CACHE` with an unverified revision. Binding time is not the original capture time, and successful typed reads do not prove that the PLC program is unchanged. No fallback exploration or writes are performed.
+- Add JSON round-trip and cross-session DB/I/Q/M fixture coverage, including reads without exploration and rejection of invalid identities.
+
+### 0.4.5
+
+- Add `bindArchiveMembers(block, members)` for locally parsed DB declarations, returning fresh session-owned descriptors without PLC inventory or metadata queries.
+- Require exact DB identity and unambiguous supported scalar LID addresses without fabricated native type identities. Archive bindings remain explicitly `ARCHIVE_UNVERIFIED`; refresh metadata after PLC program changes.
+
+### 0.4.4
 
 - Omit the explicit ServerSession.Role=1 request that caused Multi-ES conflicts with TIA Portal. Full DB/I/Q/M discovery and scalar reads succeeded on the tested controller with TIA connected; other firmware and reverse connection order remain unqualified.
 - Report requested and PLC-returned session roles separately from HMI transport identity, with regression coverage and coexistence troubleshooting documentation.

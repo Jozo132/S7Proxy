@@ -39,6 +39,38 @@ describe('archive-backed read descriptors', () => {
     } finally { await client.disconnect(); await server.close(); }
   });
 });
+describe('persisted PLC structure binding', () => {
+  it('rebinds DB and I/Q/M metadata in a fresh session without exploration or old descriptors', async () => {
+    const server = await fixture({ metadata: true });
+    const original = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy', limits: { maxRequests: 256 } });
+    const restored = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy', limits: { maxRequests: 256 } });
+    try {
+      await original.connect();
+      const database = await original.listBlockMembers({ type: 'DB', number: 7 });
+      const areas = [];
+      for (const type of /** @type {const} */ (['I', 'Q', 'M'])) {
+        const { area, ...discovery } = await original.listAreaMembers({ type });
+        areas.push({ block: area, ...discovery });
+      }
+      await original.disconnect();
+      await restored.connect();
+      const before = server.requests.length;
+      const rebound = [database, ...areas].map(({ block, members, completeness }) => restored.bindCachedMembers(JSON.parse(JSON.stringify({
+        block: { type: block.type, name: block.name, objectRid: block.objectRid, number: 'number' in block ? block.number : 0, typeInfoId: block.typeInfoId },
+        members: [...members, { ...members[0], path: null, readable: false }], completeness,
+      }))));
+      expect(server.requests.length).toBe(before);
+      const oldMember = database.members.find(member => member.readable);
+      if (!oldMember) throw new Error('Fixture must provide a readable DB member');
+      await expect(restored.readMember(oldMember)).rejects.toMatchObject({ code: 'UNVERIFIED_ADDRESS' });
+      const members = rebound.flatMap(discovery => discovery.members.filter(member => member.readable).slice(0, 1));
+      expect((await restored.readMembers(members)).length).toBe(4);
+      expect(server.requests.slice(before).every(request => request.functionCode === 0x054C)).toBe(true);
+      expect(rebound[0].evidence).toEqual([expect.objectContaining({ source: 'PLC_CACHE', runtimeMetadataObserved: false })]);
+      expect(() => restored.bindCachedMembers({ ...database, block: { ...database.block, objectRid: 1 } })).toThrow(/identity/);
+    } finally { await original.disconnect(); await restored.disconnect(); await server.close(); }
+  }, 20000);
+});
 describe('S7CommPlus session role policy', () => {
   it('does not request the engineering role when creating a session', () => {
     const frame = encodeOperation({ kind: 'createSession' }, context, 1);
