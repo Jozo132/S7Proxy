@@ -10,7 +10,7 @@ import {
   PlusError, PLUS_FUNCTION, PlusAssembler, Cursor, decodeValue, decodeObjects,
   encodeOperation, assertOutgoing, responsePayload, planReadBatches,
 } from '../protocol/s7commplus/codec.js';
-import { buildBlockMembers, validateMemberValue, memberValueSize } from '../protocol/s7commplus/type-info.js';
+import { buildBlockMembers, validateMemberValue, memberValueSize, SOFTWARE_TYPES } from '../protocol/s7commplus/type-info.js';
 import { decodeProgramInventory, decodeProgramEventMetadata, PROGRAM_INVENTORY_ATTRIBUTES } from '../protocol/s7commplus/block-inventory.js';
 import { BLOCK_CONTENT_ATTRIBUTES, decodeBlockContent } from '../protocol/s7commplus/block-upload.js';
 import { createLegacySessionKey, encodeLegacySecurityKey } from '../protocol/s7commplus/session-key.js';
@@ -743,6 +743,34 @@ export class S7CommPlusClient {
     const limits = this.#discoveryLimits(options);
     const { block: area, ...discovery } = await this.#listMembers(await this.getAreaMetadata(selector), limits);
     return { area, ...discovery };
+  }
+
+  /** @param {{type:'DB',number:number,name:string,objectRid:number}} block @param {RuntimeMember[]} members */
+  bindArchiveMembers(block, members) {
+    this.#requireReady();
+    if (block?.type !== 'DB' || !Number.isInteger(block.number) || block.number < 1 || block.number > 65535
+      || block.objectRid !== 0x8A0E0000 + block.number || typeof block.name !== 'string' || !block.name
+      || !Array.isArray(members) || members.length > 1048576) throw new PlusError('ARGUMENT', 'Exact archive DB identity and bounded members required');
+    const paths = new Set();
+    const addresses = new Set();
+    for (const member of members) {
+      if (typeof member.path !== 'string' || !member.path || paths.has(member.path)) throw new PlusError('ARGUMENT', 'Archive member paths must be unique');
+      paths.add(member.path);
+      if (!member.readable) continue;
+      const address = JSON.stringify(member.accessPath);
+      if (!Array.isArray(member.accessPath) || !member.accessPath.length || member.accessPath.length > 16
+        || member.accessPath.some(lid => !Number.isInteger(lid) || lid < 0 || lid > 0xFFFFFFFF)
+        || !Number.isInteger(member.memberId) || member.memberId < 1 || member.memberId > 0xFFFFFFFF
+        || member.datatype !== SOFTWARE_TYPES[/** @type {keyof typeof SOFTWARE_TYPES} */ (member.softdatatype)]
+        || member.typeInfoId !== null || member.symbolCrc !== 0 || addresses.has(address)) {
+        throw new PlusError('ARGUMENT', 'Archive members require unambiguous scalar LID addresses without invented type identities');
+      }
+      memberValueSize(member);
+      addresses.add(address);
+    }
+    const evidence = { source: 'ARCHIVE_AST', revisionStatus: 'UNVERIFIED', runtimeMetadataObserved: false };
+    const nativeBlock = { ...block, typeInfoId: null, status: 'ARCHIVE_UNVERIFIED', evidence };
+    return this.#bindDiscovery({ block: nativeBlock, members: structuredClone(members), diagnostics: [], evidence: [evidence], completeness: 'ARCHIVE_UNVERIFIED', receivedAt: new Date().toISOString() });
   }
 
   /** @template {BlockMetadata|AreaMetadata} T @param {T} block @param {{maxTypes:number,maxMembers:number}} limits */

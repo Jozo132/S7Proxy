@@ -521,11 +521,42 @@ client; no discovery is repeated per scan. After a program download or online
 edit, explicitly disconnect and rediscover with a new client. Automatic program
 revision detection and cross-session cache import are not implemented. Saved
 structure JSON under ignored experimentation is an audit snapshot, not an
-authorized source of runtime addresses for a new connection.
+authorized source of runtime addresses for a new connection. The explicit local
+archive binding API below is separate from native metadata discovery.
+
+### Archive-Backed Members
+
+`bindArchiveMembers(block, members)` registers locally parsed DB declarations in
+the connected client without sending inventory, metadata or type queries. It
+returns fresh session-owned members usable with `readMember` and `readMembers`.
+It does not verify the archive against the loaded program or replace discovery
+caches. The caller must select a trusted archive and exact controller scope.
+
+`block` requires `type: 'DB'`, a unique DB number from 1 to 65535, its name and
+`objectRid: 0x8A0E0000 + number`. Members use the runtime descriptor shape:
+unique paths, qualified scalar `datatype`/`softdatatype`, serialized `memberId`
+and ordered `accessPath`, `readable`, `status`, `parentPath`, null `typeInfoId`
+and `referencedTypeInfoId`, zero `symbolCrc`, and `arrayDimensions`. No native
+type RID is fabricated from archive declaration/definition IDs. Unsupported or
+ambiguous declarations must be marked unreadable by the archive mapper.
+
+```js
+const bound = client.bindArchiveMembers(archiveBlock, archiveMembers);
+const values = await client.readMembers(bound.members.filter(member => member.readable));
+```
+
+The returned catalogue has `ARCHIVE_UNVERIFIED` completeness and evidence with
+`source: 'ARCHIVE_AST'`, `revisionStatus: 'UNVERIFIED'` and
+`runtimeMetadataObserved: false`. Its local binding time is not a PLC metadata
+receipt. Actual reads retain normal wire datatype, response correlation and
+integrity checks. A GOOD typed value cannot prove archive/executable equivalence:
+a stale LID may identify another value of the same type. No fallback discovery,
+retry, writes, CPU-mode changes or role changes are performed. Bind again in each
+new session; never reuse descriptors from a previous or different client.
 
 ### Batch Value Reads
 
-`readMembers(members)` reads 1..4096 descriptors discovered by the same connected
+`readMembers(members)` reads 1..4096 descriptors discovered or explicitly archive-bound by the same connected
 client and returns lightweight `{ observation }` entries in input order. Combine
 members across DBs to fill packets instead of issuing a small request per DB.
 Plans obey the selected item ceiling, complete request-byte budget, and worst-case

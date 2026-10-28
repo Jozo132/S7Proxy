@@ -14,6 +14,31 @@ import { DataNotificationBuffer, PlusReceiveRouter } from '../../src/protocol/s7
 import { OwnedSubscriptionSession } from '../../src/protocol/s7commplus/subscription-session.js';
 
 const context = { version: 1, sessionId: 0x12345678 };
+describe('archive-backed read descriptors', () => {
+  it('binds local LIDs without PLC structure requests and validates actual values', async () => {
+    const server = await fixture();
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy' });
+    const member = { path: 'Value', parentPath: null, datatype: 'DINT', softdatatype: 7, memberId: 101, typeInfoId: null,
+      referencedTypeInfoId: null, accessPath: [101], symbolCrc: 0, arrayDimensions: [], readable: true, status: 'ARCHIVE_UNVERIFIED' };
+    const block = { type: /** @type {const} */ ('DB'), number: 7, name: 'Sample', objectRid: 0x8A0E0007 };
+    try {
+      await client.connect();
+      const before = server.requests.length;
+      const bound = client.bindArchiveMembers(block, [member]);
+      expect(server.requests.length).toBe(before);
+      member.accessPath[0] = 999;
+      expect(bound.members[0].accessPath).toEqual([101]);
+      const samples = await client.readMembers(bound.members);
+      expect(samples[0].observation.value).toBe(42);
+      expect(bound.evidence).toEqual([expect.objectContaining({ source: 'ARCHIVE_AST', runtimeMetadataObserved: false })]);
+      expect(server.requests.slice(before).map(request => request.functionCode)).toEqual([0x054C]);
+      expect(() => client.bindArchiveMembers({ ...block, objectRid: 1 }, [member])).toThrow(/identity/);
+      expect(() => client.bindArchiveMembers(block, [{ ...member, accessPath: [] }])).toThrow(/LID/);
+      const wrongType = client.bindArchiveMembers(block, [{ ...member, datatype: 'INT', softdatatype: 5 }]);
+      await expect(client.readMembers(wrongType.members)).rejects.toMatchObject({ code: 'DATATYPE_MISMATCH' });
+    } finally { await client.disconnect(); await server.close(); }
+  });
+});
 describe('S7CommPlus session role policy', () => {
   it('does not request the engineering role when creating a session', () => {
     const frame = encodeOperation({ kind: 'createSession' }, context, 1);
