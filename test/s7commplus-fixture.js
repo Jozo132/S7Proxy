@@ -43,6 +43,10 @@ export function normalizedReferenceCreate(frame) {
     assert.ok(offset >= 0 && result.indexOf(before, offset + 1) < 0, 'Exactly one declared reference identity attribute');
     result = Buffer.concat([result.subarray(0, offset), after, result.subarray(offset + before.length)]);
   }
+  const engineeringRole = Buffer.from('a3822b000401', 'hex');
+  const roleOffset = result.indexOf(engineeringRole);
+  assert.ok(roleOffset >= 0 && result.indexOf(engineeringRole, roleOffset + 1) < 0);
+  result = Buffer.concat([result.subarray(0, roleOffset), result.subarray(roleOffset + engineeringRole.length)]);
   result.writeUInt16BE(result.length - 8, 2);
   return result;
 }
@@ -70,8 +74,8 @@ export function validateSessionRequest(request, index, secure = false, reference
     const objects = decodeObjects(new Cursor(payload.subarray(11)));
     assert.equal(objects.length, 2);
     assert.deepEqual(objects.map(entry => [entry.rid, entry.classId, entry.classFlags, entry.attributeId]), [[211, 287, 0, 0], [211, 255, 0, 0]]);
-    assert.deepEqual(objects[0].attributes.map(attribute => attribute.id), [233, 289, 296, 297, 298, 299, 300, 301]);
-    if (!reference) assert.deepEqual(objects[0].attributes.map(attribute => attribute.value.value), ['S7Proxy', '1:::6.0::S7Proxy', 'S7Proxy', '', 'S7Proxy', 1, 0x80C3C901, '']);
+    assert.deepEqual(objects[0].attributes.map(attribute => attribute.id), reference ? [233, 289, 296, 297, 298, 299, 300, 301] : [233, 289, 296, 297, 298, 300, 301]);
+    if (!reference) assert.deepEqual(objects[0].attributes.map(attribute => attribute.value.value), ['S7Proxy', '1:::6.0::S7Proxy', 'S7Proxy', '', 'S7Proxy', 0x80C3C901, '']);
     assert.equal(objects[1].attributes[0].value.value, 'SubscriptionContainer');
     assert.deepEqual(payload.subarray(-4), Buffer.alloc(4));
   }

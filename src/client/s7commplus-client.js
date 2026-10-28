@@ -88,6 +88,8 @@ export class S7CommPlusClient {
   #baselines = new Map();
   #ready = false;
   #established = false;
+  /** @type {number|null} */
+  #serverSessionRole = null;
   #phase = 'idle';
   /** @type {string|undefined} */
   #failurePhase;
@@ -182,6 +184,7 @@ export class S7CommPlusClient {
       target: { host: this.#host, port: this.#port }, productionReadOnly: this.productionReadOnly, phase: this.#phase,
       connected: this.connected, protocol: 'S7CommPlus', protocolVersion: this.#version,
       sessionEstablished: this.#established, securityMode: this.#tlsVerified ? 'TLS_VERIFIED' : this.#options.securityMode === 'tls' ? 'TLS_UNVERIFIED' : this.#legacyAuthenticated ? 'LEGACY_SESSION_KEY_INTEGRITY' : 'UNAUTHENTICATED_DISCOVERY',
+      sessionRole: { requested: null, returned: this.#serverSessionRole },
       selectedProfile: this.#options.securityMode === 'tls' ? 'TLS' : 'LEGACY_PLAINTEXT',
       allowAnyCertificate: this.#options.tls?.allowAnyCertificate === true,
       peerCertificateSha256: this.#peerCertificateSha256,
@@ -268,6 +271,10 @@ export class S7CommPlusClient {
       const versionValue = versions[0].value;
       this.#serverVersion = versionValue.raw;
       this.#extractIdentity(versionValue);
+      const roles = sessionObjects[0].attributes.filter(attribute => attribute.id === 299);
+      if (roles.length === 1 && roles[0].value.flags === 0 && roles[0].value.datatype === 4 && Number.isInteger(roles[0].value.value)) {
+        this.#serverSessionRole = Number(roles[0].value.value);
+      }
       const securedRole = attributes.some(attribute => attribute.id === 299 && (Number(attribute.value.value) & 0x20000000));
       const challenges = sessionObjects[0].attributes.filter(attribute => attribute.id === 303);
       let legacyMaterial;

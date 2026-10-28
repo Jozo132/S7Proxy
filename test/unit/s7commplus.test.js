@@ -14,6 +14,27 @@ import { DataNotificationBuffer, PlusReceiveRouter } from '../../src/protocol/s7
 import { OwnedSubscriptionSession } from '../../src/protocol/s7commplus/subscription-session.js';
 
 const context = { version: 1, sessionId: 0x12345678 };
+describe('S7CommPlus session role policy', () => {
+  it('does not request the engineering role when creating a session', () => {
+    const frame = encodeOperation({ kind: 'createSession' }, context, 1);
+    const payload = frame.subarray(18, -4);
+    const objects = decodeObjects(new Cursor(payload.subarray(11)));
+    const session = objects.find(object => object.classId === 287);
+    expect(session?.attributes.some(attribute => attribute.id === 299)).toBe(false);
+    expect(session?.attributes.find(attribute => attribute.id === 300)?.value.value).toBe(0x80C3C901);
+    expect(() => validateSessionRequest(frame, 1)).not.toThrow();
+  });
+  it('reports the omitted request and an unavailable returned role without inferring a PLC role', async () => {
+    const server = await fixture();
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy' });
+    try {
+      await client.connect();
+      expect(client.report.sessionRole).toEqual({ requested: null, returned: null });
+      expect(client.report.concurrency.connectionType).toBe('HMI');
+      expect(server.errors).toEqual([]);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+});
 describe('offline data notification decoding', () => {
   const owner = { subscriptionRid: 0x10000001, changeCounter: 1, referenceIds: [1, 128, 300] };
   const header = Buffer.from('331000000104000000000005810001', 'hex');

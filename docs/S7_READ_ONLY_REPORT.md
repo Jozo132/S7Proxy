@@ -1,5 +1,126 @@
 # S7 Native Read-Only Acquisition Report
 
+## TIA Portal Coexistence and Session Roles (2026-10-28)
+
+### Symptom and Cause
+
+An authorized TLS connection to the configured CPU was rejected while TIA Portal
+was already connected. TCP, COTP and TLS succeeded, but CreateSession
+(`CreateObject`, function `0x04CA`) returned service result -134, classified as
+`ENGINEERING_SESSION_IN_USE` with the message "Service Multi-ES Not Supported".
+Conversely, an established library session had been reported to block engineers
+from connecting TIA Portal. That reverse-order symptom was user-reported, not
+independently reproduced in this qualification.
+
+The client already requested the `SIMATIC-ROOT-HMI` COTP destination TSAP. Its
+CreateSession payload nevertheless explicitly requested `ServerSession.Role`
+(attribute 299) as UDInt(1). Removing only that attribute, while keeping the TSAP,
+client identification, ClientRID and subscription container unchanged, allowed
+the connection with TIA online. The PLC then returned role 2. This isolates the
+observed conflict to the explicit role request; it does not establish a universal
+Siemens role-number taxonomy or imply that HMI transport identity selects a role.
+The rejection occurred before DB exploration, not because discovery later left
+the session in an engineering mode.
+
+### Library Behavior
+
+- `createSessionPayload()` in `src/protocol/s7commplus/codec.js` intentionally
+  omits attribute 299. Do not reintroduce role 1 merely to match a reference
+  client's TIA-style identification frame. No role selector or role-switch API
+  is provided by this fix.
+- `client.report.concurrency.connectionType` is the requested transport identity
+  (`HMI`), not proof of the PLC's effective session role.
+- `client.report.sessionRole.requested` is null because attribute 299 is omitted.
+  `returned` records the role only when the owned ServerSession object contains
+  one unambiguous scalar UDInt attribute 299; otherwise it is null. A null value
+  is unavailable evidence, not role 0 or a coexistence guarantee.
+- Existing rejection of unsupported secured-session authentication remains in
+  force. Omitting the role request does not disable authentication, certificate
+  policy, request integrity, operation allowlists or traffic budgets.
+- The tested inventory, DB/type/member exploration and value-read sequence does
+  not send a role-change request. A separate PG session or post-discovery role
+  downgrade was not needed for that sequence. Other diagnostic and upload
+  services are not qualified by this result.
+
+On the tested controller, a connected report contained:
+
+```json
+{
+  "concurrency": { "connectionType": "HMI" },
+  "sessionRole": { "requested": null, "returned": 2 }
+}
+```
+
+### Live Evidence
+
+The configured CPU 1214C V4.5 was tested with explicit TLS certificate bypass;
+its identity remained `TLS_UNVERIFIED`. Certificate bypass was an existing test
+configuration, not part of the role fix, and is not recommended as a coexistence
+workaround. Exact target identity remains in local experimentation storage.
+
+| Check | Observed result |
+| --- | --- |
+| Original role-1 request with TIA online | CreateSession rejected with -134 before inventory or value reads |
+| Same request with only attribute 299 omitted | Connected, genuine RUN response, PLC-returned role 2 |
+| Bounded initial discovery/read probe | Inventory of 96 DBs, DB1 structure with 23 members, one scalar read with GOOD quality |
+| Full portal-adapter read-only qualification | 96 DBs plus I/Q/M metadata, 1,314 readable members, three scalar reads, 152 requests, approximately 42.9 seconds |
+| Metadata limitation | DB78 retained an incomplete-member-names warning |
+| Cached source load in that session | Zero additional requests |
+| TIA transport | Windows reported an established `Siemens.Automation.Portal` TCP/102 connection before and after the full qualification |
+| Cleanup | Only TIA's established PLC socket remained after test cleanup |
+| Process writes, CPU-mode changes and role switches | None sent |
+
+An established TIA socket is transport evidence, not an operator-observed proof
+that every TIA diagnostic workflow remained responsive. No high-frequency load,
+long-running endurance, other firmware or legacy-security coexistence claim is
+made. In particular, a fresh TIA connection while library monitoring is already
+active still requires an operator-observed test on the target CPU.
+
+### Troubleshooting and Session Lifetime
+
+1. If CreateSession reports Multi-ES, inspect `failure.phase`, `failure.details`,
+   the transport identity and session-role report. Verify the loaded library
+   source actually omits attribute 299; changing only the TSAP is not this fix.
+   Do not automatically retry with role 1, increase connection limits, or ask
+   engineers to release TIA as the normal workaround.
+2. Deploy the corrected native library revision. A consumer-only update cannot
+   change the payload of an older installed library. Restart long-running Node
+   consumers after deployment so their module cache does not retain the old
+   encoder. No release-version guarantee is implied by these source changes.
+3. Keep discovery bounded and reuse metadata within its owning client session.
+   Native member descriptors cannot be reused by a new client after disconnect;
+   consumers retaining display catalogues must obtain fresh session-owned
+   descriptors before reading. Persistent cross-session caching is not provided
+   by this library fix.
+4. Always `await client.disconnect()` in cleanup, including failed attempts.
+   Stopping an application's polling timer does not disconnect the client. A
+   successful discovery does not automatically close its session. Set explicit
+   request/session budgets for the workload and release idle connections rather
+   than relying on the HMI name or the observed role number to reserve engineer
+   access.
+5. Inspect `report.teardownWarning` separately from `connected`. Some successful
+   probes received `ECONNRESET` after closure. `disconnect()` closes the owned
+   transport and aborts queued work; it does not obtain a protocol-level session
+   deletion receipt or prove immediate PLC resource reclamation. Retain the
+   warning and verify target behavior rather than claiming clean deletion.
+
+Regression coverage in `test/unit/s7commplus.test.js` asserts that CreateSession
+does not contain attribute 299, retains ClientRID, matches the intentionally
+adjusted golden frame, and reports unavailable returned-role evidence as null.
+The original independent reference fixture is retained with its role-1 field;
+only normalization to this client's payload removes it. Loopback tests protect
+the wire policy but cannot establish hardware coexistence.
+
+From the library root, run the focused offline regression with:
+
+```sh
+node node_modules/vitest/vitest.mjs run test/unit/s7commplus.test.js -t "session role policy"
+npm run check-types
+```
+
+These commands do not connect to a PLC. Repeat authorized live qualification
+separately for a new controller, firmware, security profile or connection order.
+
 ## Configured-Controller Compatibility Update
 
 The additional authorized 17-target investigation established genuine process

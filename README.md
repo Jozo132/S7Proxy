@@ -931,6 +931,15 @@ security profiles; see the qualification report's CPU-start update.
 
 Each client requests `SIMATIC-ROOT-HMI`, with its own socket, TLS context, session
 ID, sequence/integrity counters, metadata caches and owned member descriptors.
+The transport TSAP does not select or prove the PLC's session role. CreateSession
+intentionally omits `ServerSession.Role` (attribute 299): explicitly requesting
+value 1 caused a Multi-ES conflict with TIA Portal on the tested controller.
+Omitting that attribute allowed the PLC to return role 2 and permitted native
+DB/I/Q/M discovery and scalar reads while TIA remained connected. Do not restore
+the role-1 request or assume a role transition is required after discovery.
+See [TIA Portal coexistence and session roles](docs/S7_READ_ONLY_REPORT.md#tia-portal-coexistence-and-session-roles-2026-10-28)
+for the failure signature, evidence, cleanup behavior and qualification limits.
+
 Multiple clients can connect and issue requests in parallel to the same endpoint.
 The connection registry is scoped to this loaded module in one Node process and
 keyed by case-normalized configured hostname plus port; it does not resolve DNS
@@ -969,18 +978,25 @@ const client = new S7CommPlusClient({
 });
 ```
 
-`client.report.concurrency` reports the HMI role, endpoint connection count,
+`client.report.concurrency` reports the HMI transport identity, endpoint connection count,
 queue capacity/current depth, and single in-flight request limit. No pool is
 created automatically; the caller owns every client and must disconnect all of
 them in cleanup, including failed parallel-connect attempts. The TIA runtime
 continues to share its existing session per approved scope rather than opening
 connections per UI request.
 
+`client.report.sessionRole` separately reports `{ requested, returned }`.
+`requested: null` means the request omitted attribute 299, not that the PLC has
+no role. `returned` is the unambiguous scalar role supplied by the PLC, or null
+when unavailable; the observed value 2 is not a universal firmware guarantee.
+
 CPU start requires an exclusive idle endpoint connection in this process and
 blocks additional connection admission while control is active. STOP, reset and
 generic writes remain denied. These local guards cannot detect a TIA Portal
-connection or a different process. HMI identity and concurrency support do not
-prove PG coexistence or reserve engineering resources on the PLC. Connection
+connection or a different process. HMI transport identity alone does not
+prove PG coexistence or reserve engineering resources on the PLC. The corrected
+session payload has bounded coexistence evidence on one controller, not a
+guarantee for other firmware, operations or connection order. Connection
 caps are library bounds, not measured safe CPU capacity; aggregate traffic can
 increase with each session. Qualify load and real TIA online monitoring on the
 specific CPU/firmware before increasing production concurrency. Loopback tests
@@ -1348,7 +1364,12 @@ test/
 
 ## Recent Updates
 
-### 0.4.3 (current source)
+### 0.4.4 (current source)
+
+- Omit the explicit ServerSession.Role=1 request that caused Multi-ES conflicts with TIA Portal. Full DB/I/Q/M discovery and scalar reads succeeded on the tested controller with TIA connected; other firmware and reverse connection order remain unqualified.
+- Report requested and PLC-returned session roles separately from HMI transport identity, with regression coverage and coexistence troubleshooting documentation.
+
+### 0.4.3
 
 - Explicit `listen.mode: "passthrough"` preserves original COTP/S7Comm/Plus and optional end-to-end TLS over dedicated upstream sockets. No classic probes/pool/DAQ, TLS termination, retries or mid-session failover; connection filters and the production raw-forwarding gate remain enforced.
 - Fresh native communication-resource and current-alarm snapshots, plus structured software-event metadata with bounded native relations. Current alarms are not diagnostic history; event links are not execution or revision proof.
