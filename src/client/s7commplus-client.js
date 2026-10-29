@@ -97,6 +97,11 @@ function decodeClassicOffsetValue(member, value) {
       : member.softdatatype === 64 ? { unit: 'ns', signed: true, bits: 64 } : null };
 }
 
+/** @param {unknown} error */
+function recoverableReadError(error) {
+  return ['PLC_REJECTED', 'ITEM_REJECTED', 'DATA_UNAVAILABLE', 'DATATYPE_MISMATCH', 'UNSUPPORTED_DATATYPE'].includes(/** @type {{code?:string}} */ (error)?.code ?? '');
+}
+
 /** @param {RuntimeMember} member */
 function readValueBudget(member) {
   return member.accessMode === 'CLASSIC_OFFSET' ? classicOffsetWidth(member) + 4 : memberValueSize(member);
@@ -401,7 +406,11 @@ export class S7CommPlusClient {
       const objects = decodeObjects(response.cursor, this.#limits.maxObjects, this.#limits.maxDepth);
       return { objectId, returnedExploreId, objects, receivedAt: new Date().toISOString(), completeness: 'BOUNDED_RESPONSE_NOT_FULL_INVENTORY',
         correlation: response.correlation };
-    } catch (error) { this.#stop(this.#asError(error)); throw error; }
+    } catch (error) {
+      const failure = this.#asError(error);
+      if (!recoverableReadError(failure)) this.#stop(failure);
+      throw failure;
+    }
   }
 
   async readCpuState() {
@@ -459,7 +468,11 @@ export class S7CommPlusClient {
         request: { sequence: response.correlation.sequence, integrityId: response.correlation.integrityId, ...response.timing },
         semantics: { itemLimitDirection: 'REFERENCE_ASSUMPTION', subscriptionMemoryUnit: 'UNKNOWN', connectionCapacity: 'NOT_REPORTED', atomicSnapshot: false },
         evidence: { schemaReference: 'thomas-v2/S7CommPlusDriver@dbd61e447c7aaf4486cf1f1fe0201212a6bd93c8:Core/CommRessources.cs', correlation: response.correlation } };
-    } catch (error) { this.#stop(this.#asError(error)); throw error; }
+    } catch (error) {
+      const failure = this.#asError(error);
+      if (!recoverableReadError(failure)) this.#stop(failure);
+      throw failure;
+    }
   }
 
   /** @param {boolean} [allowCpuStart] */
@@ -957,10 +970,28 @@ export class S7CommPlusClient {
         observation: result.observation, evidence: { metadata: structuredClone(binding.metadataEvidence), response: {
           address: { accessArea: block.objectRid, accessSubArea: 2550, lids: [3, native.byteOffset, native.byteSize] }, request: result.request, status: 'GOOD' } } };
     }
-    const observation = await this.readSymbolic({ accessArea: block.objectRid, lids: native.accessPath, symbolCrc: 0 });
+    let observation;
     let decoded;
-    try { decoded = validateMemberValue(native, observation.value); }
-    catch (error) { this.#stop(this.#asError(error)); throw error; }
+    try {
+      observation = await this.readSymbolic({ accessArea: block.objectRid, lids: native.accessPath, symbolCrc: 0 });
+      decoded = validateMemberValue(native, observation.value);
+    } catch (error) {
+      const failure = this.#asError(error);
+      if (!recoverableReadError(failure)) throw failure;
+      const value = observation?.value;
+      return { block: structuredClone(block), symbol: structuredClone(native),
+        runtime: { protocol: 's7commplus', objectRid: block.objectRid, typeInfoId: block.typeInfoId,
+          memberTypeInfoId: native.typeInfoId, memberId: native.memberId, accessPath: [...native.accessPath],
+          symbolCrc: 0, metadataSymbolCrc: native.symbolCrc },
+        observation: { datatype: native.datatype, value: value?.value ?? null, quality: 'MISMATCH', status: failure.code,
+          message: failure.message, expectedDatatype: native.datatype, actualWireType: value?.datatype,
+          receivedAt: new Date().toISOString(), nativeTimestamp: null },
+        evidence: { metadata: structuredClone(binding.metadataEvidence), response: {
+          address: { accessArea: block.objectRid, lids: [...native.accessPath], symbolCrc: 0 }, value: value ?? { value: null },
+          status: 'MISMATCH', receivedAt: new Date().toISOString(), nativeTimestamp: null,
+          error: { code: failure.code, message: failure.message },
+        } } };
+    }
     return { block: structuredClone(block), symbol: structuredClone(native),
       runtime: { protocol: 's7commplus', objectRid: block.objectRid, typeInfoId: block.typeInfoId,
         memberTypeInfoId: native.typeInfoId, memberId: native.memberId, accessPath: [...native.accessPath],
@@ -984,48 +1015,112 @@ export class S7CommPlusClient {
         if (!binding) throw new PlusError('UNVERIFIED_ADDRESS', 'Use readable members discovered by this client session');
         return binding;
       });
-      const addresses = bindings.map(binding => binding.member.accessMode === 'CLASSIC_OFFSET'
-        ? { accessArea: binding.block.objectRid, accessSubArea: 2550, lids: [3, binding.member.byteOffset, binding.member.byteSize] }
-        : { accessArea: binding.block.objectRid, lids: binding.member.accessPath, symbolCrc: 0 });
+      /** @type {{accessArea:number,accessSubArea?:number,lids:number[],symbolCrc?:number}[]} */
+      const addresses = bindings.map(binding => {
+        if (binding.member.accessMode === 'CLASSIC_OFFSET') {
+          classicOffsetWidth(binding.member);
+          return { accessArea: binding.block.objectRid, accessSubArea: 2550,
+            lids: [3, /** @type {number} */ (binding.member.byteOffset), /** @type {number} */ (binding.member.byteSize)] };
+        }
+        return { accessArea: binding.block.objectRid, lids: binding.member.accessPath, symbolCrc: 0 };
+      });
       const batches = planReadBatches(addresses, bindings.map(binding => readValueBudget(binding.member)),
         { sessionId: this.#sessionId, version: this.#version, sessionKey: this.#sessionKey, integrityId: this.#tls ? this.#integrityId : undefined }, { ...this.#limits, maxItems });
       plan = { maxItems, members: [...members], bindings, operations: batches.map(indices => ({ kind: 'read', maxItems, items: indices.map(index => addresses[index]) })) };
       this.#readPlans.set(members, plan);
     }
+    if (!plan) throw new PlusError('SESSION_STATE', 'Read plan unavailable');
     if (plan.operations.length > this.#limits.maxRequests - this.#requests) throw new PlusError('REQUEST_LIMIT', 'Remaining request budget cannot cover the full batch plan');
     const results = [];
     let offset = 0;
+    /** @param {ExchangeResult} response @param {number} count */
+    const parse = (response, count) => {
+      const values = new Map();
+      const errors = new Map();
+      let item;
+      while ((item = response.cursor.uint()) !== 0) {
+        if (item > count || values.has(item)) throw new PlusError('MALFORMED_RESPONSE', 'Duplicate or out-of-range read item');
+        values.set(item, decodeValue(response.cursor));
+      }
+      while ((item = response.cursor.uint()) !== 0) {
+        if (item > count || values.has(item) || errors.has(item)) throw new PlusError('MALFORMED_RESPONSE', 'Duplicate or out-of-range error item');
+        errors.set(item, response.cursor.integer(64));
+      }
+      this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
+      return { values, errors };
+    };
+    /** @param {RuntimeMember} member @param {PlusError} error @param {PlusValue|undefined} rawValue @param {ExchangeResult|undefined} response */
+    const mismatched = (member, error, rawValue, response) => ({
+      request: response ? { sequence: response.correlation.sequence, integrityId: response.correlation.integrityId, ...response.timing } : undefined,
+      observation: { datatype: member.datatype, value: rawValue?.value ?? null, quality: 'MISMATCH', status: error.code ?? 'READ_REJECTED',
+        message: error.message, expectedDatatype: member.datatype, actualWireType: rawValue?.datatype,
+        receivedAt: new Date().toISOString(), nativeTimestamp: null },
+    });
+    /** @param {RuntimeMember} member @param {{accessArea:number,accessSubArea?:number,lids:number[],symbolCrc?:number}} address */
+    const readOne = async (member, address) => {
+      let response;
+      try { response = await this.#exchange({ kind: 'read', maxItems: 1, items: [address] }); }
+      catch (error) {
+        const failure = this.#asError(error);
+        if (!recoverableReadError(failure)) throw failure;
+        return mismatched(member, failure, undefined, undefined);
+      }
+      const { values, errors } = parse(response, 1);
+      if (errors.has(1)) return mismatched(member, new PlusError('ITEM_REJECTED', `Native item rejected with code 0x${errors.get(1).toString(16)}`), undefined, response);
+      const rawValue = values.get(1);
+      if (!rawValue) return mismatched(member, new PlusError('DATA_UNAVAILABLE', 'PLC omitted this read item'), undefined, response);
+      try {
+        const decoded = member.accessMode === 'CLASSIC_OFFSET' ? decodeClassicOffsetValue(member, rawValue) : validateMemberValue(member, rawValue);
+        return { request: { sequence: response.correlation.sequence, integrityId: response.correlation.integrityId, ...response.timing }, observation: {
+          ...decoded, quality: 'GOOD', status: 'GOOD', source: 'S7COMMPLUS_RESPONSE', receivedAt: new Date().toISOString(), nativeTimestamp: null,
+        } };
+      } catch (error) {
+        const failure = this.#asError(error);
+        if (!recoverableReadError(failure)) throw failure;
+        return mismatched(member, failure, rawValue, response);
+      }
+    };
     try {
       for (const operation of plan.operations) {
-        const count = operation.items?.length ?? 0;
-        const response = await this.#exchange(operation);
-        const values = new Map();
-        const errors = new Map();
-        let item;
-        while ((item = response.cursor.uint()) !== 0) {
-          if (item > count || values.has(item)) throw new PlusError('MALFORMED_RESPONSE', 'Duplicate or out-of-range read item');
-          values.set(item, decodeValue(response.cursor));
+        const operationItems = operation.items ?? [];
+        const count = operationItems.length;
+        const start = offset;
+        let response;
+        try { response = await this.#exchange(operation); }
+        catch (error) {
+          const failure = this.#asError(error);
+          if (failure.code !== 'PLC_REJECTED') throw failure;
+          for (let ordinal = 0; ordinal < count; ordinal++) results.push(await readOne(plan.bindings[start + ordinal].member, operationItems[ordinal]));
+          offset += count;
+          continue;
         }
-        while ((item = response.cursor.uint()) !== 0) {
-          if (item > count || values.has(item) || errors.has(item)) throw new PlusError('MALFORMED_RESPONSE', 'Duplicate or out-of-range error item');
-          errors.set(item, response.cursor.integer(64));
-        }
-        this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
-        if (errors.size) throw new PlusError('ITEM_REJECTED', 'Native batch contains rejected items', { items: [...errors].map(([number, code]) => ({ number, code: code.toString(16) })) });
-        if (values.size !== count) throw new PlusError('DATA_UNAVAILABLE', 'PLC omitted one or more requested items');
-        const receivedAt = new Date().toISOString();
+        const { values, errors } = parse(response, count);
         for (let ordinal = 0; ordinal < count; ordinal++) {
-          const member = plan.bindings[offset + ordinal].member;
-          const decoded = member.accessMode === 'CLASSIC_OFFSET' ? decodeClassicOffsetValue(member, values.get(ordinal + 1))
-            : validateMemberValue(member, values.get(ordinal + 1));
-          results.push({ request: { sequence: response.correlation.sequence, integrityId: response.correlation.integrityId, ...response.timing }, observation: {
-            ...decoded, quality: 'GOOD', source: 'S7COMMPLUS_RESPONSE', receivedAt, nativeTimestamp: null,
-          } });
+          const member = plan.bindings[start + ordinal].member;
+          if (errors.has(ordinal + 1) || !values.has(ordinal + 1)) {
+            results.push(await readOne(member, operationItems[ordinal]));
+            continue;
+          }
+          const rawValue = values.get(ordinal + 1);
+          try {
+            const decoded = member.accessMode === 'CLASSIC_OFFSET' ? decodeClassicOffsetValue(member, rawValue) : validateMemberValue(member, rawValue);
+            results.push({ request: { sequence: response.correlation.sequence, integrityId: response.correlation.integrityId, ...response.timing }, observation: {
+              ...decoded, quality: 'GOOD', status: 'GOOD', source: 'S7COMMPLUS_RESPONSE', receivedAt: new Date().toISOString(), nativeTimestamp: null,
+            } });
+          } catch (error) {
+            const failure = this.#asError(error);
+            if (!recoverableReadError(failure)) throw failure;
+            results.push(mismatched(member, failure, rawValue, response));
+          }
         }
         offset += count;
       }
       return results;
-    } catch (error) { this.#stop(this.#asError(error)); throw error; }
+    } catch (error) {
+      const failure = this.#asError(error);
+      if (!recoverableReadError(failure)) this.#stop(failure);
+      throw failure;
+    }
   }
 
   /** @param {string} name */
@@ -1066,7 +1161,11 @@ export class S7CommPlusClient {
       this.#checkScalarTail(response.cursor, response.expectedIntegrityId);
       return { address: structuredClone(address), value, status: 'GOOD', receivedAt: new Date().toISOString(), nativeTimestamp: null,
         correlation: response.correlation, timing: response.timing };
-    } catch (error) { this.#stop(this.#asError(error)); throw error; }
+    } catch (error) {
+      const failure = this.#asError(error);
+      if (!recoverableReadError(failure)) this.#stop(failure);
+      throw failure;
+    }
   }
 
   /** @param {unknown} [_block] @returns {Promise<never>} */
@@ -1243,7 +1342,7 @@ export class S7CommPlusClient {
           fragmentCount: incoming.fragmentCount } };
     } catch (error) {
       const failure = this.#asError(error);
-      this.#stop(failure);
+      if (!(operation.kind === 'read' && recoverableReadError(failure))) this.#stop(failure);
       throw failure;
     } finally { this.#busy = false; }
   }

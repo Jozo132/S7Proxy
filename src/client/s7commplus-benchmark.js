@@ -155,9 +155,17 @@ export async function runS7CommPlusBenchmark(input, options = {}) {
               if (control.signal.aborted || performance.now() >= deadline) break;
               if (sweeps >= (config.maxSweepsPerLane ?? 10000)) throw new Error(`Lane ${lane.id} sweep budget exhausted`);
               const samples = await client.readMembers(members, { maxItems: lane.maxItems ?? 32 });
-              if (samples.length !== members.length || samples.some(sample => sample.observation.quality !== 'GOOD')) throw new Error(`Lane ${lane.id} returned incomplete or BAD values`);
-              const groups = [...new Map(samples.map(sample => [sample.request.sequence, sample.request])).values()];
-              const first = groups[0].sentAtMonotonicMs;
+              if (samples.length !== members.length) throw new Error(`Lane ${lane.id} returned an incomplete sample set`);
+              const invalidSample = samples.find(sample => sample.observation.quality !== 'GOOD');
+              if (invalidSample) throw new Error(`Lane ${lane.id} returned ${invalidSample.observation.quality} sample (${invalidSample.observation.status ?? 'unknown status'}); benchmark requires GOOD values`);
+              const timedSamples = samples.map(sample => {
+                if (!sample.request) throw new Error(`Lane ${lane.id} returned a GOOD sample without native request timing`);
+                return { ...sample, request: sample.request };
+              });
+              const groups = [...new Map(timedSamples.map(sample => [sample.request.sequence, sample.request])).values()];
+              const firstGroup = groups[0];
+              if (!firstGroup) throw new Error(`Lane ${lane.id} returned no native request timing groups`);
+              const first = firstGroup.sentAtMonotonicMs;
               const last = groups[groups.length - 1].receivedAtMonotonicMs;
               const period = previousSweep === undefined ? undefined : first - previousSweep;
               for (const request of groups) {
@@ -186,7 +194,7 @@ export async function runS7CommPlusBenchmark(input, options = {}) {
               sweeps++; requests += groups.length; values += samples.length;
               const outputStarted = performance.now();
               await emit({ kind: 'sweep', stage: stage.name, lane: lane.id, sweep: sweeps, scheduledAtMonotonicMs: nextDue,
-                requests: groups, values: samples.map(sample => ({ value: sample.observation.value, quality: sample.observation.quality,
+                requests: groups, values: timedSamples.map(sample => ({ value: sample.observation.value, quality: sample.observation.quality,
                   receivedAt: sample.observation.receivedAt, requestSequence: sample.request.sequence })) });
               metrics.outputWaitMs.push(performance.now() - outputStarted);
               if (lane.periodMs) {

@@ -8,7 +8,7 @@ import { FrameAssembler } from '../src/protocol/frame-assembler.js';
 import { Cursor, decodeObjects, decodeValue, u32, vlq } from '../src/protocol/s7commplus/codec.js';
 import { metadataExplore } from './s7commplus-metadata-fixture.js';
 
-/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,initVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},abortTLS?:boolean,stallTLS?:boolean,badIntegrity?:boolean,reference?:boolean,compositeReject?:boolean,nonzeroCreateStatus?:boolean,metadata?:boolean,areaReference?:'invalid'|'zero'|'missing',areaTypeMissing?:boolean,memberError?:boolean,memberTypeMismatch?:boolean,classicOffsetValues?:Record<string,Buffer>,classicOffsetPValues?:Record<string,Buffer>,programContent?:boolean,programFailure?:boolean,programStall?:boolean,programEmpty?:boolean}} FixtureOptions */
+/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,initVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},abortTLS?:boolean,stallTLS?:boolean,badIntegrity?:boolean,reference?:boolean,compositeReject?:boolean,nonzeroCreateStatus?:boolean,metadata?:boolean,areaReference?:'invalid'|'zero'|'missing',areaTypeMissing?:boolean,memberError?:boolean,memberTypeMismatch?:boolean,readRejectLid?:number,classicOffsetValues?:Record<string,Buffer>,classicOffsetPValues?:Record<string,Buffer>,programContent?:boolean,programFailure?:boolean,programStall?:boolean,programEmpty?:boolean}} FixtureOptions */
 
 /** @param {bigint} value */
 export function encodeTestUInt64(value) {
@@ -83,7 +83,7 @@ export function validateSessionRequest(request, index, secure = false, reference
   return functionCode;
 }
 
-/** @param {FixtureOptions & {programEvents?:'present'|'missing'|'mismatch'|'unresolved',currentAlarms?:'present'|'empty'|'partial'|'invalidText'|'unknownClass'|'multiple',communicationResources?:'complete'|'partial'|'invalid'|'duplicate'|'outOfRange'|'badTail',cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number,readStall?:boolean,resetOnDisconnect?:boolean,resetOnRead?:boolean}} [options] */
+/** @param {FixtureOptions & {programEvents?:'present'|'missing'|'mismatch'|'unresolved',currentAlarms?:'present'|'empty'|'partial'|'invalidText'|'unknownClass'|'multiple',communicationResources?:'complete'|'partial'|'invalid'|'duplicate'|'outOfRange'|'badTail',cpuStart?:'success'|'rejected'|'unchanged'|'badIntegrity'|'badTail'|'lost',programProtected?:boolean,states?:number[],inventorySize?:number,tlsDelayMs?:number,legacyInit?:'rejected'|'error2',legacyKey?:{challenge:Buffer,blob:Buffer,sessionKey:Buffer},legacyBadHmac?:boolean,legacyBadCounter?:boolean,legacyDowngrade?:boolean,legacyInventoryDelayMs?:number,readStall?:boolean,resetOnDisconnect?:boolean,resetOnRead?:boolean,readRejectLid?:number}} [options] */
 export async function fixture(options = {}) {
   /** @type {import('node:net').Socket[]} */
   const sockets = [];
@@ -134,6 +134,7 @@ export async function fixture(options = {}) {
         request = Buffer.concat([Buffer.from([0x72, 1, applicationBody.length >> 8, applicationBody.length & 255]), applicationBody, Buffer.from([0x72, 1, 0, 0])]);
       }
       const sequence = request.readUInt16BE(11);
+      const readRejectLid = /** @type {{readRejectLid?:number}} */ (options).readRejectLid;
       let functionCode;
       if (options.legacyKey && requestCount >= 2) {
         functionCode = request.readUInt16BE(7);
@@ -218,6 +219,17 @@ export async function fixture(options = {}) {
           payload = Buffer.concat([Buffer.from([0]), ...values, Buffer.from([0, 0])]);
         } else payload = options.itemError ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
           : Buffer.from([0, 1, 0, 8, 42, 0, 0, ...(options.badTail ? [99] : [])]);
+      }
+      if (functionCode === 0x054C && readRejectLid !== undefined) {
+        const cursor = new Cursor(request.subarray(18, -4));
+        cursor.uint32(); const itemCount = cursor.uint(); cursor.uint();
+        let rejected = false;
+        for (let ordinal = 0; ordinal < itemCount; ordinal++) {
+          cursor.uint(); cursor.uint(); const pathLength = cursor.uint() - 1; cursor.uint();
+          const lids = Array.from({ length: pathLength }, () => cursor.uint());
+          rejected ||= lids.includes(readRejectLid);
+        }
+        if (rejected) payload = encodeTestUInt64(0x2027800001750013n);
       }
       if (options.metadata && functionCode === 0x04BB && request.readUInt32BE(18) !== 52) {
         const typeMissing = options.areaTypeMissing && [0x90010000, 0x90020000, 0x90030000].includes(request.readUInt32BE(18));

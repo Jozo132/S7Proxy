@@ -49,10 +49,13 @@ describe('archive-backed read descriptors', () => {
       expect((await client.readSymbol('DB7.Value')).observation.value).toBe(42);
       expect(bound.evidence).toEqual([expect.objectContaining({ source: 'ARCHIVE_AST', runtimeMetadataObserved: false })]);
       expect(server.requests.slice(before).map(request => request.functionCode)).toEqual([0x054C, 0x054C]);
-      expect(() => client.bindArchiveMembers({ ...block, objectRid: 1 }, [member])).toThrow(/identity/);
+        expect(() => client.bindArchiveMembers({ ...block, objectRid: 1 }, [member])).toThrow(/identity/);
       expect(() => client.bindArchiveMembers(block, [{ ...member, accessPath: [] }])).toThrow(/LID/);
       const wrongType = client.bindArchiveMembers(block, [{ ...member, datatype: 'INT', softdatatype: 5 }]);
-      await expect(client.readMembers(wrongType.members)).rejects.toMatchObject({ code: 'DATATYPE_MISMATCH' });
+      const mismatch = (await client.readMembers(wrongType.members))[0].observation;
+      expect(mismatch).toMatchObject({ quality: 'MISMATCH', status: 'DATATYPE_MISMATCH', expectedDatatype: 'INT', actualWireType: 8, value: 42 });
+      expect(client.connected).toBe(true);
+      expect((await client.readMembers(bound.members))[0].observation.value).toBe(42);
     } finally { await client.disconnect(); await server.close(); }
   });
 
@@ -63,7 +66,7 @@ describe('archive-backed read descriptors', () => {
     const block = { type: /** @type {const} */ ('DB'), number: 7, name: 'Standard', objectRid: 0x8A0E0007, memoryLayout: 'standard', standardSizeBits: 128 };
     const members = [
       { path: 'Enabled', parentPath: null, datatype: 'BOOL', softdatatype: 1, memberId: 0, typeInfoId: null, referencedTypeInfoId: null,
-        accessPath: [], symbolCrc: 0, arrayDimensions: [], status: 'ARCHIVE_UNVERIFIED', readable: true, accessMode: 'CLASSIC_OFFSET', byteOffset: 8, bitOffset: 2, byteSize: 1, offsetConfidence: 'confirmed' },
+        accessPath: [], symbolCrc: 0, arrayDimensions: [], status: 'ARCHIVE_UNVERIFIED', readable: true, accessMode: /** @type {const} */ ('CLASSIC_OFFSET'), byteOffset: 8, bitOffset: 2, byteSize: 1, offsetConfidence: 'confirmed' },
       { path: 'Count', parentPath: null, datatype: 'DINT', softdatatype: 7, memberId: 0, typeInfoId: null, referencedTypeInfoId: null,
         accessPath: [], symbolCrc: 0, arrayDimensions: [], status: 'ARCHIVE_UNVERIFIED', readable: true, accessMode: 'CLASSIC_OFFSET', byteOffset: 12, byteSize: 4, offsetConfidence: 'confirmed' },
     ];
@@ -96,6 +99,25 @@ describe('archive-backed read descriptors', () => {
       expect(() => client.bindArchiveMembers(block, [{ ...members[0], byteOffset: 16 }])).toThrow(/outside the confirmed standard layout/);
       const cached = client.bindCachedMembers(JSON.parse(JSON.stringify(bound)));
       expect((await client.readMembers(cached.members))[0].observation.value).toBe(true);
+    } finally { await client.disconnect(); await server.close(); }
+  });
+
+  it('isolates a PLC service rejection to the affected archive member', async () => {
+    const server = await fixture({ readRejectLid: 102 });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy' });
+    const block = { type: /** @type {const} */ ('DB'), number: 7, name: 'Sample', objectRid: 0x8A0E0007 };
+    /** @param {string} path @param {number} memberId */
+    const member = (path, memberId) => ({ path, parentPath: null, datatype: 'DINT', softdatatype: 7, memberId, typeInfoId: null,
+      referencedTypeInfoId: null, accessPath: [memberId], symbolCrc: 0, arrayDimensions: [], readable: true, status: 'ARCHIVE_UNVERIFIED' });
+    try {
+      await client.connect();
+      const bound = client.bindArchiveMembers(block, [member('Good', 101), member('Changed', 102)]);
+      const values = await client.readMembers(bound.members);
+      expect(values.map(result => result.observation.quality)).toEqual(['GOOD', 'MISMATCH']);
+      expect(values[0].observation.value).toBe(42);
+      expect(values[1].observation).toMatchObject({ status: 'PLC_REJECTED', expectedDatatype: 'DINT', quality: 'MISMATCH' });
+      expect(client.connected).toBe(true);
+      expect((await client.readMembers([bound.members[0]]))[0].observation.value).toBe(42);
     } finally { await client.disconnect(); await server.close(); }
   });
 });
@@ -919,15 +941,15 @@ describe('S7CommPlus loopback lifecycle (never live)', () => {
     } finally { await client.disconnect(); await server.close(); }
   });
   it.each([
-    [{ itemError: true }, 'ITEM_REJECTED', /0x8104/],
-    [{ badTail: true }, 'UNSUPPORTED_DECODING', /suffix/],
-  ])('preserves read failures without reporting GOOD: %j', async (options, code, message) => {
+    [{ itemError: true }, 'ITEM_REJECTED', /0x8104/, true],
+    [{ badTail: true }, 'UNSUPPORTED_DECODING', /suffix/, false],
+  ])('preserves read failures without reporting GOOD: %j', async (options, code, message, remainsConnected) => {
     const server = await fixture(/** @type {any} */ (options));
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
     try {
       await client.connect();
       await expect(client.readSymbolic({ accessArea: 0x8A0E0001, lids: [1] })).rejects.toMatchObject({ code, message });
-      expect(client.connected).toBe(false);
+      expect(client.connected).toBe(remainsConnected);
     } finally { await client.disconnect(); await server.close(); }
   });
   it('recognizes only the structurally anchored protection marker', async () => {
@@ -1161,19 +1183,21 @@ describe('S7CommPlus verified loopback TLS (never live)', () => {
       const discovery = await client.listBlockMembers({ type: 'DB', number: 7 });
       const member = discovery.members.find(candidate => candidate.path === 'Enabled' && candidate.readable);
       if (!member) throw new Error('Missing synthetic member');
-      const members = Array(65).fill(member);
+      const members = mode === 'good' ? Array(65).fill(member) : Array(3).fill(member);
       if (mode === 'good') {
         for (let scan = 0; scan < 2; scan++) {
           const results = await client.readMembers(members);
           expect(results).toHaveLength(65);
           expect(results.every(result => result.observation.value === true && result.observation.quality === 'GOOD')).toBe(true);
-          expect(results.every(result => result.request.sentAtMonotonicMs > 0 && result.request.receivedAtMonotonicMs >= result.request.sentAtMonotonicMs)).toBe(true);
-          expect(new Set(results.map(result => result.request.sequence)).size).toBe(3);
+          expect(results.every(result => result.request && result.request.sentAtMonotonicMs > 0 && result.request.receivedAtMonotonicMs >= result.request.sentAtMonotonicMs)).toBe(true);
+          expect(new Set(results.flatMap(result => result.request ? [result.request.sequence] : [])).size).toBe(3);
         }
         expect(client.report.securityMode).toBe('TLS_VERIFIED');
       } else {
-        await expect(client.readMembers(members)).rejects.toMatchObject({ code: mode === 'item-error' ? 'ITEM_REJECTED' : 'DATATYPE_MISMATCH' });
-        expect(client.connected).toBe(false);
+        const results = await client.readMembers(members);
+        expect(results).toHaveLength(members.length);
+        expect(results.every(result => result.observation.quality === 'MISMATCH')).toBe(true);
+        expect(client.connected).toBe(true);
       }
       expect(server.errors).toEqual([]);
     } finally { await client.disconnect(); await server.close(); }

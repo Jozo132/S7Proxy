@@ -578,9 +578,15 @@ client and returns lightweight `{ observation }` entries in input order. Combine
 members across DBs to fill packets instead of issuing a small request per DB.
 Plans obey the selected item ceiling, complete request-byte budget, and worst-case
 response sizes, including STRING capacity. Per-item type checks, response
-correlation and transport integrity are unchanged; rejected items or invalid
-replies fail closed. An insufficient remaining request budget rejects the whole
-plan before its first request.
+correlation and transport integrity remain enforced. Well-formed item rejection,
+omitted values and supported scalar datatype mismatches are returned for that
+member as `quality: 'MISMATCH'`, with expected datatype, actual wire type when
+available, status and diagnostic text; they are not cast to the archive datatype.
+When a batched service is rejected, the client retries its members individually
+and preserves successful values alongside per-member mismatches. Malformed
+responses, integrity/correlation failures, timeouts and transport errors remain
+fatal and stop the session. An insufficient remaining request budget rejects the
+whole plan before its first request.
 
 `readMembers(members, { maxItems: 48 })` explicitly raises the per-request item
 ceiling for a separately qualified target; accepted values are 1..64 and the

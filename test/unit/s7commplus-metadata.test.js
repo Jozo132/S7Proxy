@@ -604,15 +604,16 @@ describe('public native discovery and qualified reads', () => {
   it.each([
     { option: { memberError: true }, code: 'ITEM_REJECTED' },
     { option: { memberTypeMismatch: true }, code: 'DATATYPE_MISMATCH' },
-  ])('fails closed on qualified member errors: $code', async ({ option, code }) => {
+  ])('returns qualified member errors as mismatches without closing the session: $code', async ({ option, code }) => {
     const server = await fixture({ metadata: true, ...option });
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port });
     try {
       await client.connect();
       await client.listBlockMembers({ type: 'DB', number: 7 });
-      await expect(client.readSymbol('SampleDB.Enabled')).rejects.toMatchObject({ code });
-      expect(client.connected).toBe(false);
-      expect(client.report.failure?.code).toBe(code);
+      const result = await client.readSymbol('SampleDB.Enabled');
+      expect(result.observation).toMatchObject({ quality: 'MISMATCH', status: code });
+      expect(client.connected).toBe(true);
+      expect(client.report.failure).toBeNull();
       expect(server.errors).toEqual([]);
     } finally { await client.disconnect(); await server.close(); }
   });

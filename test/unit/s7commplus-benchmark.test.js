@@ -64,7 +64,7 @@ describe('S7CommPlus bounded parallel benchmark', () => {
         stages: [{ name: 'reject', durationMs: 100, lanes: [{ id: 'bool', type: 'boolean', periodMs: 0 }, { id: 'num', type: 'numeric', periodMs: 50 }] },
           { name: 'must-not-start', durationMs: 100, lanes: [{ id: 'bool', type: 'boolean', periodMs: 0 }] }] });
       expect(report.status).toBe('FAILED');
-      expect(report.error).toMatch(/rejected/);
+      expect(report.error).toMatch(/MISMATCH.*ITEM_REJECTED/);
       expect(report.disconnected).toBe(true);
       expect(server.cotpRequests).toHaveLength(2);
     } finally { await server.close(); }
