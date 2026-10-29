@@ -24,6 +24,8 @@ export { getProductionHost } from '../protocol/production-policy.js';
 /** @type {Map<string, Set<S7CommPlusClient>>} */
 const activeConnections = new Map();
 const AREA_RIDS = Object.freeze({ I: 80, Q: 81, M: 82 });
+const CLASSIC_OFFSET_WIDTHS = new Map([[1, 1], [2, 1], [3, 1], [4, 2], [5, 2], [6, 4], [7, 4], [8, 4], [11, 4],
+  [48, 8], [49, 8], [50, 8], [51, 8], [52, 1], [53, 2], [54, 4], [55, 1], [61, 2], [64, 8]]);
 const COMMUNICATION_RESOURCE_FIELDS = Object.freeze([
   { name: 'tagsPerReadRequestMax', subarea: 1037, lid: 1000 },
   { name: 'tagsPerWriteRequestMax', subarea: 1037, lid: 1001 },
@@ -40,6 +42,65 @@ const DEFAULT_LIMITS = Object.freeze({
   maxUploadBytes: 1048576, pacingMs: 250, readPacingMs: 250, maxObjects: 65536, maxDepth: 256, maxDiagnosticEntries: 128,
   maxLatencyMs: 4000, latencyFactor: 5, maxConnectionsPerTarget: 4, maxQueuedRequests: 32,
 });
+
+/** @param {RuntimeMember} member */
+function classicOffsetWidth(member) {
+  const width = CLASSIC_OFFSET_WIDTHS.get(member.softdatatype);
+  if (!width || member.offsetConfidence !== 'confirmed' || member.datatype !== SOFTWARE_TYPES[/** @type {keyof typeof SOFTWARE_TYPES} */ (member.softdatatype)]
+    || !Number.isSafeInteger(member.byteOffset) || member.byteOffset < 0 || member.byteOffset > 0xFFFFFFFF
+    || member.byteSize !== width || member.typeInfoId !== null || member.symbolCrc !== 0
+    || member.softdatatype === 1 && (!Number.isInteger(member.bitOffset) || member.bitOffset < 0 || member.bitOffset > 7)
+    || member.softdatatype !== 1 && member.bitOffset !== undefined) {
+    throw new PlusError('ARGUMENT', 'Classic DB reads require a confirmed standard offset and supported scalar width');
+  }
+  return width;
+}
+
+/** @param {RuntimeMember} member @param {number|undefined} standardSizeBits */
+function classicOffsetRange(member, standardSizeBits) {
+  const width = classicOffsetWidth(member);
+  if (!Number.isSafeInteger(standardSizeBits) || standardSizeBits <= 0) throw new PlusError('ARGUMENT', 'Classic DB reads require a confirmed standard DB size');
+  const start = member.byteOffset * 8 + (member.softdatatype === 1 ? member.bitOffset : 0);
+  const end = start + (member.softdatatype === 1 ? 1 : width * 8);
+  if (!Number.isSafeInteger(start) || end > standardSizeBits) throw new PlusError('ARGUMENT', 'Classic DB offset is outside the confirmed standard layout');
+  return { start, end };
+}
+
+/** @param {RuntimeMember} member @param {PlusValue} value */
+function decodeClassicOffsetValue(member, value) {
+  const width = classicOffsetWidth(member);
+  if (value.flags !== 0) throw new PlusError('DATATYPE_MISMATCH', 'Classic DB read returned a non-scalar PValue');
+  if (value.datatype !== 20) return validateMemberValue(member, value);
+  if (!Buffer.isBuffer(value.value) || value.value.length !== width) {
+    throw new PlusError('DATATYPE_MISMATCH', 'Classic DB byte range did not return the exact archive scalar width');
+  }
+  const bytes = value.value;
+  let decoded;
+  switch (member.softdatatype) {
+    case 1: decoded = Boolean(bytes[0] & (1 << member.bitOffset)); break;
+    case 2: case 52: decoded = bytes.readUInt8(0); break;
+    case 3: decoded = bytes.toString('latin1'); break;
+    case 4: case 53: decoded = bytes.readUInt16BE(0); break;
+    case 5: decoded = bytes.readInt16BE(0); break;
+    case 6: case 54: decoded = bytes.readUInt32BE(0); break;
+    case 7: case 11: decoded = bytes.readInt32BE(0); break;
+    case 8: decoded = bytes.readFloatBE(0); break;
+    case 48: decoded = bytes.readDoubleBE(0); break;
+    case 49: case 51: decoded = bytes.readBigUInt64BE(0).toString(); break;
+    case 50: case 64: decoded = bytes.readBigInt64BE(0).toString(); break;
+    case 55: decoded = bytes.readInt8(0); break;
+    case 61: decoded = String.fromCharCode(bytes.readUInt16BE(0)); break;
+    default: throw new PlusError('UNSUPPORTED_DATATYPE', 'Classic DB scalar decoder is not qualified for this datatype');
+  }
+  return { datatype: member.datatype, value: decoded, native: value,
+    representation: member.softdatatype === 11 ? { unit: 'ms', signed: true, bits: 32 }
+      : member.softdatatype === 64 ? { unit: 'ns', signed: true, bits: 64 } : null };
+}
+
+/** @param {RuntimeMember} member */
+function readValueBudget(member) {
+  return member.accessMode === 'CLASSIC_OFFSET' ? classicOffsetWidth(member) + 4 : memberValueSize(member);
+}
 
 /** @typedef {Partial<Record<keyof typeof DEFAULT_LIMITS,number>>} PlusLimits */
 /** @template {BlockMetadata|AreaMetadata} [T=BlockMetadata|AreaMetadata] @typedef {ReturnType<typeof buildBlockMembers<T>> & {evidence:unknown[],receivedAt:string}} MemberDiscovery */
@@ -745,7 +806,7 @@ export class S7CommPlusClient {
     return { area, ...discovery };
   }
 
-  /** @param {{type:'DB',number:number,name:string,objectRid:number}} block @param {RuntimeMember[]} members */
+  /** @param {{type:'DB',number:number,name:string,objectRid:number,memoryLayout?:string}} block @param {RuntimeMember[]} members */
   bindArchiveMembers(block, members) {
     this.#requireReady();
     if (block?.type !== 'DB' || !Number.isInteger(block.number) || block.number < 1 || block.number > 65535
@@ -753,19 +814,33 @@ export class S7CommPlusClient {
       || !Array.isArray(members) || members.length > 1048576) throw new PlusError('ARGUMENT', 'Exact archive DB identity and bounded members required');
     const paths = new Set();
     const addresses = new Set();
+    const offsetRanges = [];
     for (const member of members) {
       if (typeof member.path !== 'string' || !member.path || paths.has(member.path)) throw new PlusError('ARGUMENT', 'Archive member paths must be unique');
       paths.add(member.path);
       if (!member.readable) continue;
-      const address = JSON.stringify(member.accessPath);
+      if (member.accessMode === 'CLASSIC_OFFSET') {
+        if (block.memoryLayout !== 'standard') throw new PlusError('ARGUMENT', 'Classic DB offsets require an exact Standard memory-layout declaration');
+        const range = classicOffsetRange(member, block.standardSizeBits);
+        const address = JSON.stringify(['CLASSIC_OFFSET', member.byteOffset, member.bitOffset ?? null, member.byteSize]);
+        if (addresses.has(address)) throw new PlusError('ARGUMENT', 'Archive offset addresses must be unique');
+        if (offsetRanges.some(previous => range.start < previous.end && previous.start < range.end
+          && !(member.softdatatype === 1 && previous.softdatatype === 1 && member.byteOffset === previous.byteOffset))) throw new PlusError('ARGUMENT', 'Archive offset ranges overlap ambiguously');
+        addresses.add(address);
+        offsetRanges.push({ ...range, softdatatype: member.softdatatype, byteOffset: member.byteOffset });
+        readValueBudget(member);
+        continue;
+      }
+      if (member.accessMode !== undefined && member.accessMode !== 'SYMBOLIC_LID') throw new PlusError('ARGUMENT', 'Unsupported archive member access mode');
+      const address = JSON.stringify(['SYMBOLIC_LID', member.accessPath]);
       if (!Array.isArray(member.accessPath) || !member.accessPath.length || member.accessPath.length > 16
         || member.accessPath.some(lid => !Number.isInteger(lid) || lid < 0 || lid > 0xFFFFFFFF)
         || !Number.isInteger(member.memberId) || member.memberId < 1 || member.memberId > 0xFFFFFFFF
         || member.datatype !== SOFTWARE_TYPES[/** @type {keyof typeof SOFTWARE_TYPES} */ (member.softdatatype)]
         || member.typeInfoId !== null || member.symbolCrc !== 0 || addresses.has(address)) {
-        throw new PlusError('ARGUMENT', 'Archive members require unambiguous scalar LID addresses without invented type identities');
+        throw new PlusError('ARGUMENT', 'Archive members require unambiguous scalar LID addresses or confirmed standard offsets');
       }
-      memberValueSize(member);
+      readValueBudget(member);
       addresses.add(address);
     }
     const evidence = { source: 'ARCHIVE_AST', revisionStatus: 'UNVERIFIED', runtimeMetadataObserved: false };
@@ -784,18 +859,31 @@ export class S7CommPlusClient {
     if (!validBlock || typeof block.name !== 'string' || !block.name || !Array.isArray(members) || members.length > 1048576) throw new PlusError('ARGUMENT', 'Exact cached DB or process-area identity and bounded members required');
     const paths = new Set();
     const addresses = new Set();
+    const offsetRanges = [];
     for (const member of members) {
       if (!member.readable) continue;
       if (typeof member.path !== 'string' || !member.path || paths.has(member.path)) throw new PlusError('ARGUMENT', 'Cached member paths must be unique');
       paths.add(member.path);
-      const address = JSON.stringify(member.accessPath);
+      if (member.accessMode === 'CLASSIC_OFFSET') {
+        if (block.type !== 'DB' || block.memoryLayout !== 'standard') throw new PlusError('ARGUMENT', 'Cached classic offsets require a Standard DB');
+        const range = classicOffsetRange(member, block.standardSizeBits);
+        const address = JSON.stringify(['CLASSIC_OFFSET', member.byteOffset, member.bitOffset ?? null, member.byteSize]);
+        if (addresses.has(address)) throw new PlusError('ARGUMENT', 'Cached offset addresses must be unique');
+        if (offsetRanges.some(previous => range.start < previous.end && previous.start < range.end
+          && !(member.softdatatype === 1 && previous.softdatatype === 1 && member.byteOffset === previous.byteOffset))) throw new PlusError('ARGUMENT', 'Cached offset ranges overlap ambiguously');
+        addresses.add(address);
+        offsetRanges.push({ ...range, softdatatype: member.softdatatype, byteOffset: member.byteOffset });
+        readValueBudget(member);
+        continue;
+      }
+      const address = JSON.stringify(['SYMBOLIC_LID', member.accessPath]);
       if (!Array.isArray(member.accessPath) || !member.accessPath.length || member.accessPath.length > 16
         || member.accessPath.some(lid => !Number.isInteger(lid) || lid < 0 || lid > 0xFFFFFFFF)
         || !Number.isInteger(member.memberId) || member.memberId < 1 || member.memberId > 0xFFFFFFFF
         || member.datatype !== SOFTWARE_TYPES[/** @type {keyof typeof SOFTWARE_TYPES} */ (member.softdatatype)] || addresses.has(address)) {
-        throw new PlusError('ARGUMENT', 'Cached members require unambiguous supported scalar LID addresses');
+        throw new PlusError('ARGUMENT', 'Cached members require unambiguous supported symbolic LIDs or standard offsets');
       }
-      memberValueSize(member);
+      readValueBudget(member);
       addresses.add(address);
     }
     const evidence = { source: 'PLC_CACHE', revisionStatus: 'UNVERIFIED', runtimeMetadataObserved: false };
@@ -848,6 +936,7 @@ export class S7CommPlusClient {
       this.#memberBindings.set(member, { block: nativeBlock, member: structuredClone(member), metadataEvidence });
       if (block.name && member.path) {
         this.#namedMembers.push({ name: `${block.name}.${member.path}`, member }, { name: `"${block.name}".${member.path}`, member });
+        if (block.type === 'DB' && Number.isInteger(block.number)) this.#namedMembers.push({ name: `DB${block.number}.${member.path}`, member });
       }
     }
     return discovery;
@@ -860,6 +949,14 @@ export class S7CommPlusClient {
     if (!binding) throw new PlusError('UNVERIFIED_ADDRESS', 'Use a readable member discovered by this client session');
     const { block, member: native } = binding;
     // The browsed per-entry CRC is not the GetMultiVariables address CRC.
+    if (native.accessMode === 'CLASSIC_OFFSET') {
+      const result = (await this.readMembers([member]))[0];
+      return { block: structuredClone(block), symbol: structuredClone(native),
+        runtime: { protocol: 's7commplus', objectRid: block.objectRid, accessMode: 'CLASSIC_OFFSET', byteOffset: native.byteOffset,
+          bitOffset: native.bitOffset, byteSize: native.byteSize },
+        observation: result.observation, evidence: { metadata: structuredClone(binding.metadataEvidence), response: {
+          address: { accessArea: block.objectRid, accessSubArea: 2550, lids: [3, native.byteOffset, native.byteSize] }, request: result.request, status: 'GOOD' } } };
+    }
     const observation = await this.readSymbolic({ accessArea: block.objectRid, lids: native.accessPath, symbolCrc: 0 });
     let decoded;
     try { decoded = validateMemberValue(native, observation.value); }
@@ -887,8 +984,10 @@ export class S7CommPlusClient {
         if (!binding) throw new PlusError('UNVERIFIED_ADDRESS', 'Use readable members discovered by this client session');
         return binding;
       });
-      const addresses = bindings.map(binding => ({ accessArea: binding.block.objectRid, lids: binding.member.accessPath, symbolCrc: 0 }));
-      const batches = planReadBatches(addresses, bindings.map(binding => memberValueSize(binding.member)),
+      const addresses = bindings.map(binding => binding.member.accessMode === 'CLASSIC_OFFSET'
+        ? { accessArea: binding.block.objectRid, accessSubArea: 2550, lids: [3, binding.member.byteOffset, binding.member.byteSize] }
+        : { accessArea: binding.block.objectRid, lids: binding.member.accessPath, symbolCrc: 0 });
+      const batches = planReadBatches(addresses, bindings.map(binding => readValueBudget(binding.member)),
         { sessionId: this.#sessionId, version: this.#version, sessionKey: this.#sessionKey, integrityId: this.#tls ? this.#integrityId : undefined }, { ...this.#limits, maxItems });
       plan = { maxItems, members: [...members], bindings, operations: batches.map(indices => ({ kind: 'read', maxItems, items: indices.map(index => addresses[index]) })) };
       this.#readPlans.set(members, plan);
@@ -915,9 +1014,14 @@ export class S7CommPlusClient {
         if (errors.size) throw new PlusError('ITEM_REJECTED', 'Native batch contains rejected items', { items: [...errors].map(([number, code]) => ({ number, code: code.toString(16) })) });
         if (values.size !== count) throw new PlusError('DATA_UNAVAILABLE', 'PLC omitted one or more requested items');
         const receivedAt = new Date().toISOString();
-        for (let ordinal = 0; ordinal < count; ordinal++) results.push({ request: { sequence: response.correlation.sequence, integrityId: response.correlation.integrityId, ...response.timing }, observation: {
-          ...validateMemberValue(plan.bindings[offset + ordinal].member, values.get(ordinal + 1)), quality: 'GOOD', source: 'S7COMMPLUS_RESPONSE', receivedAt, nativeTimestamp: null,
-        } });
+        for (let ordinal = 0; ordinal < count; ordinal++) {
+          const member = plan.bindings[offset + ordinal].member;
+          const decoded = member.accessMode === 'CLASSIC_OFFSET' ? decodeClassicOffsetValue(member, values.get(ordinal + 1))
+            : validateMemberValue(member, values.get(ordinal + 1));
+          results.push({ request: { sequence: response.correlation.sequence, integrityId: response.correlation.integrityId, ...response.timing }, observation: {
+            ...decoded, quality: 'GOOD', source: 'S7COMMPLUS_RESPONSE', receivedAt, nativeTimestamp: null,
+          } });
+        }
         offset += count;
       }
       return results;

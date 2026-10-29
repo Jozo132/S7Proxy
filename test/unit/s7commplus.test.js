@@ -15,6 +15,22 @@ import { OwnedSubscriptionSession } from '../../src/protocol/s7commplus/subscrip
 
 const context = { version: 1, sessionId: 0x12345678 };
 describe('archive-backed read descriptors', () => {
+  it('encodes only the exact ClassicBlob DB offset address form', () => {
+    const operation = { kind: 'read', items: [{ accessArea: 0x8A0E0007, accessSubArea: 2550, lids: [3, 12, 4] }] };
+    const frame = encodeOperation(operation, context, 1);
+    const cursor = new Cursor(frame.subarray(18, -4));
+    expect([cursor.uint32(), cursor.uint(), cursor.uint()]).toEqual([0, 1, 7]);
+    expect([cursor.uint(), cursor.uint(), cursor.uint(), cursor.uint(), cursor.uint()]).toEqual([0, 0x8A0E0007, 4, 2550, 3]);
+    expect([cursor.uint(), cursor.uint()]).toEqual([12, 4]);
+    for (const address of [
+      { accessArea: 0x8A0E0000, accessSubArea: 2550, lids: [3, 12, 4] },
+      { accessArea: 0x8A0E0007, accessSubArea: 2550, lids: [3, 12] },
+      { accessArea: 0x8A0E0007, accessSubArea: 2550, lids: [2, 12, 4] },
+      { accessArea: 0x8A0E0007, accessSubArea: 2550, lids: [3, 12, 0] },
+      { accessArea: 0x8A0E0007, accessSubArea: 2551, lids: [3, 12, 4] },
+    ]) expect(() => encodeOperation({ kind: 'read', items: [address] }, context, 1)).toThrow(/subareas/);
+  });
+
   it('binds local LIDs without PLC structure requests and validates actual values', async () => {
     const server = await fixture();
     const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy' });
@@ -30,12 +46,56 @@ describe('archive-backed read descriptors', () => {
       expect(bound.members[0].accessPath).toEqual([101]);
       const samples = await client.readMembers(bound.members);
       expect(samples[0].observation.value).toBe(42);
+      expect((await client.readSymbol('DB7.Value')).observation.value).toBe(42);
       expect(bound.evidence).toEqual([expect.objectContaining({ source: 'ARCHIVE_AST', runtimeMetadataObserved: false })]);
-      expect(server.requests.slice(before).map(request => request.functionCode)).toEqual([0x054C]);
+      expect(server.requests.slice(before).map(request => request.functionCode)).toEqual([0x054C, 0x054C]);
       expect(() => client.bindArchiveMembers({ ...block, objectRid: 1 }, [member])).toThrow(/identity/);
       expect(() => client.bindArchiveMembers(block, [{ ...member, accessPath: [] }])).toThrow(/LID/);
       const wrongType = client.bindArchiveMembers(block, [{ ...member, datatype: 'INT', softdatatype: 5 }]);
       await expect(client.readMembers(wrongType.members)).rejects.toMatchObject({ code: 'DATATYPE_MISMATCH' });
+    } finally { await client.disconnect(); await server.close(); }
+  });
+
+  it('reads confirmed Standard DB offsets by ClassicBlob range and archive scalar type', async () => {
+    const server = await fixture({ classicOffsetValues: { '7:8:1': Buffer.from([0x04]), '7:12:4': Buffer.from([0, 0, 0, 42]) },
+      classicOffsetPValues: { '7:12:4': Buffer.from([0, 8, 42]) } });
+    const client = new S7CommPlusClient({ host: '127.0.0.1', port: server.port, securityMode: 'legacy' });
+    const block = { type: /** @type {const} */ ('DB'), number: 7, name: 'Standard', objectRid: 0x8A0E0007, memoryLayout: 'standard', standardSizeBits: 128 };
+    const members = [
+      { path: 'Enabled', parentPath: null, datatype: 'BOOL', softdatatype: 1, memberId: 0, typeInfoId: null, referencedTypeInfoId: null,
+        accessPath: [], symbolCrc: 0, arrayDimensions: [], status: 'ARCHIVE_UNVERIFIED', readable: true, accessMode: 'CLASSIC_OFFSET', byteOffset: 8, bitOffset: 2, byteSize: 1, offsetConfidence: 'confirmed' },
+      { path: 'Count', parentPath: null, datatype: 'DINT', softdatatype: 7, memberId: 0, typeInfoId: null, referencedTypeInfoId: null,
+        accessPath: [], symbolCrc: 0, arrayDimensions: [], status: 'ARCHIVE_UNVERIFIED', readable: true, accessMode: 'CLASSIC_OFFSET', byteOffset: 12, byteSize: 4, offsetConfidence: 'confirmed' },
+    ];
+    try {
+      await client.connect();
+      const before = server.requests.length;
+      const bound = client.bindArchiveMembers(block, members);
+      const values = await client.readMembers(bound.members);
+      expect(values.map(result => result.observation.value)).toEqual([true, 42]);
+      const request = server.requests.at(-1);
+      if (!request) throw new Error('Missing ClassicBlob request');
+      const cursor = new Cursor(request.frame.subarray(18, -4));
+      cursor.uint32(); const count = cursor.uint(); cursor.uint();
+      const addresses = Array.from({ length: count }, () => {
+        const symbolCrc = cursor.uint(); const accessArea = cursor.uint(); const pathLength = cursor.uint() - 1; const accessSubArea = cursor.uint();
+        return { symbolCrc, accessArea, accessSubArea, lids: Array.from({ length: pathLength }, () => cursor.uint()) };
+      });
+      expect(addresses).toEqual([
+        { symbolCrc: 0, accessArea: 0x8A0E0007, accessSubArea: 2550, lids: [3, 8, 1] },
+        { symbolCrc: 0, accessArea: 0x8A0E0007, accessSubArea: 2550, lids: [3, 12, 4] },
+      ]);
+      expect(server.requests.slice(before).map(item => item.functionCode)).toEqual([0x054C]);
+      const single = await client.readMember(bound.members[0]);
+      expect(single.runtime).toMatchObject({ accessMode: 'CLASSIC_OFFSET', objectRid: 0x8A0E0007, byteOffset: 8, bitOffset: 2 });
+      expect(single.runtime).not.toHaveProperty('memberId');
+      expect(single.evidence.response.address).toEqual({ accessArea: 0x8A0E0007, accessSubArea: 2550, lids: [3, 8, 1] });
+      expect(server.requests.slice(before).map(item => item.functionCode)).toEqual([0x054C, 0x054C]);
+      expect(() => client.bindArchiveMembers({ ...block, memoryLayout: 'optimized' }, members)).toThrow(/Standard/);
+      expect(() => client.bindArchiveMembers(block, [{ ...members[0], offsetConfidence: 'inferred' }])).toThrow(/confirmed standard offset/);
+      expect(() => client.bindArchiveMembers(block, [{ ...members[0], byteOffset: 16 }])).toThrow(/outside the confirmed standard layout/);
+      const cached = client.bindCachedMembers(JSON.parse(JSON.stringify(bound)));
+      expect((await client.readMembers(cached.members))[0].observation.value).toBe(true);
     } finally { await client.disconnect(); await server.close(); }
   });
 });

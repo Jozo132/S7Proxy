@@ -178,8 +178,11 @@ export function createSessionPayload() {
 /** @param {{accessArea:number,lids:number[],symbolCrc?:number,accessSubArea?:number}} item */
 function encodeReadAddress(item) {
   if (!item.lids.length || item.lids.length > 16) throw new PlusError('REQUEST_LIMIT', 'LID path requires 1..16 elements');
-  if (item.accessSubArea !== undefined && (item.accessArea !== 201 || item.lids.length !== 1 || (item.symbolCrc ?? 0) !== 0
-    || !(item.accessSubArea === 1037 ? [0, 1, 2, 1000, 1001] : item.accessSubArea === 1081 ? [0, 1, 2] : []).includes(item.lids[0]))) {
+  const classicDbRange = item.accessArea >>> 16 === 0x8A0E && (item.accessArea & 0xFFFF) > 0 && (item.accessArea & 0xFFFF) <= 65535
+    && item.accessSubArea === 2550 && item.lids.length === 3 && item.lids[0] === 3 && item.lids[2] > 0;
+  const communicationResource = item.accessArea === 201 && item.lids.length === 1 && (item.symbolCrc ?? 0) === 0
+    && (item.accessSubArea === 1037 ? [0, 1, 2, 1000, 1001] : item.accessSubArea === 1081 ? [0, 1, 2] : []).includes(item.lids[0]);
+  if (item.accessSubArea !== undefined && !classicDbRange && !communicationResource) {
     throw new PlusError('ARGUMENT', 'Explicit read subareas are restricted to communication resource counters');
   }
   return Buffer.concat([vlq(item.symbolCrc ?? 0), vlq(item.accessArea), vlq(1 + item.lids.length),

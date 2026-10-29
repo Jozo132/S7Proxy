@@ -8,7 +8,7 @@ import { FrameAssembler } from '../src/protocol/frame-assembler.js';
 import { Cursor, decodeObjects, decodeValue, u32, vlq } from '../src/protocol/s7commplus/codec.js';
 import { metadataExplore } from './s7commplus-metadata-fixture.js';
 
-/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,initVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},abortTLS?:boolean,stallTLS?:boolean,badIntegrity?:boolean,reference?:boolean,compositeReject?:boolean,nonzeroCreateStatus?:boolean,metadata?:boolean,areaReference?:'invalid'|'zero'|'missing',areaTypeMissing?:boolean,memberError?:boolean,memberTypeMismatch?:boolean,programContent?:boolean,programFailure?:boolean,programStall?:boolean,programEmpty?:boolean}} FixtureOptions */
+/** @typedef {{state?:number,challenge?:boolean,stall?:boolean,wrongSequence?:boolean,oversized?:boolean,smallTpdu?:boolean,itemError?:boolean,badTail?:boolean,protectionMarker?:boolean,reject?:'initSSL'|'createSession'|'setupSession',badInitTail?:boolean,createVersion?:number,initVersion?:number,malformed?:'reserved'|'opcode'|'function'|'truncated'|'trailer'|'cotp'|'length'|'genericError'|'duplicate'|'empty',versionSchema?:'missing'|'duplicate'|'invalid'|'foreignOwner',terminate?:boolean,setupError?:boolean,badSetupTail?:boolean,tls?:{key:Buffer,cert:Buffer},abortTLS?:boolean,stallTLS?:boolean,badIntegrity?:boolean,reference?:boolean,compositeReject?:boolean,nonzeroCreateStatus?:boolean,metadata?:boolean,areaReference?:'invalid'|'zero'|'missing',areaTypeMissing?:boolean,memberError?:boolean,memberTypeMismatch?:boolean,classicOffsetValues?:Record<string,Buffer>,classicOffsetPValues?:Record<string,Buffer>,programContent?:boolean,programFailure?:boolean,programStall?:boolean,programEmpty?:boolean}} FixtureOptions */
 
 /** @param {bigint} value */
 export function encodeTestUInt64(value) {
@@ -195,8 +195,30 @@ export async function fixture(options = {}) {
         payload = Buffer.concat([Buffer.from([0]), object(objectId, objectId === 52 ? [{ id: 0x8BD,
           raw: Buffer.concat([Buffer.from([0, 23]), u32(0xD99), vlq(0xD9E), Buffer.from([0, 8, options.states?.[stateReads++] ?? (cpuStarted ? 8 : options.state ?? 8), 0])]) }] : [])]);
       } else if (functionCode === 0x0586) payload = Buffer.from(options.programContent ? [0, 0, 4, 1] : options.protectionMarker ? [0, 0, 0, 4, 2, 0] : [0, 0, 4, 2]);
-      else if (functionCode === 0x054C) payload = options.itemError ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
-        : Buffer.from([0, 1, 0, 8, 42, 0, 0, ...(options.badTail ? [99] : [])]);
+      else if (functionCode === 0x054C) {
+        if (options.classicOffsetValues) {
+          const cursor = new Cursor(request.subarray(18, -4));
+          cursor.uint32();
+          const count = cursor.uint();
+          cursor.uint();
+          const values = [];
+          for (let ordinal = 1; ordinal <= count; ordinal++) {
+            const symbolCrc = cursor.uint();
+            const accessArea = cursor.uint();
+            const pathLength = cursor.uint() - 1;
+            const accessSubArea = cursor.uint();
+            const lids = Array.from({ length: pathLength }, () => cursor.uint());
+            if (symbolCrc !== 0 || accessArea < 0x8A0E0000 || accessSubArea !== 2550 || lids.length !== 3 || lids[0] !== 3) throw new Error('Expected standard DB ClassicBlob range');
+            const bytes = options.classicOffsetValues[`${accessArea & 0xFFFF}:${lids[1]}:${lids[2]}`];
+            if (!Buffer.isBuffer(bytes) || bytes.length !== lids[2]) throw new Error('No exact ClassicBlob fixture range');
+            const key = `${accessArea & 0xFFFF}:${lids[1]}:${lids[2]}`;
+            const scalar = options.classicOffsetPValues?.[key];
+            values.push(vlq(ordinal), scalar ?? Buffer.concat([Buffer.from([0, 20]), vlq(0), vlq(bytes.length), bytes]));
+          }
+          payload = Buffer.concat([Buffer.from([0]), ...values, Buffer.from([0, 0])]);
+        } else payload = options.itemError ? Buffer.concat([Buffer.from([0, 0, 1]), vlq(0x8104), Buffer.from([0])])
+          : Buffer.from([0, 1, 0, 8, 42, 0, 0, ...(options.badTail ? [99] : [])]);
+      }
       if (options.metadata && functionCode === 0x04BB && request.readUInt32BE(18) !== 52) {
         const typeMissing = options.areaTypeMissing && [0x90010000, 0x90020000, 0x90030000].includes(request.readUInt32BE(18));
         payload = Buffer.concat([Buffer.from([0]), typeMissing ? object(request.readUInt32BE(18), []) : metadataExplore(request.readUInt32BE(18), options.inventorySize)]);
